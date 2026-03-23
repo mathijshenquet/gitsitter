@@ -7,49 +7,9 @@ use anyhow::{bail, Context, Result};
 const HOOK_START_MARKER: &str = "# >>> gitsitter hook >>>";
 const HOOK_END_MARKER: &str = "# <<< gitsitter hook <<<";
 
-const BASH_HOOK: &str = r#"# gitsitter shell hook
-__gitsitter_hook() {
-    if command -v gitsitter &>/dev/null; then
-        gitsitter register &>/dev/null &
-        disown 2>/dev/null
-        local msg
-        msg=$(gitsitter _prompt 2>/dev/null)
-        if [ -n "$msg" ]; then
-            echo "$msg"
-        fi
-    fi
-}
-
-if [[ ! "$PROMPT_COMMAND" == *"__gitsitter_hook"* ]]; then
-    PROMPT_COMMAND="__gitsitter_hook${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
-fi"#;
-
-const ZSH_HOOK: &str = r#"# gitsitter shell hook
-__gitsitter_hook() {
-    if (( $+commands[gitsitter] )); then
-        gitsitter register &>/dev/null &!
-        local msg
-        msg=$(gitsitter _prompt 2>/dev/null)
-        if [[ -n "$msg" ]]; then
-            echo "$msg"
-        fi
-    fi
-}
-
-if [[ -z "${precmd_functions[(r)__gitsitter_hook]}" ]]; then
-    precmd_functions+=(__gitsitter_hook)
-fi"#;
-
-const FISH_HOOK: &str = r#"# gitsitter shell hook
-function __gitsitter_hook --on-event fish_prompt
-    if command -q gitsitter
-        gitsitter register &>/dev/null &
-        set -l msg (gitsitter _prompt 2>/dev/null)
-        if test -n "$msg"
-            echo $msg
-        end
-    end
-end"#;
+const BASH_HOOK: &str = include_str!("embed/bash_hook.sh");
+const ZSH_HOOK: &str = include_str!("embed/zsh_hook.zsh");
+const FISH_HOOK: &str = include_str!("embed/fish_hook.fish");
 
 /// List supported shells.
 pub fn supported_shells() -> &'static [&'static str] {

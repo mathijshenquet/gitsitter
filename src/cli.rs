@@ -875,10 +875,8 @@ pub async fn handle_install(component: Option<String>, shell_name: Option<String
                 .join(".config/systemd/user");
             std::fs::create_dir_all(&unit_dir)?;
             let exe = std::env::current_exe()?;
-            let unit = format!(
-                "[Unit]\nDescription=gitsitter daemon\n\n[Service]\nType=exec\nExecStart={} daemon run\nRestart=on-failure\nRestartSec=5\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n",
-                exe.display()
-            );
+            let unit = include_str!("embed/gitsitter.service")
+                .replace("@@EXEC_PATH@@", &exe.display().to_string());
             let unit_path = unit_dir.join("gitsitter.service");
             std::fs::write(&unit_path, unit)?;
             println!("Systemd user service written to {}", unit_path.display());

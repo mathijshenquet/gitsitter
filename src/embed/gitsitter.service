@@ -1,0 +1,13 @@
+[Unit]
+Description=gitsitter daemon
+
+[Service]
+Type=exec
+ExecStart=@@EXEC_PATH@@ daemon run
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
