@@ -57,7 +57,7 @@ pub async fn run(
     ) {
         Ok(w) => w,
         Err(e) => {
-            error!("🔍 failed to create file watcher: {:#}", e);
+            error!("🔍  failed to create file watcher: {:#}", e);
             warn!("file watching disabled — falling back to polling only");
             return;
         }
@@ -65,7 +65,7 @@ pub async fn run(
 
     // Track which repos we're watching and per-repo debounce timers.
     let mut watched_repos: HashMap<String, Vec<PathBuf>> = HashMap::new();
-    let mut pending: HashMap<String, (Instant, PathBuf)> = HashMap::new();
+    let mut pending: HashMap<String, (Instant, String)> = HashMap::new();
 
     // Initial setup: watch all currently registered repos.
     {
@@ -75,7 +75,7 @@ pub async fn run(
                 continue;
             }
             if let Err(e) = add_repo_watches(&mut watcher, repo_id, &mut watched_repos) {
-                warn!("🔍 failed to watch {}: {:#}", repo_id, e);
+                warn!("🔍  failed to watch {}: {:#}", repo_id, e);
             }
         }
     }
@@ -93,15 +93,20 @@ pub async fn run(
                     continue;
                 }
 
-                // Ignore refs/remotes/ changes shortly after a sync — these
-                // are our own fetch/push updating the remote tracking ref.
+                // Ignore refs/remotes/ changes when a sync recently ran or
+                // is currently running — these are our own fetch/push
+                // updating the remote tracking ref.
                 if is_remote_ref(&path) {
                     let dominated = {
                         let repos_guard = daemon.repos.read().await;
                         resolve_repo_id_for_path(&path, &watched_repos)
                             .and_then(|rid| repos_guard.get(&rid))
-                            .and_then(|tr| tr.last_sync)
-                            .is_some_and(|last| last.elapsed() < debounce * 5)
+                            .map(|tr| match tr.last_sync {
+                                // last_sync is None when a sync is in-flight
+                                None => true,
+                                Some(last) => last.elapsed() < debounce * 5,
+                            })
+                            .unwrap_or(false)
                     };
                     if dominated {
                         continue;
@@ -109,14 +114,14 @@ pub async fn run(
                 }
 
                 if let Some(repo_id) = resolve_repo_id_for_path(&path, &watched_repos) {
-                    let display_path = path.clone();
+                    let reason = describe_change(&path);
                     pending
                         .entry(repo_id)
                         .and_modify(|entry| {
                             entry.0 = Instant::now();
-                            entry.1 = display_path.clone();
+                            entry.1 = reason.clone();
                         })
-                        .or_insert_with(|| (Instant::now(), display_path));
+                        .or_insert_with(|| (Instant::now(), reason));
                 }
             }
 
@@ -130,7 +135,7 @@ pub async fn run(
                     }
                     if !watched_repos.contains_key(repo_id) {
                         if let Err(e) = add_repo_watches(&mut watcher, repo_id, &mut watched_repos) {
-                            warn!("🔍 failed to watch {}: {:#}", repo_id, e);
+                            warn!("🔍  failed to watch {}: {:#}", repo_id, e);
                         }
                     }
                 }
@@ -148,7 +153,7 @@ pub async fn run(
 
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
-                    info!("🔍 file watcher shutting down");
+                    info!("🔍  file watcher shutting down");
                     return;
                 }
             }
@@ -162,12 +167,9 @@ pub async fn run(
                 fired.push((repo_id.clone(), trigger_path.clone()));
             }
         }
-        for (repo_id, trigger_path) in fired {
+        for (repo_id, reason) in fired {
             pending.remove(&repo_id);
-            info!(
-                "🔍 detected change in {}, rescanning...",
-                trigger_path.display()
-            );
+            info!("🔍  rescanning {} ({})", repo_id, reason);
             // Reset the repo's last_sync to force an immediate sync.
             let mut repos = daemon.repos.write().await;
             if let Some(tr) = repos.get_mut(&repo_id) {
@@ -192,26 +194,22 @@ fn add_repo_watches(
 
     let mut paths = Vec::new();
 
-    // Watch subdirectories recursively (refs/heads, refs/remotes).
     for subdir in WATCH_SUBDIRS {
         let p = git_dir.join(subdir);
         if p.exists() {
             watcher.watch(&p, RecursiveMode::Recursive)?;
-            paths.push(p.clone());
-            info!("👁️ watching {}", p.display());
+            paths.push(p);
         }
     }
-
-    // Watch individual files (HEAD).
     for file in WATCH_FILES {
         let p = git_dir.join(file);
         if p.exists() {
             watcher.watch(&p, RecursiveMode::NonRecursive)?;
-            paths.push(p.clone());
-            info!("👁️ watching {}", p.display());
+            paths.push(p);
         }
     }
 
+    info!("👁️  watching {}", git_dir.display());
     watched.insert(repo_id.to_string(), paths);
     Ok(())
 }
@@ -226,8 +224,41 @@ fn remove_repo_watches(
         for p in &paths {
             let _ = watcher.unwatch(p);
         }
-        info!("👁️ unwatched {}", repo_id);
+        info!("👁️  unwatched {}", repo_id);
     }
+}
+
+/// Derive a human-readable reason from a changed path.
+///
+/// Examples: "ref update (main)", "HEAD changed", "remote ref (origin/main)"
+fn describe_change(path: &Path) -> String {
+    let components: Vec<&str> = path
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+
+    // refs/heads/<branch>
+    if let Some(pos) = components.iter().position(|&c| c == "heads") {
+        let branch = components[pos + 1..].join("/");
+        if !branch.is_empty() {
+            return format!("ref update ({})", branch);
+        }
+    }
+
+    // refs/remotes/<remote>/<branch>
+    if let Some(pos) = components.iter().position(|&c| c == "remotes") {
+        let rest = components[pos + 1..].join("/");
+        if !rest.is_empty() {
+            return format!("remote ref ({})", rest);
+        }
+    }
+
+    // HEAD
+    if components.last() == Some(&"HEAD") {
+        return "HEAD changed".to_string();
+    }
+
+    format!("file changed ({})", path.display())
 }
 
 /// Check if a path is under refs/remotes/.
