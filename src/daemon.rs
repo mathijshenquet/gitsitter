@@ -699,6 +699,7 @@ async fn sync_loop(daemon: SharedDaemon, mut shutdown_rx: watch::Receiver<bool>)
 // ---------------------------------------------------------------------------
 
 async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
+    let sync_start = Instant::now();
     let repo_path = PathBuf::from(repo_id);
 
     // 1. Check repo exists
@@ -1268,6 +1269,9 @@ async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
             tr.last_sync = Some(Instant::now());
         }
     }
+
+    let elapsed = sync_start.elapsed();
+    info!("✅ sync completed for {} in {:.1?}", repo_id, elapsed);
 
     Ok(())
 }

@@ -92,6 +92,22 @@ pub async fn run(
                 if path.extension().is_some_and(|ext| ext == "lock") {
                     continue;
                 }
+
+                // Ignore refs/remotes/ changes shortly after a sync — these
+                // are our own fetch/push updating the remote tracking ref.
+                if is_remote_ref(&path) {
+                    let dominated = {
+                        let repos_guard = daemon.repos.read().await;
+                        resolve_repo_id_for_path(&path, &watched_repos)
+                            .and_then(|rid| repos_guard.get(&rid))
+                            .and_then(|tr| tr.last_sync)
+                            .is_some_and(|last| last.elapsed() < debounce * 5)
+                    };
+                    if dominated {
+                        continue;
+                    }
+                }
+
                 if let Some(repo_id) = resolve_repo_id_for_path(&path, &watched_repos) {
                     let display_path = path.clone();
                     pending
@@ -212,6 +228,12 @@ fn remove_repo_watches(
         }
         info!("👁️ unwatched {}", repo_id);
     }
+}
+
+/// Check if a path is under refs/remotes/.
+fn is_remote_ref(path: &Path) -> bool {
+    path.components().any(|c| c.as_os_str() == "remotes")
+        && path.components().any(|c| c.as_os_str() == "refs")
 }
 
 /// Given a changed path, figure out which repo_id it belongs to.
