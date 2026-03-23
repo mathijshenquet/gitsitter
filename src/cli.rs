@@ -216,53 +216,32 @@ fn print_repo_status(data: &transport::StatusData) {
 
 fn fallback_status(global: bool) -> Result<()> {
     let db = StateDb::open()?;
+    let config = config::UserConfig::load()?;
+
     if global {
-        let repos = db.list_repos()?;
+        let repos = crate::queries::build_global_status(&db, &config)?;
         if repos.is_empty() {
             println!("No repos registered.");
             return Ok(());
         }
-        for repo in &repos {
-            let dp = display_path(&repo.display_path);
-            let sync_info = match &repo.last_sync_at {
+        for r in &repos {
+            let dp = display_path(&r.display_path);
+            let sync_info = match &r.last_sync {
                 Some(ts) => format!("synced {}", format_relative_time(ts)),
                 None => "never synced".to_string(),
             };
             println!(
-                "\u{1F4E6} {}  (status: {}, {})",
-                dp, repo.status, sync_info
+                "\u{1F4E6} {}  ({}, {})",
+                dp, r.mode, sync_info
             );
-            // Show branches
-            let branches = db.list_branches(&repo.repo_id)?;
-            for b in &branches {
-                let icon = status_icon(&b.sync_status);
-                let label = status_label(&b.sync_status);
-                println!("  {:<16} {} {}", b.branch_name, icon, label);
-            }
+            println!("    {}", r.status_summary);
             println!();
         }
     } else {
         let repo_path = resolve_cwd_repo_path()?;
-        match db.get_repo(&repo_path)? {
-            Some(repo) => {
-                let dp = display_path(&repo.display_path);
-                let sync_info = match &repo.last_sync_at {
-                    Some(ts) => format!("synced {}", format_relative_time(ts)),
-                    None => "never synced".to_string(),
-                };
-                println!(
-                    "\u{1F4E6} {}  (status: {}, {})",
-                    dp, repo.status, sync_info
-                );
-                println!();
-                let branches = db.list_branches(&repo.repo_id)?;
-                for b in &branches {
-                    let icon = status_icon(&b.sync_status);
-                    let label = status_label(&b.sync_status);
-                    println!("  {:<16} {} {}", b.branch_name, icon, label);
-                }
-            }
-            None => {
+        match crate::queries::build_repo_status(&db, &config, &repo_path) {
+            Ok(data) => print_repo_status(&data),
+            Err(_) => {
                 println!("This repo is not registered with gitsitter.");
                 println!("Run `gitsitter enable` or `gitsitter register` to add it.");
             }
@@ -456,9 +435,7 @@ async fn handle_config_explain() -> Result<()> {
     let repo_id_path = PathBuf::from(&repo_path);
     let remote_url = git_ops::get_remote_url(&repo_id_path)?
         .unwrap_or_default();
-    let in_repo = config::InRepoConfig::load(
-        &git_ops::get_display_path(&repo_id_path)?,
-    )?;
+    let in_repo = crate::queries::load_in_repo_config(&repo_id_path)?;
 
     let repo_mode = cfg.resolve_repo_mode(
         &remote_url,

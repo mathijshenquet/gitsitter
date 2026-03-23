@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, Notify, RwLock, watch};
 use tracing::{error, info, warn};
 
 use crate::config::{
-    BranchSyncMode, InRepoConfig, RepoSyncMode, UserConfig,
+    BranchSyncMode, RepoSyncMode, UserConfig,
 };
 use crate::git_ops::{
     self, MergeAnalysis, PushResult,
@@ -23,7 +23,7 @@ use crate::git_ops::{
 use crate::paths;
 use crate::state::{BranchState, StateDb, WorktreeState};
 use crate::transport::{
-    self, BranchStatusData, RepoStatusData, Request, Response, StatusData,
+    self, Request, Response,
 };
 
 // ---------------------------------------------------------------------------
@@ -358,7 +358,6 @@ async fn handle_status(daemon: &SharedDaemon, repo_path: Option<String>) -> Resp
         }
     };
 
-    // Resolve repo_id from path
     let repo_id = match resolve_repo_id_from_path(&repo_path) {
         Ok(id) => id,
         Err(e) => {
@@ -370,117 +369,26 @@ async fn handle_status(daemon: &SharedDaemon, repo_path: Option<String>) -> Resp
     let repo_id_str = repo_id.to_string_lossy().to_string();
 
     let db = daemon.db.lock().await;
-
-    let repo_state = match db.get_repo(&repo_id_str) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            return Response::Error {
-                message: format!("repo not registered: {}", repo_path),
-            };
-        }
-        Err(e) => {
-            return Response::Error {
-                message: format!("database error: {}", e),
-            };
-        }
-    };
-
-    let branches_db = match db.list_branches(&repo_id_str) {
-        Ok(b) => b,
-        Err(e) => {
-            return Response::Error {
-                message: format!("database error: {}", e),
-            };
-        }
-    };
-
-    drop(db);
-
-    // Determine effective mode
     let config = daemon.config.read().await;
-    let remote_url = repo_state.remote_url.as_deref().unwrap_or("");
-    let in_repo = load_in_repo_config(&repo_id).ok().flatten();
-    let mode = config.resolve_repo_mode(remote_url, &repo_id_str, in_repo.as_ref());
-    drop(config);
 
-    let branches: Vec<BranchStatusData> = branches_db
-        .iter()
-        .map(|b| BranchStatusData {
-            name: b.branch_name.clone(),
-            upstream: None, // filled from git2 if needed
-            status: b.sync_status.clone(),
-            last_action: b
-                .last_pull_at
-                .as_ref()
-                .or(b.last_push_at.as_ref())
-                .cloned(),
-        })
-        .collect();
-
-    Response::Status {
-        data: StatusData {
-            repo_id: repo_id_str,
-            display_path: repo_state.display_path,
-            mode: format!("{:?}", mode).to_lowercase(),
-            last_sync: repo_state.last_sync_at,
-            branches,
+    match crate::queries::build_repo_status(&db, &config, &repo_id_str) {
+        Ok(data) => Response::Status { data },
+        Err(e) => Response::Error {
+            message: format!("{}", e),
         },
     }
 }
 
 async fn handle_global_status(daemon: &SharedDaemon) -> Response {
     let db = daemon.db.lock().await;
-    let repos = match db.list_repos() {
-        Ok(r) => r,
-        Err(e) => {
-            return Response::Error {
-                message: format!("database error: {}", e),
-            };
-        }
-    };
-
-    let mut result = Vec::new();
     let config = daemon.config.read().await;
 
-    for rs in &repos {
-        let remote_url = rs.remote_url.as_deref().unwrap_or("");
-        let repo_id_path = PathBuf::from(&rs.repo_id);
-        let in_repo = load_in_repo_config(&repo_id_path).ok().flatten();
-        let mode = config.resolve_repo_mode(remote_url, &rs.repo_id, in_repo.as_ref());
-
-        let branches = db.list_branches(&rs.repo_id).unwrap_or_default();
-        let total = branches.len();
-        let synced = branches
-            .iter()
-            .filter(|b| b.sync_status == "synced" || b.sync_status == "up_to_date")
-            .count();
-        let diverged = branches
-            .iter()
-            .filter(|b| b.sync_status == "diverged")
-            .count();
-
-        let status_summary = if rs.status == "disabled" {
-            "disabled".to_string()
-        } else if rs.status == "missing" {
-            "missing".to_string()
-        } else if diverged > 0 {
-            format!("{}/{} diverged", diverged, total)
-        } else {
-            format!("{} synced", synced)
-        };
-
-        result.push(RepoStatusData {
-            display_path: rs.display_path.clone(),
-            mode: format!("{:?}", mode).to_lowercase(),
-            status_summary,
-            last_sync: rs.last_sync_at.clone(),
-        });
+    match crate::queries::build_global_status(&db, &config) {
+        Ok(repos) => Response::GlobalStatus { repos },
+        Err(e) => Response::Error {
+            message: format!("database error: {}", e),
+        },
     }
-
-    drop(config);
-    drop(db);
-
-    Response::GlobalStatus { repos: result }
 }
 
 async fn handle_sync(
@@ -841,7 +749,7 @@ async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
             .unwrap_or_default()
     };
 
-    let in_repo_config = load_in_repo_config(&repo_path).ok().flatten();
+    let in_repo_config = crate::queries::load_in_repo_config(&repo_path).ok().flatten();
     let repo_mode = config.resolve_repo_mode(
         &remote_url,
         repo_id,
@@ -1379,10 +1287,3 @@ fn resolve_repo_id_from_path(path: &str) -> Result<PathBuf> {
     git_ops::discover_repo_id(p)
 }
 
-/// Load the in-repo `.gitsitter.toml` config if it exists.
-fn load_in_repo_config(repo_id: &Path) -> Result<Option<InRepoConfig>> {
-    // The repo_id is the common git dir (e.g. /path/to/repo/.git).
-    // The in-repo config lives in the working tree root.
-    let display_path = git_ops::get_display_path(repo_id)?;
-    InRepoConfig::load(&display_path)
-}
