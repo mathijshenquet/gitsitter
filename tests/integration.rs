@@ -1104,199 +1104,785 @@ mod git_ops_tests {
 }
 
 // ===========================================================================
-// 5. End-to-End Integration Test
+// 5. End-to-End Integration Tests
 // ===========================================================================
 
-#[tokio::test]
-async fn end_to_end_daemon_integration() {
+mod e2e_tests {
+    use super::*;
+    use serial_test::serial;
+    use std::path::PathBuf;
     use tokio::net::UnixStream;
+    use tokio::task::JoinHandle;
 
-    let tmp = TempDir::new().unwrap();
-    let base = tmp.path();
-    let (config_dir, _state_dir, socket_path) = setup_test_env(base);
+    // -----------------------------------------------------------------------
+    // Shared harness
+    // -----------------------------------------------------------------------
 
-    // Write a minimal config
-    let config_toml = r#"
+    struct E2eHarness {
+        _tmp: TempDir,
+        socket_path: PathBuf,
+        repo_id_str: String,
+        local_dir: PathBuf,
+        bare_dir: PathBuf,
+        branch_name: String,
+        daemon_handle: JoinHandle<()>,
+    }
+
+    impl E2eHarness {
+        /// Boot a daemon with a bare remote + local clone already registered.
+        /// `repo_mode` controls the sync mode written to config (e.g. "push+pull").
+        async fn start(repo_mode: &str) -> Self {
+            let tmp = TempDir::new().unwrap();
+            let base = tmp.path().to_path_buf();
+            let (config_dir, _state_dir, socket_path) = setup_test_env(&base);
+
+            // Create bare remote via a temp working copy
+            let bare_dir = base.join("remote.git");
+            let init_dir = base.join("init_tmp");
+            let init_repo = git2::Repository::init(&init_dir).unwrap();
+            make_commit(&init_repo, "README.md", "initial", "Initial commit");
+            create_bare_repo(&bare_dir);
+
+            let branch_name = init_repo
+                .head()
+                .unwrap()
+                .shorthand()
+                .unwrap()
+                .to_string();
+
+            let mut remote = init_repo
+                .remote("origin", &format!("file://{}", bare_dir.display()))
+                .unwrap();
+            remote
+                .push(
+                    &[&format!(
+                        "refs/heads/{}:refs/heads/{}",
+                        branch_name, branch_name
+                    )],
+                    None,
+                )
+                .unwrap();
+            drop(remote);
+            drop(init_repo);
+
+            // Clone
+            let local_dir = base.join("local");
+            let _local_repo = clone_repo(&bare_dir, &local_dir);
+
+            let repo_id =
+                gitsitter::git_ops::discover_repo_id(&local_dir).unwrap();
+            let repo_id_str = repo_id.to_string_lossy().to_string();
+
+            // Write config with explicit per-repo mode.
+            let config_toml = format!(
+                r#"
 [global]
-refresh_interval = "2s"
-"#;
-    std::fs::write(config_dir.join("config.toml"), config_toml).unwrap();
+refresh_interval = "1s"
 
-    // Create a "remote" bare repo and a "local" clone
-    let bare_dir = base.join("remote.git");
-    let local_dir = base.join("local");
+[repos."{}"]
+mode = "{}"
+"#,
+                repo_id_str, repo_mode
+            );
+            std::fs::write(config_dir.join("config.toml"), &config_toml).unwrap();
 
-    // Initialize bare repo with an initial commit via a temp working copy
-    let init_dir = base.join("init_tmp");
-    let init_repo = git2::Repository::init(&init_dir).unwrap();
-    make_commit(&init_repo, "README.md", "initial", "Initial commit");
-    // Push to bare repo
-    create_bare_repo(&bare_dir);
-    let mut remote = init_repo
-        .remote("origin", &format!("file://{}", bare_dir.display()))
-        .unwrap();
-    remote
-        .push(&["refs/heads/master:refs/heads/master"], None)
-        .ok();
-    // Check if the branch is main or master
-    let branch_name = {
-        let head = init_repo.head().unwrap();
-        head.shorthand().unwrap().to_string()
-    };
-    if branch_name != "master" {
+            // Start daemon
+            let daemon_handle = tokio::spawn(async move {
+                let _ = gitsitter::daemon::run_daemon().await;
+            });
+
+            // Wait for socket
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if socket_path.exists() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    break;
+                }
+                if tokio::time::Instant::now() > deadline {
+                    panic!("daemon socket did not appear within 5 seconds");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            // Register the repo
+            let resp = Self::roundtrip_static(
+                &socket_path,
+                &Request::Register {
+                    repo_path: repo_id_str.clone(),
+                },
+            )
+            .await;
+            match &resp {
+                Response::Ok { .. } => {}
+                other => panic!("register failed: {:?}", other),
+            }
+
+            Self {
+                _tmp: tmp,
+                socket_path,
+                repo_id_str,
+                local_dir,
+                bare_dir,
+                branch_name,
+                daemon_handle,
+            }
+        }
+
+        async fn roundtrip_static(
+            socket: &std::path::Path,
+            req: &Request,
+        ) -> Response {
+            let mut stream = UnixStream::connect(socket).await.unwrap();
+            let (mut reader, mut writer) = stream.split();
+            transport::send_request(&mut writer, req).await.unwrap();
+            transport::recv_response(&mut reader).await.unwrap()
+        }
+
+        async fn roundtrip(&self, req: &Request) -> Response {
+            Self::roundtrip_static(&self.socket_path, req).await
+        }
+
+        /// Trigger a sync and poll until the branch appears in the DB with
+        /// one of the expected statuses, or until `timeout` elapses.
+        async fn trigger_sync_and_wait_for(
+            &self,
+            expected_statuses: &[&str],
+            timeout: Duration,
+        ) {
+            self.roundtrip(&Request::Sync {
+                repo_path: Some(self.repo_id_str.clone()),
+                all: false,
+            })
+            .await;
+
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if let Some(bs) = self.get_branch_status(&self.branch_name) {
+                    if expected_statuses.contains(&bs.sync_status.as_str()) {
+                        return;
+                    }
+                }
+                if tokio::time::Instant::now() > deadline {
+                    return; // let the caller's assert produce the error
+                }
+            }
+        }
+
+        /// Open a second clone of the same bare repo ("another user").
+        fn open_second_clone(&self) -> (TempDir, git2::Repository) {
+            let tmp = TempDir::new().unwrap();
+            let repo = clone_repo(&self.bare_dir, tmp.path());
+            (tmp, repo)
+        }
+
+        /// Get the branch status from the state DB.
+        fn get_branch_status(&self, branch: &str) -> Option<BranchState> {
+            let db = StateDb::open().unwrap();
+            db.get_branch(&self.repo_id_str, branch).unwrap()
+        }
+
+        /// Open the local repo via git2.
+        fn open_local_repo(&self) -> git2::Repository {
+            git2::Repository::open(&self.local_dir).unwrap()
+        }
+
+        async fn shutdown(self) {
+            let _ = self
+                .roundtrip(&Request::Shutdown)
+                .await;
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                self.daemon_handle,
+            )
+            .await;
+            teardown_test_env();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests
+    // -----------------------------------------------------------------------
+
+    /// Basic lifecycle: register, status, daemon-status, config-update, shutdown.
+    #[tokio::test]
+    #[serial]
+    async fn daemon_lifecycle() {
+        let h = E2eHarness::start("push+pull").await;
+
+        // Verify repo in state DB
+        {
+            let db = StateDb::open().unwrap();
+            let repo = db.get_repo(&h.repo_id_str).unwrap();
+            assert!(
+                repo.is_some(),
+                "repo should exist in state DB after registration"
+            );
+        }
+
+        // Status
+        let resp = h
+            .roundtrip(&Request::Status {
+                repo_path: Some(h.repo_id_str.clone()),
+                global: false,
+            })
+            .await;
+        match &resp {
+            Response::Status { data } => {
+                assert_eq!(data.repo_id, h.repo_id_str);
+            }
+            Response::Error { message } => {
+                eprintln!("status error (may be expected): {}", message);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+
+        // DaemonStatus
+        let resp = h.roundtrip(&Request::DaemonStatus).await;
+        match &resp {
+            Response::DaemonStatus {
+                pid,
+                repos_watched,
+                ..
+            } => {
+                assert!(*pid > 0);
+                assert!(*repos_watched >= 1);
+            }
+            other => panic!("unexpected: {:?}", other),
+        }
+
+        // ConfigUpdate
+        let resp = h
+            .roundtrip(&Request::ConfigUpdate {
+                repo_path: Some(h.repo_id_str.clone()),
+            })
+            .await;
+        assert!(matches!(resp, Response::Ok { .. }));
+
+        // Shutdown cleans up socket
+        let socket = h.socket_path.clone();
+        h.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !socket.exists(),
+            "socket should be removed after shutdown"
+        );
+    }
+
+    /// A local commit is auto-pushed to the remote.
+    #[tokio::test]
+    #[serial]
+    async fn local_commit_is_pushed() {
+        let h = E2eHarness::start("push+pull").await;
+
+        // Make a local commit
+        let local_repo = h.open_local_repo();
+        make_commit(&local_repo, "new.txt", "hello", "Add new file");
+        let local_oid = local_repo
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        drop(local_repo);
+
+        // Trigger sync and wait for push to complete
+        h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
+
+        // Verify branch is synced
+        let bs = h.get_branch_status(&h.branch_name);
+        assert!(bs.is_some(), "branch should exist in state DB");
+        let bs = bs.unwrap();
+        assert_eq!(
+            bs.sync_status, "synced",
+            "branch should be synced after push, got: {} (error: {:?})",
+            bs.sync_status, bs.error_message
+        );
+
+        // Verify the remote has the commit
+        let bare = git2::Repository::open_bare(&h.bare_dir).unwrap();
+        let remote_ref = bare
+            .find_reference(&format!("refs/heads/{}", h.branch_name))
+            .unwrap();
+        assert_eq!(
+            remote_ref.target().unwrap().to_string(),
+            local_oid,
+            "remote should have the local commit"
+        );
+
+        h.shutdown().await;
+    }
+
+    /// A remote update is fast-forward merged into the local branch.
+    #[tokio::test]
+    #[serial]
+    async fn remote_update_is_pulled() {
+        let h = E2eHarness::start("push+pull").await;
+
+        // Simulate another user pushing to the remote
+        let (_tmp2, other_clone) = h.open_second_clone();
+        make_commit(
+            &other_clone,
+            "remote_file.txt",
+            "from remote",
+            "Remote commit",
+        );
+        let expected_oid = other_clone
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        // Push to bare
+        let mut remote = other_clone.find_remote("origin").unwrap();
         remote
             .push(
                 &[&format!(
                     "refs/heads/{}:refs/heads/{}",
-                    branch_name, branch_name
+                    h.branch_name, h.branch_name
                 )],
                 None,
             )
-            .ok();
+            .unwrap();
+        drop(remote);
+        drop(other_clone);
+
+        // Trigger sync — daemon should fetch + ff-merge
+        h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
+
+        let bs = h.get_branch_status(&h.branch_name);
+        assert!(bs.is_some(), "branch should exist in state DB");
+        let bs = bs.unwrap();
+        assert_eq!(
+            bs.sync_status, "synced",
+            "branch should be synced after pull, got: {} (error: {:?})",
+            bs.sync_status, bs.error_message
+        );
+
+        // Verify local repo has the remote commit
+        let local_repo = h.open_local_repo();
+        let local_oid = local_repo
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            local_oid, expected_oid,
+            "local should have been fast-forwarded to the remote commit"
+        );
+
+        h.shutdown().await;
     }
-    drop(remote);
-    drop(init_repo);
 
-    // Clone the bare repo
-    let local_repo = clone_repo(&bare_dir, &local_dir);
-    make_commit(&local_repo, "file1.txt", "content1", "Add file1");
+    /// Diverged branches: local and remote both have independent commits.
+    #[tokio::test]
+    #[serial]
+    async fn diverged_branches_detected() {
+        let h = E2eHarness::start("pull").await;
 
-    // Discover the repo_id for later use
-    let repo_id = gitsitter::git_ops::discover_repo_id(&local_dir).unwrap();
-    let repo_id_str = repo_id.to_string_lossy().to_string();
+        // Make a local commit (won't be pushed because mode is "pull")
+        let local_repo = h.open_local_repo();
+        make_commit(
+            &local_repo,
+            "local_only.txt",
+            "local",
+            "Local-only commit",
+        );
+        drop(local_repo);
 
-    // Start the daemon in a background task
-    let daemon_handle = tokio::spawn(async move {
-        // run_daemon installs its own tracing subscriber, which may conflict.
-        // We ignore errors from the daemon since it will be shut down.
-        let _ = gitsitter::daemon::run_daemon().await;
-    });
+        // Push an independent commit to the remote via second clone
+        let (_tmp2, other_clone) = h.open_second_clone();
+        make_commit(
+            &other_clone,
+            "remote_only.txt",
+            "remote",
+            "Remote-only commit",
+        );
+        let mut remote = other_clone.find_remote("origin").unwrap();
+        remote
+            .push(
+                &[&format!(
+                    "refs/heads/{}:refs/heads/{}",
+                    h.branch_name, h.branch_name
+                )],
+                None,
+            )
+            .unwrap();
+        drop(remote);
+        drop(other_clone);
 
-    // Wait for the daemon socket to appear (up to 5 seconds)
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if socket_path.exists() {
-            // Give it a tiny bit more time to be ready to accept connections
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            break;
+        // Trigger sync — daemon should detect divergence
+        h.trigger_sync_and_wait_for(&["diverged"], Duration::from_secs(10)).await;
+
+        let bs = h.get_branch_status(&h.branch_name);
+        assert!(bs.is_some(), "branch should exist in state DB");
+        let bs = bs.unwrap();
+        assert_eq!(
+            bs.sync_status, "diverged",
+            "branch should be diverged, got: {} (error: {:?})",
+            bs.sync_status, bs.error_message
+        );
+        assert!(
+            bs.error_message
+                .as_deref()
+                .unwrap_or("")
+                .contains("diverged"),
+            "error_message should mention divergence"
+        );
+
+        h.shutdown().await;
+    }
+
+    /// Push rejected by a server-side pre-receive hook.
+    #[tokio::test]
+    #[serial]
+    async fn push_rejected_by_hook() {
+        let h = E2eHarness::start("push+pull").await;
+
+        // Install a pre-receive hook that rejects all pushes
+        let hooks_dir = h.bare_dir.join("hooks");
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        let hook_path = hooks_dir.join("pre-receive");
+        std::fs::write(
+            &hook_path,
+            "#!/bin/sh\necho 'rejected by policy'\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &hook_path,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
         }
-        if tokio::time::Instant::now() > deadline {
-            panic!("daemon socket did not appear within 5 seconds");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Make a local commit
+        let local_repo = h.open_local_repo();
+        make_commit(
+            &local_repo,
+            "blocked.txt",
+            "should not arrive",
+            "Blocked commit",
+        );
+        drop(local_repo);
+
+        // Trigger sync — push should be rejected
+        h.trigger_sync_and_wait_for(&["push_rejected"], Duration::from_secs(10)).await;
+
+        let bs = h.get_branch_status(&h.branch_name);
+        assert!(bs.is_some(), "branch should exist in state DB");
+        let bs = bs.unwrap();
+        assert_eq!(
+            bs.sync_status, "push_rejected",
+            "branch should be push_rejected, got: {} (error: {:?})",
+            bs.sync_status, bs.error_message
+        );
+
+        h.shutdown().await;
     }
 
-    // Helper: send a request and get a response
-    async fn roundtrip(socket: &std::path::Path, req: &Request) -> Response {
-        let mut stream = UnixStream::connect(socket).await.unwrap();
-        let (mut reader, mut writer) = stream.split();
-        transport::send_request(&mut writer, req).await.unwrap();
-        transport::recv_response(&mut reader).await.unwrap()
+    /// Dirty worktree prevents fast-forward pull.
+    #[tokio::test]
+    #[serial]
+    async fn dirty_worktree_blocks_ff() {
+        let h = E2eHarness::start("push+pull").await;
+
+        // Push a commit to the remote via second clone
+        let (_tmp2, other_clone) = h.open_second_clone();
+        make_commit(
+            &other_clone,
+            "remote_new.txt",
+            "from remote",
+            "Remote commit",
+        );
+        let mut remote = other_clone.find_remote("origin").unwrap();
+        remote
+            .push(
+                &[&format!(
+                    "refs/heads/{}:refs/heads/{}",
+                    h.branch_name, h.branch_name
+                )],
+                None,
+            )
+            .unwrap();
+        drop(remote);
+        drop(other_clone);
+
+        // Make the local worktree dirty (modify tracked file without committing)
+        std::fs::write(
+            h.local_dir.join("README.md"),
+            "uncommitted changes",
+        )
+        .unwrap();
+
+        // Trigger sync — should detect pending_ff_dirty
+        h.trigger_sync_and_wait_for(&["pending_ff_dirty"], Duration::from_secs(10)).await;
+
+        let bs = h.get_branch_status(&h.branch_name);
+        assert!(bs.is_some(), "branch should exist in state DB");
+        let bs = bs.unwrap();
+        assert_eq!(
+            bs.sync_status, "pending_ff_dirty",
+            "branch should be pending_ff_dirty, got: {} (error: {:?})",
+            bs.sync_status, bs.error_message
+        );
+
+        h.shutdown().await;
     }
 
-    // Test 1: Register the repo
-    let resp = roundtrip(
-        &socket_path,
-        &Request::Register {
-            repo_path: repo_id_str.clone(),
-        },
-    )
-    .await;
-    match &resp {
-        Response::Ok { message } => {
-            assert!(
-                message.contains("registered") || message.contains("already"),
-                "unexpected ok message: {}",
-                message
+    /// Operation in progress (index.lock) causes daemon to skip sync.
+    #[tokio::test]
+    #[serial]
+    async fn operation_in_progress_skips_sync() {
+        let h = E2eHarness::start("push+pull").await;
+
+        // Make a local commit so there's something to push
+        let local_repo = h.open_local_repo();
+        make_commit(
+            &local_repo,
+            "will_push.txt",
+            "data",
+            "Commit to push",
+        );
+        drop(local_repo);
+
+        // Place an index.lock to simulate an in-progress operation
+        let lock_path = h.local_dir.join(".git/index.lock");
+        std::fs::write(&lock_path, "").unwrap();
+
+        // Trigger sync — should be skipped due to index.lock
+        h.roundtrip(&Request::Sync {
+            repo_path: Some(h.repo_id_str.clone()),
+            all: false,
+        })
+        .await;
+        // Wait a few sync cycles
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        // Branch should NOT be recorded as synced (no sync happened)
+        let bs = h.get_branch_status(&h.branch_name);
+        // Either None (never recorded) or not "synced" — the daemon
+        // skips entirely when index.lock exists.
+        if let Some(bs) = &bs {
+            assert_ne!(
+                bs.sync_status, "synced",
+                "branch should not be synced while index.lock exists"
             );
         }
-        Response::Error { message } => {
-            panic!("register failed: {}", message);
-        }
-        other => panic!("unexpected response: {:?}", other),
+
+        // Remove lock and sync again — should succeed now
+        std::fs::remove_file(&lock_path).unwrap();
+        h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
+
+        let bs = h.get_branch_status(&h.branch_name);
+        assert!(bs.is_some(), "branch should exist after lock removed");
+        let bs = bs.unwrap();
+        assert_eq!(
+            bs.sync_status, "synced",
+            "branch should be synced after lock removed, got: {} (error: {:?})",
+            bs.sync_status, bs.error_message
+        );
+
+        h.shutdown().await;
     }
 
-    // Test 2: Verify the repo is in the state DB
-    {
-        let db = StateDb::open().unwrap();
-        let repo = db.get_repo(&repo_id_str).unwrap();
-        assert!(repo.is_some(), "repo should exist in state DB after registration");
+    /// Pull-only mode: local commits are NOT pushed (status should be "local_ahead").
+    #[tokio::test]
+    #[serial]
+    async fn pull_only_local_ahead_not_pushed() {
+        let h = E2eHarness::start("pull").await;
+
+        // Make a local commit — should NOT be pushed in pull-only mode
+        let local_repo = h.open_local_repo();
+        make_commit(
+            &local_repo,
+            "local_only.txt",
+            "content",
+            "Local commit",
+        );
+        let local_oid = local_repo
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        drop(local_repo);
+
+        h.trigger_sync_and_wait_for(&["local_ahead"], Duration::from_secs(10)).await;
+
+        let bs = h.get_branch_status(&h.branch_name);
+        assert!(bs.is_some(), "branch should exist in state DB");
+        let bs = bs.unwrap();
+        assert_eq!(
+            bs.sync_status, "local_ahead",
+            "pull-only mode should report local_ahead, got: {} (error: {:?})",
+            bs.sync_status, bs.error_message
+        );
+
+        // Verify remote does NOT have the local commit
+        let bare = git2::Repository::open_bare(&h.bare_dir).unwrap();
+        let remote_oid = bare
+            .find_reference(&format!("refs/heads/{}", h.branch_name))
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        assert_ne!(
+            remote_oid, local_oid,
+            "remote should NOT have the local commit in pull-only mode"
+        );
+
+        h.shutdown().await;
     }
 
-    // Test 3: Status request
-    let resp = roundtrip(
-        &socket_path,
-        &Request::Status {
-            repo_path: Some(repo_id_str.clone()),
-            global: false,
-        },
-    )
-    .await;
-    match &resp {
-        Response::Status { data } => {
-            assert_eq!(data.repo_id, repo_id_str);
-        }
-        Response::Error { message } => {
-            // This is acceptable if the repo is still being set up
-            eprintln!("status returned error (may be expected): {}", message);
-        }
-        other => panic!("unexpected response: {:?}", other),
+    /// Push-only mode: local commits are pushed but remote-ahead is not pulled.
+    #[tokio::test]
+    #[serial]
+    async fn push_only_mode() {
+        let h = E2eHarness::start("push").await;
+
+        // Make a local commit — should be pushed
+        let local_repo = h.open_local_repo();
+        make_commit(
+            &local_repo,
+            "pushed.txt",
+            "content",
+            "Local commit",
+        );
+        let local_oid = local_repo
+            .head()
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        drop(local_repo);
+
+        h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
+
+        // Verify push happened
+        let bare = git2::Repository::open_bare(&h.bare_dir).unwrap();
+        let remote_oid = bare
+            .find_reference(&format!("refs/heads/{}", h.branch_name))
+            .unwrap()
+            .target()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            remote_oid, local_oid,
+            "remote should have the local commit after push"
+        );
+
+        h.shutdown().await;
     }
 
-    // Test 4: DaemonStatus request
-    let resp = roundtrip(&socket_path, &Request::DaemonStatus).await;
-    match &resp {
-        Response::DaemonStatus {
-            pid,
-            uptime_secs: _,
-            repos_watched,
-        } => {
-            assert!(*pid > 0);
-            assert!(*repos_watched >= 1);
-        }
-        other => panic!("unexpected response: {:?}", other),
+    /// Fetch-only mode: remote changes are fetched but local branch is NOT
+    /// fast-forwarded (status should be "remote_ahead").
+    #[tokio::test]
+    #[serial]
+    async fn fetch_only_mode_no_merge() {
+        let h = E2eHarness::start("fetch").await;
+
+        // Push a commit to the remote via second clone
+        let (_tmp2, other_clone) = h.open_second_clone();
+        make_commit(
+            &other_clone,
+            "fetched.txt",
+            "content",
+            "Remote-only",
+        );
+        let mut remote = other_clone.find_remote("origin").unwrap();
+        remote
+            .push(
+                &[&format!(
+                    "refs/heads/{}:refs/heads/{}",
+                    h.branch_name, h.branch_name
+                )],
+                None,
+            )
+            .unwrap();
+        drop(remote);
+        drop(other_clone);
+
+        h.trigger_sync_and_wait_for(
+            &["remote_ahead"],
+            Duration::from_secs(10),
+        )
+        .await;
+
+        let bs = h.get_branch_status(&h.branch_name);
+        assert!(bs.is_some(), "branch should exist in state DB");
+        let bs = bs.unwrap();
+        assert_eq!(
+            bs.sync_status, "remote_ahead",
+            "fetch-only mode should report remote_ahead, got: {} (error: {:?})",
+            bs.sync_status, bs.error_message
+        );
+
+        // Verify local branch was NOT updated
+        let file = h.local_dir.join("fetched.txt");
+        assert!(
+            !file.exists(),
+            "fetched.txt should not exist in worktree in fetch-only mode"
+        );
+
+        h.shutdown().await;
     }
 
-    // Test 5: Config update
-    let resp = roundtrip(
-        &socket_path,
-        &Request::ConfigUpdate {
-            repo_path: Some(repo_id_str.clone()),
-        },
-    )
-    .await;
-    match &resp {
-        Response::Ok { .. } => {}
-        other => panic!("unexpected response to config update: {:?}", other),
+    /// Explicit sync request triggers immediate processing.
+    #[tokio::test]
+    #[serial]
+    async fn explicit_sync_request() {
+        let h = E2eHarness::start("push+pull").await;
+
+        let local_repo = h.open_local_repo();
+        make_commit(
+            &local_repo,
+            "sync_me.txt",
+            "data",
+            "Commit for explicit sync",
+        );
+        drop(local_repo);
+
+        // Send explicit sync and wait for it to complete
+        h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
+
+        let bs = h.get_branch_status(&h.branch_name);
+        assert!(bs.is_some());
+        let bs = bs.unwrap();
+        assert_eq!(
+            bs.sync_status, "synced",
+            "should be synced after explicit sync, got: {} (error: {:?})",
+            bs.sync_status, bs.error_message
+        );
+
+        h.shutdown().await;
     }
 
-    // Test 6: Shutdown the daemon
-    let resp = roundtrip(&socket_path, &Request::Shutdown).await;
-    match &resp {
-        Response::Ok { message } => {
-            assert!(
-                message.to_lowercase().contains("shutting down")
-                    || message.to_lowercase().contains("shutdown"),
-                "unexpected shutdown message: {}",
-                message
-            );
+    /// PromptCheck registers the repo and returns status.
+    #[tokio::test]
+    #[serial]
+    async fn prompt_check_registers_and_returns_status() {
+        let h = E2eHarness::start("push+pull").await;
+
+        let resp = h
+            .roundtrip(&Request::PromptCheck {
+                repo_path: h.local_dir.to_string_lossy().to_string(),
+            })
+            .await;
+        match &resp {
+            Response::Status { data } => {
+                assert_eq!(data.repo_id, h.repo_id_str);
+            }
+            Response::Error { message } => {
+                panic!("prompt_check failed: {}", message);
+            }
+            other => panic!("unexpected: {:?}", other),
         }
-        other => {
-            // Connection may close before response, that's OK
-            eprintln!("shutdown response: {:?}", other);
-        }
+
+        h.shutdown().await;
     }
-
-    // Wait for daemon to finish (with timeout)
-    let _ = tokio::time::timeout(Duration::from_secs(10), daemon_handle).await;
-
-    // Test 7: Verify clean shutdown - socket should be removed
-    // Give the daemon a moment to clean up
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(
-        !socket_path.exists(),
-        "socket file should be removed after shutdown"
-    );
-
-    teardown_test_env();
 }

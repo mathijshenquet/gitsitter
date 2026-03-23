@@ -111,6 +111,7 @@ impl std::fmt::Display for RepoSyncMode {
 pub enum BranchSyncMode {
     Inherit,
     None,
+    Fetch,
     Pull,
     Push,
     #[serde(rename = "push+pull")]
@@ -627,14 +628,16 @@ impl UserConfig {
         repo_path: &str,
         in_repo_config: Option<&InRepoConfig>,
     ) -> RepoSyncMode {
-        // Step 0: host trust check
-        if let Some(host) = extract_host(remote_url) {
-            if !self.is_host_trusted(&host) {
+        // Step 0: host trust check (local file:// URLs are always trusted)
+        if !remote_url.starts_with("file://") {
+            if let Some(host) = extract_host(remote_url) {
+                if !self.is_host_trusted(&host) {
+                    return RepoSyncMode::None;
+                }
+            } else {
+                // Can't determine host — don't make network requests
                 return RepoSyncMode::None;
             }
-        } else {
-            // Can't determine host — don't make network requests
-            return RepoSyncMode::None;
         }
 
         // Step 1 & 2: user per-repo config
@@ -777,7 +780,7 @@ impl UserConfig {
 fn branch_mode_from_repo(repo_mode: RepoSyncMode) -> BranchSyncMode {
     match repo_mode {
         RepoSyncMode::None => BranchSyncMode::None,
-        RepoSyncMode::Fetch => BranchSyncMode::None, // fetch is repo-wide, branches don't "fetch"
+        RepoSyncMode::Fetch => BranchSyncMode::Fetch,
         RepoSyncMode::Pull => BranchSyncMode::Pull,
         RepoSyncMode::Push => BranchSyncMode::Push,
         RepoSyncMode::PushPull => BranchSyncMode::PushPull,

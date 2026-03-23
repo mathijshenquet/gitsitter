@@ -147,14 +147,14 @@ pub async fn run_daemon() -> Result<()> {
     // 3. Set up tracing (log to stderr — captured by systemd/journald,
     //    redirected to daemon.log by `daemon start`, or visible in terminal
     //    when running `daemon run` interactively)
-    tracing_subscriber::fmt()
+    let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .with_target(false)
-        .init();
+        .try_init();
 
     info!("gitsitter daemon starting (pid={})", pid);
 
