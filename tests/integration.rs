@@ -911,6 +911,9 @@ mod transport_tests {
                 follow: false,
                 since: None,
             },
+            Request::PromptCheck {
+                repo_path: "/repo".into(),
+            },
             Request::DaemonStatus,
             Request::Shutdown,
         ];

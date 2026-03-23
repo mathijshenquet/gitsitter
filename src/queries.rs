@@ -65,7 +65,7 @@ pub fn build_repo_status(
     Ok(StatusData {
         repo_id: repo_id.to_string(),
         display_path: repo_state.display_path,
-        mode: format!("{:?}", mode).to_lowercase(),
+        mode: mode.to_string(),
         last_sync: repo_state.last_sync_at,
         branches,
     })
@@ -108,7 +108,7 @@ pub fn build_global_status(
 
         result.push(RepoStatusData {
             display_path: rs.display_path.clone(),
-            mode: format!("{:?}", mode).to_lowercase(),
+            mode: mode.to_string(),
             status_summary,
             last_sync: rs.last_sync_at.clone(),
         });

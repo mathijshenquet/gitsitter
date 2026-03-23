@@ -780,21 +780,42 @@ pub async fn handle_daemon_start() -> Result<()> {
         return Ok(());
     }
 
-    // Try systemd first
-    let systemd_result = tokio::process::Command::new("systemctl")
-        .args(["--user", "start", "gitsitter"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .status()
-        .await;
-
-    match systemd_result {
-        Ok(status) if status.success() => {
-            println!("gitsitter daemon started via systemd");
-            return Ok(());
+    // Try platform service manager first
+    if cfg!(target_os = "macos") {
+        let plist_path = dirs::home_dir()
+            .map(|h| h.join("Library/LaunchAgents/com.gitsitter.daemon.plist"));
+        if let Some(ref p) = plist_path {
+            if p.exists() {
+                let result = tokio::process::Command::new("launchctl")
+                    .args(["load", &p.display().to_string()])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .status()
+                    .await;
+                if let Ok(status) = result {
+                    if status.success() {
+                        println!("gitsitter daemon started via launchd");
+                        return Ok(());
+                    }
+                }
+            }
         }
-        _ => {
-            // systemd not available or unit not installed -- spawn directly
+    } else {
+        let systemd_result = tokio::process::Command::new("systemctl")
+            .args(["--user", "start", "gitsitter"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .status()
+            .await;
+
+        match systemd_result {
+            Ok(status) if status.success() => {
+                println!("gitsitter daemon started via systemd");
+                return Ok(());
+            }
+            _ => {
+                // systemd not available or unit not installed -- spawn directly
+            }
         }
     }
 
@@ -869,18 +890,37 @@ pub async fn handle_install(component: Option<String>, shell_name: Option<String
             println!("Shell hook installed for {sh}");
         }
         "daemon" => {
-            // Generate systemd unit file
-            let unit_dir = dirs::home_dir()
-                .context("cannot determine home directory")?
-                .join(".config/systemd/user");
-            std::fs::create_dir_all(&unit_dir)?;
             let exe = std::env::current_exe()?;
-            let unit = include_str!("embed/gitsitter.service")
-                .replace("@@EXEC_PATH@@", &exe.display().to_string());
-            let unit_path = unit_dir.join("gitsitter.service");
-            std::fs::write(&unit_path, unit)?;
-            println!("Systemd user service written to {}", unit_path.display());
-            println!("Run: systemctl --user daemon-reload && systemctl --user enable --now gitsitter");
+            if cfg!(target_os = "macos") {
+                // Generate launchd plist
+                let launch_agents = dirs::home_dir()
+                    .context("cannot determine home directory")?
+                    .join("Library/LaunchAgents");
+                std::fs::create_dir_all(&launch_agents)?;
+                let log_dir = dirs::home_dir()
+                    .context("cannot determine home directory")?
+                    .join("Library/Logs/gitsitter");
+                std::fs::create_dir_all(&log_dir)?;
+                let plist = include_str!("embed/com.gitsitter.daemon.plist")
+                    .replace("@@EXEC_PATH@@", &exe.display().to_string())
+                    .replace("@@LOG_DIR@@", &log_dir.display().to_string());
+                let plist_path = launch_agents.join("com.gitsitter.daemon.plist");
+                std::fs::write(&plist_path, plist)?;
+                println!("launchd plist written to {}", plist_path.display());
+                println!("Run: launchctl load {}", plist_path.display());
+            } else {
+                // Generate systemd unit file
+                let unit_dir = dirs::home_dir()
+                    .context("cannot determine home directory")?
+                    .join(".config/systemd/user");
+                std::fs::create_dir_all(&unit_dir)?;
+                let unit = include_str!("embed/gitsitter.service")
+                    .replace("@@EXEC_PATH@@", &exe.display().to_string());
+                let unit_path = unit_dir.join("gitsitter.service");
+                std::fs::write(&unit_path, unit)?;
+                println!("Systemd user service written to {}", unit_path.display());
+                println!("Run: systemctl --user daemon-reload && systemctl --user enable --now gitsitter");
+            }
         }
         _ => bail!("unknown component: {}. Use 'shell', 'hooks', 'daemon', or 'all'", comp),
     }
@@ -888,7 +928,11 @@ pub async fn handle_install(component: Option<String>, shell_name: Option<String
     if comp == "all" {
         // Also offer daemon install hint
         println!();
-        println!("To also install the systemd service, run: gitsitter install daemon");
+        if cfg!(target_os = "macos") {
+            println!("To also install the launchd service, run: gitsitter install daemon");
+        } else {
+            println!("To also install the systemd service, run: gitsitter install daemon");
+        }
     }
     Ok(())
 }
@@ -903,15 +947,28 @@ pub async fn handle_uninstall(component: Option<String>) -> Result<()> {
             println!("Shell hook removed for {sh}");
         }
         "daemon" => {
-            let unit_path = dirs::home_dir()
-                .context("cannot determine home directory")?
-                .join(".config/systemd/user/gitsitter.service");
-            if unit_path.exists() {
-                std::fs::remove_file(&unit_path)?;
-                println!("Systemd service file removed");
-                println!("Run: systemctl --user daemon-reload");
+            if cfg!(target_os = "macos") {
+                let plist_path = dirs::home_dir()
+                    .context("cannot determine home directory")?
+                    .join("Library/LaunchAgents/com.gitsitter.daemon.plist");
+                if plist_path.exists() {
+                    println!("Run first: launchctl unload {}", plist_path.display());
+                    std::fs::remove_file(&plist_path)?;
+                    println!("launchd plist removed");
+                } else {
+                    println!("No launchd plist found");
+                }
             } else {
-                println!("No systemd service file found");
+                let unit_path = dirs::home_dir()
+                    .context("cannot determine home directory")?
+                    .join(".config/systemd/user/gitsitter.service");
+                if unit_path.exists() {
+                    std::fs::remove_file(&unit_path)?;
+                    println!("Systemd service file removed");
+                    println!("Run: systemctl --user daemon-reload");
+                } else {
+                    println!("No systemd service file found");
+                }
             }
         }
         _ => bail!("unknown component: {}. Use 'shell', 'hooks', 'daemon', or 'all'", comp),
@@ -938,10 +995,9 @@ pub async fn handle_prompt() -> Result<()> {
         Err(_) => return Ok(()), // not in a git repo
     };
 
-    let req = Request::Status {
-        repo_path: Some(repo_path),
-        global: false,
-    };
+    // Use PromptCheck to register + get status in a single daemon call,
+    // eliminating the need for a separate `gitsitter register` process.
+    let req = Request::PromptCheck { repo_path };
 
     let resp = match tokio::time::timeout(
         std::time::Duration::from_millis(50),
@@ -954,8 +1010,28 @@ pub async fn handle_prompt() -> Result<()> {
     };
 
     if let Response::Status { data } = resp {
+        // Load cooldown config and state DB for rate-limiting notifications.
+        let cooldown = config::UserConfig::load()
+            .map(|c| c.global.notification_cooldown)
+            .unwrap_or(std::time::Duration::from_secs(300));
+        let db = StateDb::open().ok();
+
         for b in &data.branches {
-            match b.status.as_str() {
+            let notification_type = match b.status.as_str() {
+                "diverged" | "upstream_gone" | "push_blocked" => b.status.as_str(),
+                _ => continue,
+            };
+
+            // Build a per-branch cooldown key: "status:branch_name"
+            let cooldown_key = format!("{}:{}", notification_type, b.name);
+
+            if let Some(ref db) = db {
+                if let Ok(false) = db.should_notify(&data.repo_id, &cooldown_key, cooldown) {
+                    continue;
+                }
+            }
+
+            match notification_type {
                 "diverged" => {
                     let upstream = b.upstream.as_deref().unwrap_or("upstream");
                     println!(
@@ -975,7 +1051,11 @@ pub async fn handle_prompt() -> Result<()> {
                         b.name
                     );
                 }
-                _ => {}
+                _ => unreachable!(),
+            }
+
+            if let Some(ref db) = db {
+                let _ = db.record_notification(&data.repo_id, &cooldown_key);
             }
         }
     }

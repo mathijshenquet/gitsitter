@@ -71,9 +71,6 @@ pub async fn run(
     {
         let repos = daemon.repos.read().await;
         for repo_id in repos.keys() {
-            if repo_id == "__shutdown__" {
-                continue;
-            }
             if let Err(e) = add_repo_watches(&mut watcher, repo_id, &mut watched_repos) {
                 warn!("🔍  failed to watch {}: {:#}", repo_id, e);
             }
@@ -130,9 +127,6 @@ pub async fn run(
                 // Check for newly registered repos that aren't watched yet.
                 let repos = daemon.repos.read().await;
                 for repo_id in repos.keys() {
-                    if repo_id == "__shutdown__" {
-                        continue;
-                    }
                     if !watched_repos.contains_key(repo_id) {
                         if let Err(e) = add_repo_watches(&mut watcher, repo_id, &mut watched_repos) {
                             warn!("🔍  failed to watch {}: {:#}", repo_id, e);

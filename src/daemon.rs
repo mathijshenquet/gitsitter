@@ -50,6 +50,7 @@ pub struct Daemon {
     pub start_time: Instant,
     pub repos: RwLock<HashMap<String, TrackedRepo>>,
     pub sync_notify: Notify,
+    pub shutdown_tx: watch::Sender<bool>,
 }
 
 /// In-memory tracking info for a single repo.
@@ -187,28 +188,29 @@ pub async fn run_daemon() -> Result<()> {
     let repo_count = repo_states.len();
     info!("loaded {} repos from state database", repo_count);
 
-    // 7. Build shared state
+    // 7. Shutdown channel (created early so it can be stored in Daemon)
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // 8. Build shared state
     let daemon = Arc::new(Daemon {
         config: RwLock::new(config),
         db: Mutex::new(db),
         start_time: Instant::now(),
         repos: RwLock::new(repo_states),
         sync_notify: Notify::new(),
+        shutdown_tx,
     });
 
-    // 8. Remove stale socket file if it exists
+    // 9. Remove stale socket file if it exists
     let socket_path = paths::socket_path();
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
     }
 
-    // 9. Start Unix socket listener
+    // 10. Start Unix socket listener
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind socket at {}", socket_path.display()))?;
     info!("listening on {}", socket_path.display());
-
-    // 10. Shutdown channel
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // 11. Spawn socket handler task
     let daemon_for_socket = Arc::clone(&daemon);
@@ -239,15 +241,16 @@ pub async fn run_daemon() -> Result<()> {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .context("failed to register SIGINT handler")?;
 
+    let mut shutdown_rx_main = shutdown_rx.clone();
     tokio::select! {
         _ = sigterm.recv() => info!("received SIGTERM"),
         _ = sigint.recv() => info!("received SIGINT"),
-        _ = wait_for_shutdown_request(&daemon) => info!("shutdown requested via socket"),
+        _ = shutdown_rx_main.changed() => info!("shutdown requested via socket"),
     }
 
     // 14. Signal shutdown to all tasks
     info!("shutting down...");
-    let _ = shutdown_tx.send(true);
+    let _ = daemon.shutdown_tx.send(true);
 
     // Give tasks a moment to finish
     let _ = tokio::time::timeout(
@@ -266,22 +269,6 @@ pub async fn run_daemon() -> Result<()> {
 
     info!("daemon stopped cleanly");
     Ok(())
-}
-
-/// Waits until a shutdown is requested via the `sync_notify` mechanism.
-/// We use a dedicated atomic flag for shutdown requests via socket.
-async fn wait_for_shutdown_request(daemon: &SharedDaemon) {
-    // We'll repurpose a simple approach: check a flag in a loop.
-    // The socket handler sets this when it receives a Shutdown request.
-    // We use a simple polling approach since shutdown via socket is rare.
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        // Check if shutdown was requested (we store it as a special repo entry)
-        let repos = daemon.repos.read().await;
-        if repos.contains_key("__shutdown__") {
-            return;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +332,7 @@ async fn process_request(daemon: &SharedDaemon, request: Request) -> Response {
         Request::Disable { repo_path, purge } => {
             handle_disable(daemon, &repo_path, purge).await
         }
+        Request::PromptCheck { repo_path } => handle_prompt_check(daemon, &repo_path).await,
         Request::ConfigUpdate { .. } => handle_config_update(daemon).await,
         Request::DaemonStatus => handle_daemon_status(daemon).await,
         Request::Shutdown => handle_shutdown(daemon).await,
@@ -499,6 +487,14 @@ async fn handle_register(daemon: &SharedDaemon, repo_path: &str) -> Response {
     }
 }
 
+/// Combined register + status for the prompt hook — avoids a separate process spawn.
+async fn handle_prompt_check(daemon: &SharedDaemon, repo_path: &str) -> Response {
+    // Register (silently — we only care about status output).
+    let _ = handle_register(daemon, repo_path).await;
+    // Return status for this repo.
+    handle_status(daemon, Some(repo_path.to_string())).await
+}
+
 async fn handle_enable(daemon: &SharedDaemon, repo_path: &str) -> Response {
     match resolve_repo_id_from_path(repo_path) {
         Ok(repo_id) => {
@@ -590,19 +586,7 @@ async fn handle_daemon_status(daemon: &SharedDaemon) -> Response {
 
 async fn handle_shutdown(daemon: &SharedDaemon) -> Response {
     info!("shutdown requested via socket");
-    // Signal shutdown by inserting a sentinel key
-    let mut repos = daemon.repos.write().await;
-    repos.insert(
-        "__shutdown__".to_string(),
-        TrackedRepo {
-            repo_id: "__shutdown__".to_string(),
-            display_path: String::new(),
-            remote_url: None,
-            last_sync: None,
-            sync_reason: None,
-            backoff: BackoffState::new(),
-        },
-    );
+    let _ = daemon.shutdown_tx.send(true);
     Response::Ok {
         message: "shutting down".into(),
     }
@@ -667,11 +651,6 @@ async fn sync_loop(daemon: SharedDaemon, mut shutdown_rx: watch::Receiver<bool>)
             let mut due = Vec::new();
 
             for (repo_id, tracked) in repos.iter() {
-                // Skip the shutdown sentinel
-                if repo_id == "__shutdown__" {
-                    continue;
-                }
-
                 let refresh_interval = config.effective_refresh_interval(
                     repo_id,
                     None, // in-repo config loaded per-sync
@@ -805,7 +784,10 @@ async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         let _ = db.remove_stale_worktrees(repo_id, &current_paths);
     }
 
-    // 4. Fetch (if mode includes fetch capability)
+    // 4. List branches (needed to determine remotes for fetch)
+    let branches = git_ops::list_branches(&repo_path).unwrap_or_default();
+
+    // 5. Fetch all unique remotes (if mode includes fetch capability)
     let should_fetch = matches!(
         repo_mode,
         RepoSyncMode::Fetch | RepoSyncMode::Pull | RepoSyncMode::Push | RepoSyncMode::PushPull
@@ -827,32 +809,48 @@ async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 .map(|wt| PathBuf::from(&wt.path))
                 .unwrap_or_else(|| repo_path.clone());
 
-            match git_ops::git_fetch(&fetch_path, "origin", git_path_ref, GIT_TIMEOUT_SECS).await
-            {
-                Ok(()) => {
-                    let mut repos = daemon.repos.write().await;
-                    if let Some(tr) = repos.get_mut(repo_id) {
-                        tr.backoff.reset_fetch_backoff();
+            // Collect unique remotes from all tracked branches
+            let mut remotes: Vec<String> = branches
+                .iter()
+                .filter(|b| b.upstream_name.is_some())
+                .map(|b| b.remote.clone())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            if remotes.is_empty() {
+                remotes.push("origin".to_string());
+            }
+
+            let mut any_success = false;
+            for remote in &remotes {
+                match git_ops::git_fetch(&fetch_path, remote, git_path_ref, GIT_TIMEOUT_SECS).await
+                {
+                    Ok(()) => {
+                        any_success = true;
                     }
-                    drop(repos);
-                    let db = daemon.db.lock().await;
-                    let _ = db.update_repo_fetch_time(repo_id);
-                }
-                Err(e) => {
-                    let err_msg = format!("{:#}", e);
-                    warn!("fetch failed for {}: {}", repo_id, err_msg);
-                    let mut repos = daemon.repos.write().await;
-                    if let Some(tr) = repos.get_mut(repo_id) {
-                        tr.backoff.record_fetch_failure();
+                    Err(e) => {
+                        warn!("fetch failed for {} remote {}: {:#}", repo_id, remote, e);
                     }
-                    // Continue anyway — we can still process local state
                 }
+            }
+
+            if any_success {
+                let mut repos = daemon.repos.write().await;
+                if let Some(tr) = repos.get_mut(repo_id) {
+                    tr.backoff.reset_fetch_backoff();
+                }
+                drop(repos);
+                let db = daemon.db.lock().await;
+                let _ = db.update_repo_fetch_time(repo_id);
+            } else {
+                let mut repos = daemon.repos.write().await;
+                if let Some(tr) = repos.get_mut(repo_id) {
+                    tr.backoff.record_fetch_failure();
+                }
+                // Continue anyway — we can still process local state
             }
         }
     }
-
-    // 5. Process each tracked branch
-    let branches = git_ops::list_branches(&repo_path).unwrap_or_default();
 
     for branch in &branches {
         // Only process branches with upstreams
@@ -1116,7 +1114,7 @@ async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
 
                 match git_ops::git_push(
                     &push_path,
-                    "origin",
+                    &branch.remote,
                     &branch.name,
                     git_path_ref,
                     GIT_TIMEOUT_SECS,

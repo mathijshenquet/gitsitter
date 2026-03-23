@@ -58,6 +58,9 @@ pub enum Request {
     #[serde(rename = "daemon_status")]
     DaemonStatus,
 
+    #[serde(rename = "prompt_check")]
+    PromptCheck { repo_path: String },
+
     #[serde(rename = "shutdown")]
     Shutdown,
 }

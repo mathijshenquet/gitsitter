@@ -21,6 +21,8 @@ pub struct RepoBranch {
     pub upstream_name: Option<String>,
     pub remote_oid: Option<String>,
     pub is_head: bool,
+    /// The remote configured for this branch (`branch.<name>.remote`), defaults to "origin".
+    pub remote: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -140,12 +142,22 @@ pub fn list_branches(repo_id: &Path) -> Result<Vec<RepoBranch>> {
             Err(_) => (None, None),
         };
 
+        // Read branch.<name>.remote from git config, default to "origin".
+        let remote = repo
+            .config()
+            .ok()
+            .and_then(|cfg| {
+                cfg.get_string(&format!("branch.{}.remote", name)).ok()
+            })
+            .unwrap_or_else(|| "origin".to_string());
+
         branches.push(RepoBranch {
             name,
             local_oid,
             upstream_name,
             remote_oid,
             is_head,
+            remote,
         });
     }
     Ok(branches)
