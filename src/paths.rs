@@ -66,22 +66,16 @@ pub fn daemon_pid() -> PathBuf {
     state_dir().join("daemon.pid")
 }
 
-/// Returns the daemon socket path.
+/// Returns the daemon IPC endpoint path.
 ///
 /// Resolution order:
 /// 1. `GITSITTER_SOCKET_PATH` (for testing)
-/// 2. `$XDG_RUNTIME_DIR/gitsitter.sock`
-/// 3. `/tmp/gitsitter-{uid}.sock`
+/// 2. Platform default runtime path / named pipe
 pub fn socket_path() -> PathBuf {
     if let Some(path) = std::env::var_os("GITSITTER_SOCKET_PATH") {
         return PathBuf::from(path);
     }
-    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
-        PathBuf::from(runtime).join("gitsitter.sock")
-    } else {
-        let uid = unsafe { libc::getuid() };
-        PathBuf::from(format!("/tmp/gitsitter-{uid}.sock"))
-    }
+    platform_socket_path()
 }
 
 /// Creates the config and state directories if they don't exist.
@@ -91,6 +85,35 @@ pub fn ensure_dirs() -> Result<()> {
     std::fs::create_dir_all(state_dir())
         .context("failed to create state directory")?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn platform_socket_path() -> PathBuf {
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+        PathBuf::from(runtime).join("gitsitter.sock")
+    } else {
+        let uid = unsafe { libc::getuid() };
+        PathBuf::from(format!("/tmp/gitsitter-{uid}.sock"))
+    }
+}
+
+#[cfg(windows)]
+fn platform_socket_path() -> PathBuf {
+    let user = std::env::var("USERNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default".to_string());
+    let sanitized: String = user
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    PathBuf::from(format!(r"\\.\pipe\gitsitter-{}", sanitized))
 }
 
 #[cfg(test)]
@@ -119,6 +142,9 @@ mod tests {
 
     #[test]
     fn respects_xdg_config_home() {
+        if cfg!(windows) {
+            return;
+        }
         // Temporarily override — won't affect other threads in parallel tests,
         // but fine for a unit test.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", "/tmp/test-xdg-config") };
@@ -128,6 +154,9 @@ mod tests {
 
     #[test]
     fn respects_xdg_state_home() {
+        if cfg!(windows) {
+            return;
+        }
         unsafe { std::env::set_var("XDG_STATE_HOME", "/tmp/test-xdg-state") };
         assert_eq!(state_dir(), PathBuf::from("/tmp/test-xdg-state/gitsitter"));
         unsafe { std::env::remove_var("XDG_STATE_HOME") };

@@ -1,4 +1,4 @@
-//! Unix domain socket transport for CLI <-> daemon communication.
+//! Local transport for CLI <-> daemon communication.
 //!
 //! Protocol: length-prefixed JSON messages.
 //!   - 4 bytes: big-endian u32 message length
@@ -8,10 +8,7 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixStream;
-
-use crate::paths;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Maximum allowed message size (16 MB).
 const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
@@ -127,7 +124,7 @@ pub struct RepoStatusData {
 // ---------------------------------------------------------------------------
 
 /// Send a length-prefixed message.
-pub async fn send_message<W: AsyncWriteExt + Unpin>(writer: &mut W, msg: &[u8]) -> Result<()> {
+pub async fn send_message<W: AsyncWrite + Unpin>(writer: &mut W, msg: &[u8]) -> Result<()> {
     let len = u32::try_from(msg.len()).context("message too large to encode length")?;
     if len > MAX_MESSAGE_SIZE {
         bail!(
@@ -149,7 +146,7 @@ pub async fn send_message<W: AsyncWriteExt + Unpin>(writer: &mut W, msg: &[u8]) 
 }
 
 /// Receive a length-prefixed message. Returns the raw bytes.
-pub async fn recv_message<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+pub async fn recv_message<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
     reader
         .read_exact(&mut len_buf)
@@ -176,19 +173,19 @@ pub async fn recv_message<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Vec
 // ---------------------------------------------------------------------------
 
 /// Serialize and send a [`Request`].
-pub async fn send_request<W: AsyncWriteExt + Unpin>(writer: &mut W, req: &Request) -> Result<()> {
+pub async fn send_request<W: AsyncWrite + Unpin>(writer: &mut W, req: &Request) -> Result<()> {
     let json = serde_json::to_vec(req).context("failed to serialize request")?;
     send_message(writer, &json).await
 }
 
 /// Receive and deserialize a [`Request`].
-pub async fn recv_request<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Request> {
+pub async fn recv_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Request> {
     let buf = recv_message(reader).await?;
     serde_json::from_slice(&buf).context("failed to deserialize request")
 }
 
 /// Serialize and send a [`Response`].
-pub async fn send_response<W: AsyncWriteExt + Unpin>(
+pub async fn send_response<W: AsyncWrite + Unpin>(
     writer: &mut W,
     resp: &Response,
 ) -> Result<()> {
@@ -197,35 +194,242 @@ pub async fn send_response<W: AsyncWriteExt + Unpin>(
 }
 
 /// Receive and deserialize a [`Response`].
-pub async fn recv_response<R: AsyncReadExt + Unpin>(reader: &mut R) -> Result<Response> {
+pub async fn recv_response<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Response> {
     let buf = recv_message(reader).await?;
     serde_json::from_slice(&buf).context("failed to deserialize response")
 }
 
 // ---------------------------------------------------------------------------
-// Client connection helpers
+// Platform transport
 // ---------------------------------------------------------------------------
 
-/// Connect to the running daemon via the Unix domain socket.
-pub async fn connect_to_daemon() -> Result<UnixStream> {
-    let path = paths::socket_path();
-    UnixStream::connect(&path)
-        .await
-        .with_context(|| format!("failed to connect to daemon socket at {}", path.display()))
+#[cfg(unix)]
+mod platform {
+    use std::path::PathBuf;
+
+    use anyhow::{Context, Result};
+    use tokio::net::{UnixListener, UnixStream};
+
+    use crate::paths;
+
+    pub type DaemonStream = UnixStream;
+    pub type DaemonListener = UnixListener;
+
+    pub fn endpoint() -> PathBuf {
+        paths::socket_path()
+    }
+
+    pub fn cleanup_endpoint() {
+        let path = endpoint();
+        if path.exists() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    pub fn bind_listener() -> Result<DaemonListener> {
+        let path = endpoint();
+        UnixListener::bind(&path)
+            .with_context(|| format!("failed to bind socket at {}", path.display()))
+    }
+
+    pub async fn connect_to_daemon() -> Result<DaemonStream> {
+        let path = endpoint();
+        UnixStream::connect(&path)
+            .await
+            .with_context(|| format!("failed to connect to daemon socket at {}", path.display()))
+    }
+
+    pub async fn accept(listener: &mut DaemonListener) -> Result<DaemonStream> {
+        listener
+            .accept()
+            .await
+            .map(|(stream, _)| stream)
+            .context("failed to accept daemon connection")
+    }
+
+    pub fn is_daemon_running() -> bool {
+        let path = endpoint();
+        if !path.exists() {
+            return false;
+        }
+        std::os::unix::net::UnixStream::connect(&path).is_ok()
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use std::io;
+    use std::pin::Pin;
+    use std::path::PathBuf;
+    use std::task::{Context as TaskContext, Poll};
+    use std::time::{Duration, Instant};
+
+    use anyhow::{Context, Result};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::net::windows::named_pipe::{
+        ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+    };
+    use tokio::time::sleep;
+
+    use crate::paths;
+
+    const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    pub enum DaemonStream {
+        Client(NamedPipeClient),
+        Server(NamedPipeServer),
+    }
+
+    pub type DaemonListener = NamedPipeServer;
+
+    impl AsyncRead for DaemonStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.get_mut() {
+                Self::Client(stream) => Pin::new(stream).poll_read(cx, buf),
+                Self::Server(stream) => Pin::new(stream).poll_read(cx, buf),
+            }
+        }
+    }
+
+    impl AsyncWrite for DaemonStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            match self.get_mut() {
+                Self::Client(stream) => Pin::new(stream).poll_write(cx, buf),
+                Self::Server(stream) => Pin::new(stream).poll_write(cx, buf),
+            }
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.get_mut() {
+                Self::Client(stream) => Pin::new(stream).poll_flush(cx),
+                Self::Server(stream) => Pin::new(stream).poll_flush(cx),
+            }
+        }
+
+        fn poll_shutdown(
+            self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.get_mut() {
+                Self::Client(stream) => Pin::new(stream).poll_shutdown(cx),
+                Self::Server(stream) => Pin::new(stream).poll_shutdown(cx),
+            }
+        }
+    }
+
+    pub fn endpoint() -> PathBuf {
+        paths::socket_path()
+    }
+
+    pub fn cleanup_endpoint() {}
+
+    fn create_server(first_instance: bool) -> Result<DaemonListener> {
+        let path = endpoint();
+        let mut options = ServerOptions::new();
+        if first_instance {
+            options.first_pipe_instance(true);
+        }
+        options
+            .create(&path)
+            .with_context(|| format!("failed to create named pipe at {}", path.display()))
+    }
+
+    pub fn bind_listener() -> Result<DaemonListener> {
+        create_server(true)
+    }
+
+    pub async fn connect_to_daemon() -> Result<DaemonStream> {
+        let path = endpoint();
+        let deadline = Instant::now() + CONNECT_TIMEOUT;
+        loop {
+            match ClientOptions::new().open(&path) {
+                Ok(stream) => return Ok(DaemonStream::Client(stream)),
+                Err(err) if err.raw_os_error() == Some(2) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to connect to daemon pipe at {}", path.display())
+                    });
+                }
+                Err(err) if err.raw_os_error() == Some(231) => {
+                    if Instant::now() >= deadline {
+                        return Err(err).with_context(|| {
+                            format!(
+                                "timed out waiting for busy daemon pipe at {}",
+                                path.display()
+                            )
+                        });
+                    }
+                    sleep(CONNECT_RETRY_INTERVAL).await;
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("failed to connect to daemon pipe at {}", path.display())
+                    });
+                }
+            }
+        }
+    }
+
+    pub async fn accept(listener: &mut DaemonListener) -> Result<DaemonStream> {
+        listener
+            .connect()
+            .await
+            .context("failed to accept daemon connection")?;
+        let next = create_server(false)?;
+        let connected = std::mem::replace(listener, next);
+        Ok(DaemonStream::Server(connected))
+    }
+
+    pub fn is_daemon_running() -> bool {
+        match ClientOptions::new().open(endpoint()) {
+            Ok(_) => true,
+            Err(err) if err.raw_os_error() == Some(231) => true,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => false,
+            Err(_) => false,
+        }
+    }
+}
+
+pub use platform::DaemonStream;
+pub use platform::DaemonListener;
+
+pub fn cleanup_endpoint() {
+    platform::cleanup_endpoint();
+}
+
+pub fn endpoint_display() -> String {
+    platform::endpoint().display().to_string()
+}
+
+pub fn bind_listener() -> Result<platform::DaemonListener> {
+    platform::bind_listener()
+}
+
+/// Connect to the running daemon.
+pub async fn connect_to_daemon() -> Result<DaemonStream> {
+    platform::connect_to_daemon().await
+}
+
+pub async fn accept_connection(
+    listener: &mut platform::DaemonListener,
+) -> Result<DaemonStream> {
+    platform::accept(listener).await
 }
 
 /// Quick synchronous check whether the daemon appears to be running.
-///
-/// Tries a blocking connect to the socket with a short timeout. Returns `true`
-/// if the connection succeeds, `false` otherwise.
 pub fn is_daemon_running() -> bool {
-    let path = paths::socket_path();
-    // First check if the socket file exists at all to avoid unnecessary work.
-    if !path.exists() {
-        return false;
-    }
-    // Attempt a blocking connect — if it succeeds the daemon is listening.
-    std::os::unix::net::UnixStream::connect(&path).is_ok()
+    platform::is_daemon_running()
 }
 
 // ---------------------------------------------------------------------------
@@ -257,7 +461,6 @@ mod tests {
         };
         send_request(&mut client, &req).await.unwrap();
         let got = recv_request(&mut server).await.unwrap();
-        // Compare via JSON to avoid needing PartialEq
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
             serde_json::to_string(&got).unwrap(),
@@ -292,7 +495,6 @@ mod tests {
     #[tokio::test]
     async fn reject_oversized_message() {
         let (mut client, mut server) = duplex(64);
-        // Write a length header claiming a huge payload.
         let fake_len: u32 = MAX_MESSAGE_SIZE + 1;
         client.write_all(&fake_len.to_be_bytes()).await.unwrap();
         let err = recv_message(&mut server).await.unwrap_err();
@@ -326,12 +528,16 @@ mod tests {
         assert_eq!(recv_message(&mut server).await.unwrap(), b"second");
     }
 
-    /// is_daemon_running returns false when there is no socket.
+    /// is_daemon_running returns false when there is no endpoint.
     #[test]
     fn no_daemon_running() {
-        // Point socket to a path that definitely doesn't exist.
+        let missing_path = if cfg!(windows) {
+            r"\\.\pipe\gitsitter-test-nonexistent".to_string()
+        } else {
+            "/tmp/gitsitter-test-nonexistent.sock".to_string()
+        };
         unsafe {
-            std::env::set_var("GITSITTER_SOCKET_PATH", "/tmp/gitsitter-test-nonexistent.sock");
+            std::env::set_var("GITSITTER_SOCKET_PATH", &missing_path);
         }
         assert!(!is_daemon_running());
         unsafe {

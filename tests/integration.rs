@@ -14,10 +14,24 @@ use gitsitter::transport::{self, Request, Response};
 // Helper functions
 // ===========================================================================
 
+fn temp_dir() -> TempDir {
+    let base = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join("test-tmp");
+    std::fs::create_dir_all(&base).unwrap();
+    tempfile::Builder::new()
+        .prefix("gitsitter-test-")
+        .tempdir_in(base)
+        .unwrap()
+}
+
+#[cfg(unix)]
 fn create_bare_repo(dir: &Path) -> git2::Repository {
     git2::Repository::init_bare(dir).unwrap()
 }
 
+#[cfg(unix)]
 fn clone_repo(bare_path: &Path, working_path: &Path) -> git2::Repository {
     let url = format!("file://{}", bare_path.display());
     git2::build::RepoBuilder::new()
@@ -47,6 +61,7 @@ fn make_commit(repo: &git2::Repository, filename: &str, content: &str, message: 
 
 /// Set up env overrides pointing to a temp directory structure.
 /// Returns (config_dir, state_dir, socket_path).
+#[cfg(unix)]
 fn setup_test_env(base: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let config_dir = base.join("config");
     let state_dir = base.join("state");
@@ -64,6 +79,7 @@ fn setup_test_env(base: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::
     (config_dir, state_dir, socket_path)
 }
 
+#[cfg(unix)]
 fn teardown_test_env() {
     unsafe {
         std::env::remove_var("GITSITTER_CONFIG_DIR");
@@ -91,7 +107,7 @@ mod config_tests {
         // and test the UserConfig fields directly.
 
         // First, verify InRepoConfig parsing covers most TOML features
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         let toml_str = r#"
 mode = "push"
 refresh_interval = "120s"
@@ -112,7 +128,7 @@ refresh_interval = "120s"
 
         // Now test a full UserConfig by loading from a temp env dir.
         // We set+use+unset the env var as quickly as possible.
-        let tmp2 = TempDir::new().unwrap();
+        let tmp2 = temp_dir();
         let config_dir = tmp2.path().join("cfg");
         std::fs::create_dir_all(&config_dir).unwrap();
 
@@ -178,7 +194,7 @@ disabled = false
 
     #[test]
     fn parse_in_repo_config() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         let repo_root = tmp.path();
         let toml_str = r#"
 mode = "fetch"
@@ -201,7 +217,7 @@ refresh_interval = "5m"
     #[test]
     fn parse_empty_config() {
         // Empty in-repo config should parse to None for all optional fields
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         std::fs::write(tmp.path().join(".gitsitter.toml"), "").unwrap();
         let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
         assert!(irc.mode.is_none());
@@ -223,7 +239,7 @@ refresh_interval = "5m"
     #[test]
     fn parse_missing_config_returns_defaults() {
         // InRepoConfig returns None when file doesn't exist
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         let irc = InRepoConfig::load(tmp.path()).unwrap();
         assert!(irc.is_none());
 
@@ -236,7 +252,7 @@ refresh_interval = "5m"
     #[test]
     fn duration_parsing_60s() {
         // Test duration parsing via in-repo config (no env vars needed)
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         std::fs::write(tmp.path().join(".gitsitter.toml"), "refresh_interval = \"60s\"").unwrap();
         let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
         assert_eq!(irc.refresh_interval, Some(Duration::from_secs(60)));
@@ -244,7 +260,7 @@ refresh_interval = "5m"
 
     #[test]
     fn duration_parsing_5m() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         std::fs::write(tmp.path().join(".gitsitter.toml"), "refresh_interval = \"5m\"").unwrap();
         let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
         assert_eq!(irc.refresh_interval, Some(Duration::from_secs(300)));
@@ -252,7 +268,7 @@ refresh_interval = "5m"
 
     #[test]
     fn duration_parsing_1h() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         std::fs::write(tmp.path().join(".gitsitter.toml"), "refresh_interval = \"1h\"").unwrap();
         let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
         assert_eq!(irc.refresh_interval, Some(Duration::from_secs(3600)));
@@ -260,7 +276,7 @@ refresh_interval = "5m"
 
     #[test]
     fn duration_parsing_500ms() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         std::fs::write(tmp.path().join(".gitsitter.toml"), "refresh_interval = \"500ms\"").unwrap();
         let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
         assert_eq!(irc.refresh_interval, Some(Duration::from_millis(500)));
@@ -278,7 +294,7 @@ refresh_interval = "5m"
         ];
 
         for (input, expected) in cases {
-            let tmp = TempDir::new().unwrap();
+            let tmp = temp_dir();
             let toml_str = format!("mode = \"{}\"", input);
             std::fs::write(tmp.path().join(".gitsitter.toml"), &toml_str).unwrap();
             let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
@@ -559,7 +575,7 @@ refresh_interval = "5m"
         // This test verifies that saving a UserConfig and loading it back
         // produces the same values. We use env vars to redirect config paths,
         // and do save+load atomically (back-to-back).
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         let config_dir = tmp.path().join("config_rt");
         std::fs::create_dir_all(&config_dir).unwrap();
 
@@ -622,7 +638,7 @@ mod state_tests {
     use super::*;
 
     fn open_temp_db() -> (TempDir, StateDb) {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         let db_path = tmp.path().join("test.db");
         let db = StateDb::open_at(&db_path).unwrap();
         (tmp, db)
@@ -993,7 +1009,7 @@ mod git_ops_tests {
 
     #[test]
     fn discover_repo_id_finds_git_dir() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         let repo = git2::Repository::init(tmp.path()).unwrap();
         // Make an initial commit so HEAD is valid
         make_commit(&repo, "README.md", "hello", "Initial commit");
@@ -1006,7 +1022,7 @@ mod git_ops_tests {
 
     #[test]
     fn get_display_path_returns_working_tree() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         let repo = git2::Repository::init(tmp.path()).unwrap();
         make_commit(&repo, "README.md", "hello", "Initial commit");
 
@@ -1021,7 +1037,7 @@ mod git_ops_tests {
 
     #[test]
     fn list_branches_finds_default_branch() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         let repo = git2::Repository::init(tmp.path()).unwrap();
         make_commit(&repo, "README.md", "hello", "Initial commit");
 
@@ -1040,20 +1056,20 @@ mod git_ops_tests {
 
     #[test]
     fn is_valid_repo_true_for_repo() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         git2::Repository::init(tmp.path()).unwrap();
         assert!(git_ops::is_valid_repo(tmp.path()));
     }
 
     #[test]
     fn is_valid_repo_false_for_random_dir() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         assert!(!git_ops::is_valid_repo(tmp.path()));
     }
 
     #[test]
     fn is_operation_in_progress_false_normally() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         let repo = git2::Repository::init(tmp.path()).unwrap();
         make_commit(&repo, "README.md", "hello", "Initial commit");
 
@@ -1063,7 +1079,7 @@ mod git_ops_tests {
 
     #[test]
     fn is_operation_in_progress_true_with_index_lock() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         let repo = git2::Repository::init(tmp.path()).unwrap();
         make_commit(&repo, "README.md", "hello", "Initial commit");
 
@@ -1081,7 +1097,7 @@ mod git_ops_tests {
 
     #[test]
     fn is_worktree_dirty_clean_repo() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         let repo = git2::Repository::init(tmp.path()).unwrap();
         make_commit(&repo, "README.md", "hello", "Initial commit");
 
@@ -1091,7 +1107,7 @@ mod git_ops_tests {
 
     #[test]
     fn is_worktree_dirty_modified_file() {
-        let tmp = TempDir::new().unwrap();
+        let tmp = temp_dir();
         let repo = git2::Repository::init(tmp.path()).unwrap();
         make_commit(&repo, "README.md", "hello", "Initial commit");
 
@@ -1107,6 +1123,8 @@ mod git_ops_tests {
 // 5. End-to-End Integration Tests
 // ===========================================================================
 
+// TODO: add a Windows E2E harness for named-pipe/service coverage.
+#[cfg(unix)]
 mod e2e_tests {
     use super::*;
     use serial_test::serial;
@@ -1132,7 +1150,7 @@ mod e2e_tests {
         /// Boot a daemon with a bare remote + local clone already registered.
         /// `repo_mode` controls the sync mode written to config (e.g. "push+pull").
         async fn start(repo_mode: &str) -> Self {
-            let tmp = TempDir::new().unwrap();
+            let tmp = temp_dir();
             let base = tmp.path().to_path_buf();
             let (config_dir, _state_dir, socket_path) = setup_test_env(&base);
 
@@ -1272,7 +1290,7 @@ mode = "{}"
 
         /// Open a second clone of the same bare repo ("another user").
         fn open_second_clone(&self) -> (TempDir, git2::Repository) {
-            let tmp = TempDir::new().unwrap();
+            let tmp = temp_dir();
             let repo = clone_repo(&self.bare_dir, tmp.path());
             (tmp, repo)
         }

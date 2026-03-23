@@ -78,6 +78,8 @@ enum Commands {
 #[derive(Subcommand)]
 enum DaemonAction {
     Run,
+    #[command(hide = true)]
+    Service,
     Start,
     Stop,
     Restart,
@@ -115,6 +117,7 @@ async fn main() {
         Some(Commands::Prompt) => cli::handle_prompt().await,
         Some(Commands::Daemon { action }) => match action {
             DaemonAction::Run => cli::handle_daemon_run().await,
+            DaemonAction::Service => cli::handle_daemon_service().await,
             DaemonAction::Start => cli::handle_daemon_start().await,
             DaemonAction::Stop => cli::handle_daemon_stop().await,
             DaemonAction::Restart => cli::handle_daemon_restart().await,

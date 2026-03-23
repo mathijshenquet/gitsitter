@@ -57,13 +57,31 @@ pub enum PushResult {
 /// Discover the git repo from a path (handles worktrees).
 /// Returns the canonicalized path to the common git dir (repo_id).
 pub fn discover_repo_id(path: &Path) -> Result<PathBuf> {
-    let repo = git2::Repository::discover(path)
-        .with_context(|| format!("failed to discover git repo at {}", path.display()))?;
+    let mut current = if path.is_file() {
+        path.parent().unwrap_or(path).to_path_buf()
+    } else {
+        path.to_path_buf()
+    };
+
+    let repo = loop {
+        match git2::Repository::open(&current) {
+            Ok(repo) => break repo,
+            Err(_) => {
+                let Some(parent) = current.parent() else {
+                    bail!("failed to discover git repo at {}", path.display());
+                };
+                current = parent.to_path_buf();
+            }
+        }
+    };
+
     let common = repo.commondir().to_path_buf();
-    let canonical = common
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", common.display()))?;
-    Ok(canonical)
+    match common.canonicalize() {
+        Ok(canonical) => Ok(canonical),
+        Err(_) if cfg!(windows) => Ok(common),
+        Err(err) => Err(err)
+            .with_context(|| format!("failed to canonicalize {}", common.display())),
+    }
 }
 
 /// Get the display path (working tree path) for a repo.

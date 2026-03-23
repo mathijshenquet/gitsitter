@@ -1,8 +1,8 @@
 //! Daemon sync loop and management.
 //!
 //! The daemon runs in the background, watches registered repos, and keeps
-//! local branches in sync with their tracking remotes. It listens on a Unix
-//! domain socket for CLI requests and periodically runs sync cycles.
+//! local branches in sync with their tracking remotes. It listens on a local
+//! IPC endpoint for CLI requests and periodically runs sync cycles.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, Notify, RwLock, watch};
 use tracing::{error, info, warn};
 
@@ -201,16 +201,12 @@ pub async fn run_daemon() -> Result<()> {
         shutdown_tx,
     });
 
-    // 9. Remove stale socket file if it exists
-    let socket_path = paths::socket_path();
-    if socket_path.exists() {
-        let _ = std::fs::remove_file(&socket_path);
-    }
+    // 9. Remove stale endpoint if it exists
+    transport::cleanup_endpoint();
 
-    // 10. Start Unix socket listener
-    let listener = UnixListener::bind(&socket_path)
-        .with_context(|| format!("failed to bind socket at {}", socket_path.display()))?;
-    info!("listening on {}", socket_path.display());
+    // 10. Start IPC listener
+    let listener = transport::bind_listener()?;
+    info!("listening on {}", transport::endpoint_display());
 
     // 11. Spawn socket handler task
     let daemon_for_socket = Arc::clone(&daemon);
@@ -233,20 +229,8 @@ pub async fn run_daemon() -> Result<()> {
         crate::watcher::run(daemon_for_watcher, shutdown_rx_watcher).await;
     });
 
-    // 13. Wait for shutdown signal (SIGTERM / SIGINT)
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .context("failed to register SIGTERM handler")?;
-    let mut sigint =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .context("failed to register SIGINT handler")?;
-
     let mut shutdown_rx_main = shutdown_rx.clone();
-    tokio::select! {
-        _ = sigterm.recv() => info!("received SIGTERM"),
-        _ = sigint.recv() => info!("received SIGINT"),
-        _ = shutdown_rx_main.changed() => info!("shutdown requested via socket"),
-    }
+    wait_for_shutdown_signal(&mut shutdown_rx_main).await?;
 
     // 14. Signal shutdown to all tasks
     info!("shutting down...");
@@ -263,8 +247,8 @@ pub async fn run_daemon() -> Result<()> {
     )
     .await;
 
-    // 15. Cleanup: remove socket file and PID file
-    let _ = std::fs::remove_file(&socket_path);
+    // 15. Cleanup: remove endpoint and PID file
+    transport::cleanup_endpoint();
     let _ = std::fs::remove_file(&pid_path);
 
     info!("daemon stopped cleanly");
@@ -277,14 +261,14 @@ pub async fn run_daemon() -> Result<()> {
 
 async fn socket_accept_loop(
     daemon: SharedDaemon,
-    listener: UnixListener,
+    mut listener: transport::DaemonListener,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
         tokio::select! {
-            result = listener.accept() => {
+            result = transport::accept_connection(&mut listener) => {
                 match result {
-                    Ok((stream, _addr)) => {
+                    Ok(stream) => {
                         let d = Arc::clone(&daemon);
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection(d, stream).await {
@@ -294,6 +278,8 @@ async fn socket_accept_loop(
                     }
                     Err(e) => {
                         error!("failed to accept connection: {}", e);
+                        #[cfg(windows)]
+                        return;
                     }
                 }
             }
@@ -307,13 +293,15 @@ async fn socket_accept_loop(
     }
 }
 
-async fn handle_connection(daemon: SharedDaemon, mut stream: UnixStream) -> Result<()> {
-    let (mut reader, mut writer) = stream.split();
-    let request = transport::recv_request(&mut reader).await?;
+async fn handle_connection<S>(daemon: SharedDaemon, mut stream: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = transport::recv_request(&mut stream).await?;
 
     let response = process_request(&daemon, request).await;
 
-    transport::send_response(&mut writer, &response).await?;
+    transport::send_response(&mut stream, &response).await?;
     Ok(())
 }
 
@@ -1294,3 +1282,32 @@ fn resolve_repo_id_from_path(path: &str) -> Result<PathBuf> {
     git_ops::discover_repo_id(p)
 }
 
+async fn wait_for_shutdown_signal(shutdown_rx: &mut watch::Receiver<bool>) -> Result<()> {
+    #[cfg(unix)]
+    {
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .context("failed to register SIGTERM handler")?;
+    let mut sigint =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .context("failed to register SIGINT handler")?;
+
+    tokio::select! {
+        _ = sigterm.recv() => info!("received SIGTERM"),
+        _ = sigint.recv() => info!("received SIGINT"),
+        _ = shutdown_rx.changed() => info!("shutdown requested via socket"),
+    }
+
+    Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => info!("received Ctrl-C"),
+        _ = shutdown_rx.changed() => info!("shutdown requested via socket"),
+    }
+
+    Ok(())
+    }
+}

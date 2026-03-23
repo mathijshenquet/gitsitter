@@ -4,6 +4,7 @@ pub mod daemon;
 pub mod git_ops;
 pub mod paths;
 pub mod queries;
+pub mod service;
 pub mod shell;
 pub mod state;
 pub mod transport;

@@ -773,6 +773,15 @@ fn format_uptime(secs: u64) -> String {
     format!("{}d {}h", days, hours % 24)
 }
 
+#[cfg(windows)]
+async fn sc_command(args: &[&str]) -> Result<std::process::Output> {
+    tokio::process::Command::new("sc.exe")
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("failed to run sc.exe {}", args.join(" ")))
+}
+
 pub async fn handle_daemon_start() -> Result<()> {
     // Check if already running
     if transport::is_daemon_running() {
@@ -781,7 +790,8 @@ pub async fn handle_daemon_start() -> Result<()> {
     }
 
     // Try platform service manager first
-    if cfg!(target_os = "macos") {
+    #[cfg(target_os = "macos")]
+    {
         let plist_path = dirs::home_dir()
             .map(|h| h.join("Library/LaunchAgents/com.gitsitter.daemon.plist"));
         if let Some(ref p) = plist_path {
@@ -801,7 +811,10 @@ pub async fn handle_daemon_start() -> Result<()> {
                 }
             }
         }
-    } else {
+    }
+
+    #[cfg(target_os = "linux")]
+    {
         let systemd_result = tokio::process::Command::new("systemctl")
             .args(["--user", "start", "gitsitter"])
             .stdout(std::process::Stdio::null())
@@ -816,6 +829,25 @@ pub async fn handle_daemon_start() -> Result<()> {
             }
             _ => {
                 // systemd not available or unit not installed -- spawn directly
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
+    {
+        eprintln!("warning: no supported Unix service manager configured on this platform; starting detached daemon directly");
+    }
+
+    #[cfg(windows)]
+    {
+        let service_result = sc_command(&["start", crate::service::SERVICE_NAME]).await;
+        match service_result {
+            Ok(output) if output.status.success() => {
+                println!("gitsitter daemon started via Windows Service Control Manager");
+                return Ok(());
+            }
+            Ok(_) | Err(_) => {
+                // Service not installed or SCM unavailable -- spawn directly.
             }
         }
     }
@@ -841,6 +873,17 @@ pub async fn handle_daemon_start() -> Result<()> {
 }
 
 pub async fn handle_daemon_stop() -> Result<()> {
+    #[cfg(windows)]
+    {
+        let service_result = sc_command(&["stop", crate::service::SERVICE_NAME]).await;
+        if let Ok(output) = service_result {
+            if output.status.success() {
+                println!("gitsitter daemon stop requested via Windows Service Control Manager");
+                return Ok(());
+            }
+        }
+    }
+
     match connect_to_daemon().await {
         Ok(mut stream) => {
             let req = Request::Shutdown;
@@ -878,6 +921,10 @@ pub async fn handle_daemon_run() -> Result<()> {
     crate::daemon::run_daemon().await
 }
 
+pub async fn handle_daemon_service() -> Result<()> {
+    crate::service::run_service_dispatcher()
+}
+
 pub async fn handle_install(component: Option<String>, shell_name: Option<String>) -> Result<()> {
     let comp = component.as_deref().unwrap_or("all");
     match comp {
@@ -892,7 +939,8 @@ pub async fn handle_install(component: Option<String>, shell_name: Option<String
         }
         "daemon" => {
             let exe = std::env::current_exe()?;
-            if cfg!(target_os = "macos") {
+            #[cfg(target_os = "macos")]
+            {
                 // Generate launchd plist
                 let launch_agents = dirs::home_dir()
                     .context("cannot determine home directory")?
@@ -909,7 +957,10 @@ pub async fn handle_install(component: Option<String>, shell_name: Option<String
                 std::fs::write(&plist_path, plist)?;
                 println!("launchd plist written to {}", plist_path.display());
                 println!("Run: launchctl bootstrap gui/$(id -u) {}", plist_path.display());
-            } else {
+            }
+
+            #[cfg(target_os = "linux")]
+            {
                 // Generate systemd unit file
                 let unit_dir = dirs::home_dir()
                     .context("cannot determine home directory")?
@@ -922,6 +973,36 @@ pub async fn handle_install(component: Option<String>, shell_name: Option<String
                 println!("Systemd user service written to {}", unit_path.display());
                 println!("Run: systemctl --user daemon-reload && systemctl --user enable --now gitsitter");
             }
+
+            #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
+            {
+                bail!("daemon service installation is not implemented for this Unix platform");
+            }
+
+            #[cfg(windows)]
+            {
+                let bin_path = format!("\"{}\" daemon service", exe.display());
+                let output = sc_command(&[
+                    "create",
+                    crate::service::SERVICE_NAME,
+                    &format!("DisplayName= {}", crate::service::SERVICE_DISPLAY_NAME),
+                    &format!("binPath= {}", bin_path),
+                    "start= auto",
+                    "type= own",
+                ])
+                .await?;
+                if !output.status.success() {
+                    bail!(
+                        "failed to create Windows service: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                println!(
+                    "Windows service '{}' installed",
+                    crate::service::SERVICE_DISPLAY_NAME
+                );
+                println!("Run: sc.exe start {}", crate::service::SERVICE_NAME);
+            }
         }
         _ => bail!("unknown component: {}. Use 'shell', 'hooks', 'daemon', or 'all'", comp),
     }
@@ -929,11 +1010,14 @@ pub async fn handle_install(component: Option<String>, shell_name: Option<String
     if comp == "all" {
         // Also offer daemon install hint
         println!();
-        if cfg!(target_os = "macos") {
-            println!("To also install the launchd service, run: gitsitter install daemon");
-        } else {
-            println!("To also install the systemd service, run: gitsitter install daemon");
-        }
+        #[cfg(target_os = "macos")]
+        println!("To also install the launchd service, run: gitsitter install daemon");
+        #[cfg(target_os = "linux")]
+        println!("To also install the systemd service, run: gitsitter install daemon");
+        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
+        println!("Daemon service installation is not implemented for this Unix platform");
+        #[cfg(windows)]
+        println!("To also install the Windows service, run: gitsitter install daemon");
     }
     Ok(())
 }
@@ -948,7 +1032,8 @@ pub async fn handle_uninstall(component: Option<String>) -> Result<()> {
             println!("Shell hook removed for {sh}");
         }
         "daemon" => {
-            if cfg!(target_os = "macos") {
+            #[cfg(target_os = "macos")]
+            {
                 let plist_path = dirs::home_dir()
                     .context("cannot determine home directory")?
                     .join("Library/LaunchAgents/com.gitsitter.daemon.plist");
@@ -959,7 +1044,10 @@ pub async fn handle_uninstall(component: Option<String>) -> Result<()> {
                 } else {
                     println!("No launchd plist found");
                 }
-            } else {
+            }
+
+            #[cfg(target_os = "linux")]
+            {
                 let unit_path = dirs::home_dir()
                     .context("cannot determine home directory")?
                     .join(".config/systemd/user/gitsitter.service");
@@ -969,6 +1057,24 @@ pub async fn handle_uninstall(component: Option<String>) -> Result<()> {
                     println!("Run: systemctl --user daemon-reload");
                 } else {
                     println!("No systemd service file found");
+                }
+            }
+
+            #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
+            {
+                bail!("daemon service uninstall is not implemented for this Unix platform");
+            }
+
+            #[cfg(windows)]
+            {
+                let output = sc_command(&["delete", crate::service::SERVICE_NAME]).await?;
+                if output.status.success() {
+                    println!("Windows service removed");
+                } else {
+                    println!(
+                        "Windows service removal failed: {}",
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
                 }
             }
         }

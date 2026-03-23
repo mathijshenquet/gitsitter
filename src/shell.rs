@@ -10,10 +10,11 @@ const HOOK_END_MARKER: &str = "# <<< gitsitter hook <<<";
 const BASH_HOOK: &str = include_str!("embed/bash_hook.sh");
 const ZSH_HOOK: &str = include_str!("embed/zsh_hook.zsh");
 const FISH_HOOK: &str = include_str!("embed/fish_hook.fish");
+const POWERSHELL_HOOK: &str = include_str!("embed/powershell_hook.ps1");
 
 /// List supported shells.
 pub fn supported_shells() -> &'static [&'static str] {
-    &["bash", "zsh", "fish"]
+    &["bash", "zsh", "fish", "powershell", "pwsh"]
 }
 
 /// Generate the shell hook script for the given shell.
@@ -22,6 +23,7 @@ pub fn generate_hook(shell: &str) -> Result<String> {
         "bash" => Ok(BASH_HOOK.to_string()),
         "zsh" => Ok(ZSH_HOOK.to_string()),
         "fish" => Ok(FISH_HOOK.to_string()),
+        "powershell" | "pwsh" => Ok(POWERSHELL_HOOK.to_string()),
         _ => bail!("unsupported shell: {shell} (supported: {})", supported_shells().join(", ")),
     }
 }
@@ -33,6 +35,14 @@ pub fn shell_config_path(shell: &str) -> Result<PathBuf> {
         "bash" => Ok(home.join(".bashrc")),
         "zsh" => Ok(home.join(".zshrc")),
         "fish" => Ok(home.join(".config").join("fish").join("config.fish")),
+        "powershell" => Ok(home
+            .join("Documents")
+            .join("WindowsPowerShell")
+            .join("Microsoft.PowerShell_profile.ps1")),
+        "pwsh" => Ok(home
+            .join("Documents")
+            .join("PowerShell")
+            .join("Microsoft.PowerShell_profile.ps1")),
         _ => bail!("unsupported shell: {shell} (supported: {})", supported_shells().join(", ")),
     }
 }
@@ -137,17 +147,26 @@ pub fn uninstall_hook(shell: &str) -> Result<()> {
 /// Returns the shell basename (e.g. "bash", "zsh", "fish") if it is
 /// a supported shell, or `None` otherwise.
 pub fn detect_shell() -> Option<String> {
-    let shell_path = std::env::var("SHELL").ok()?;
-    let basename = std::path::Path::new(&shell_path)
-        .file_name()?
-        .to_str()?
-        .to_string();
+    if let Ok(shell_path) = std::env::var("SHELL") {
+        let basename = std::path::Path::new(&shell_path)
+            .file_name()?
+            .to_str()?
+            .to_string();
 
-    if supported_shells().contains(&basename.as_str()) {
-        Some(basename)
-    } else {
-        None
+        if supported_shells().contains(&basename.as_str()) {
+            return Some(basename);
+        }
     }
+
+    if cfg!(windows) {
+        if let Ok(psmodulepath) = std::env::var("PSModulePath") {
+            if !psmodulepath.is_empty() {
+                return Some("powershell".to_string());
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -158,10 +177,12 @@ mod tests {
     #[test]
     fn supported_shells_has_three() {
         let shells = supported_shells();
-        assert_eq!(shells.len(), 3);
+        assert_eq!(shells.len(), 5);
         assert!(shells.contains(&"bash"));
         assert!(shells.contains(&"zsh"));
         assert!(shells.contains(&"fish"));
+        assert!(shells.contains(&"powershell"));
+        assert!(shells.contains(&"pwsh"));
     }
 
     #[test]
@@ -186,8 +207,15 @@ mod tests {
     }
 
     #[test]
+    fn generate_hook_powershell() {
+        let hook = generate_hook("powershell").unwrap();
+        assert!(hook.contains("__gitsitter_hook"));
+        assert!(hook.contains("function global:prompt"));
+    }
+
+    #[test]
     fn generate_hook_unsupported() {
-        assert!(generate_hook("powershell").is_err());
+        assert!(generate_hook("nushell").is_err());
     }
 
     #[test]
@@ -206,7 +234,13 @@ mod tests {
     fn shell_config_path_fish() {
         let path = shell_config_path("fish").unwrap();
         assert_eq!(path.file_name().unwrap(), "config.fish");
-        assert!(path.to_str().unwrap().contains(".config/fish"));
+        assert_eq!(path.parent().unwrap().file_name().unwrap(), "fish");
+    }
+
+    #[test]
+    fn shell_config_path_powershell() {
+        let path = shell_config_path("powershell").unwrap();
+        assert_eq!(path.file_name().unwrap(), "Microsoft.PowerShell_profile.ps1");
     }
 
     #[test]
@@ -223,7 +257,11 @@ mod tests {
         unsafe { std::env::set_var("SHELL", "/usr/local/bin/fish") };
         assert_eq!(detect_shell(), Some("fish".to_string()));
         unsafe { std::env::set_var("SHELL", "/bin/sh") };
-        assert_eq!(detect_shell(), None);
+        if cfg!(windows) {
+            assert_eq!(detect_shell(), Some("powershell".to_string()));
+        } else {
+            assert_eq!(detect_shell(), None);
+        }
     }
 
     #[test]
