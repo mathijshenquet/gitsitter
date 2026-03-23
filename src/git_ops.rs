@@ -289,7 +289,7 @@ pub fn list_worktrees(repo_id: &Path) -> Result<Vec<WorktreeInfo>> {
 
 /// Check if a repo path exists and is a valid git repo.
 pub fn is_valid_repo(path: &Path) -> bool {
-    git2::Repository::discover(path).is_ok()
+    git2::Repository::open(path).is_ok()
 }
 
 /// Check if any git operation is in progress (rebase, merge, cherry-pick, bisect).
