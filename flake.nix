@@ -16,7 +16,10 @@
           pname = "gitsitter";
           version = "0.1.0";
           src = ./.;
-          cargoHash = "sha256-b3rxa+O0n1ClrLrjQoDYjWFup0uhkmMHQjh9/GXJzOk="; # TODO: update after first cargo build generates Cargo.lock
+          # cargoHash = "sha256-b3rxa+O0n1ClrLrjQoDYjWFup0uhkmMHQjh9/GXJzOk="; # TODO: update after first cargo build generates Cargo.lock
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+          };
           nativeBuildInputs = with pkgs; [
             pkg-config
           ];
