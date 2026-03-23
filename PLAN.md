@@ -61,6 +61,8 @@ Why SQLite over TOML state files:
 - Single file, no directory of per-repo state files to manage
 - The daemon writes frequently — SQLite handles concurrent read/write safely
 
+The database is initialized with `PRAGMA journal_mode = WAL` and `PRAGMA synchronous = NORMAL` for safe concurrent read/write without locking.
+
 Config stays in TOML — it's human-editable and version-controllable.
 
 ---
@@ -90,7 +92,44 @@ The in-repo file lets teams share sensible defaults (e.g. "never auto-push main"
 
 - `none` vs `fetch` distinction only exists at the repo level. At branch level, `none` means "don't sync this branch" while inheriting the repo's fetch behavior.
 - If any branch has a sync mode other than `none`, the repo implicitly has at least `fetch`.
-- **Default: `push+pull`**
+- **Default: `pull`** — push is opt-in. Use remote globs (see below) to enable push for repos owned by you or your org.
+
+### Remote-based trust model
+
+All repos are **auto-registered** on `cd` — no opt-in needed. The sync mode is determined by matching the repo's remote URL(s) against remote globs:
+
+- **Well-known hosts** (GitHub, GitLab, Codeberg, Bitbucket, SourceHut) ship as built-in `pull` defaults
+- **Unknown remotes** default to `none` — no network activity. The shell hook shows a one-time notification: "repo X has unknown remote, run `gitsitter config` to enable sync"
+- **`gitsitter status`** shows unsynced repos clearly with the reason (e.g. "remote not recognized")
+
+This eliminates the need for a separate trust/enable ceremony or an `auto_add` setting. No background network operations happen against unfamiliar remotes.
+
+### Remote globs
+
+Remote URL globs let you set sync modes based on who owns the remote, rather than configuring per-repo:
+
+```toml
+[remotes]
+# Built-in defaults (shipped with gitsitter, can be overridden):
+# "*github.com*" = "pull"
+# "*gitlab.com*" = "pull"
+# "*codeberg.org*" = "pull"
+# "*bitbucket.org*" = "pull"
+# "*sr.ht*" = "pull"
+
+# User config — evaluated before built-ins:
+"git@github.com:myuser/*" = "push+pull"     # my repos: full sync
+"git@github.com:myorg/*" = "push+pull"       # org repos: full sync
+```
+
+Remote globs are evaluated in order — first match wins. User-defined globs take priority over built-in defaults. They act as defaults that can be overridden by per-repo or per-branch config.
+
+Precedence (most specific wins):
+1. Branch config (exact name > longest glob > declaration order)
+2. Per-repo config
+3. In-repo config (`.config/gitsitter.toml`)
+4. Remote globs (user-defined, then built-in)
+5. Global defaults (`none` for unmatched remotes)
 
 ### Repo-level special states
 
@@ -101,7 +140,6 @@ The in-repo file lets teams share sensible defaults (e.g. "never auto-push main"
 | Setting | Scope | Default | Description |
 |---------|-------|---------|-------------|
 | `refresh_interval` | global, repo | `60s` | How often to check for changes |
-| `auto_add` | global | `true` | Automatically register repos on `cd` |
 | `colors` | global | `true` | Enable colored output |
 | `emoji` | global | `true` | Enable emoji in output |
 | `notification_cooldown` | global | `5m` | Minimum time between shell hook notifications per repo |
@@ -130,11 +168,13 @@ TOML format, stored in `~/.config/gitsitter/config.toml`:
 ```toml
 [global]
 refresh_interval = "60s"
-auto_add = true
 colors = true
 emoji = true
 notification_cooldown = "5m"
-mode = "push+pull"
+
+[remotes]
+"git@github.com:myuser/*" = "push+pull"    # my repos: full sync
+"git@github.com:myorg/*" = "push+pull"     # org repos: full sync
 
 [branches]
 "temp/*" = "none" # ignore temp branches
@@ -185,6 +225,7 @@ Context-aware status display.
   ~/projects/api-server    push+pull   ⚠️  1/9 diverged      1m ago
   ~/vendor/some-lib        pull        ✅ 5 synced       5m ago
   ~/old-project            disabled    ⏸️  —               —
+  ~/sketchy/repo           none        ⚠️  unknown remote   —
 ```
 
 The global view is an interactive TUI list — navigate with arrow keys, press Enter to drill into a repo, `d` to disable, `e` to enable, `c` to configure.
@@ -318,7 +359,7 @@ The notification is rate-limited per repo (default: once per 5 minutes) to avoid
 
 ### Registration hook
 
-If `auto_add` is enabled: call `gitsitter register` to ensure the repo is tracked. This is idempotent and fast.
+On every prompt, calls `gitsitter register` to ensure the repo is tracked. This is idempotent and fast. For repos with unrecognized remotes, a one-time notification is shown suggesting `gitsitter config`.
 
 ### Supported shells
 
@@ -333,21 +374,24 @@ If `auto_add` is enabled: call `gitsitter register` to ensure the repo is tracke
 ### Sync loop (per repo, per refresh interval)
 
 1. **Check repo exists** — if path is gone, mark repo as `missing`, log it, skip
-2. **Check repo state** — if mid-rebase, mid-merge, mid-cherry-pick, or `.git/index.lock` exists: skip this cycle
-3. **Fetch** from tracking remote(s)
-4. **For each tracked branch:**
+2. **Check repo state** — if any in-progress git operation is detected, skip this cycle. Check for: `.git/index.lock`, `.git/rebase-merge/`, `.git/rebase-apply/`, `.git/MERGE_HEAD`, `.git/CHERRY_PICK_HEAD`, `.git/BISECT_LOG`
+3. **Discover worktrees** — enumerate linked worktrees via `git2` to build branch→worktree occupancy map
+4. **Fetch** from tracking remote(s)
+5. **For each tracked branch** (only `refs/heads/*` — ignore `refs/stash`, `refs/bisect/*`, `refs/notes/*`):
    a. Determine local and remote HEAD
    b. If equal: nothing to do
    c. If remote is ahead and ff-possible:
-      - **Checked-out branch:** check worktree is clean first. If dirty, mark as "pending ff (worktree dirty)", skip. If clean, ff-merge (updates worktree and index).
-      - **Non-checked-out branch:** `git update-ref` to move the ref forward (no checkout needed). This is a core feature — when you `git checkout feature-x`, it's already up to date.
-   d. If local is ahead: push (never force-push)
+      - **Checked-out branch (in any worktree):** check that worktree is clean first. If dirty, mark as "pending ff (worktree dirty)", skip. If clean, ff-merge (updates worktree and index).
+      - **Non-checked-out branch:** `git update-ref` with expected-old-OID to move the ref forward (no checkout needed). This is a core feature — when you `git checkout feature-x`, it's already up to date.
+   d. If local is ahead: push (never force-push). Respect backoff state for this remote.
    e. If diverged: mark as diverged, log warning, update state
-5. **Persist state** to SQLite
+6. **Persist state** to SQLite
 
 ### File watching
 
 Use the `notify` crate to watch `.git/refs/heads/` and `.git/HEAD` for changes and index.lock. This allows near-instant reaction to local commits (for pushing) rather than waiting for the next polling interval. The polling interval remains as a fallback and for fetching remote changes. Once things change, depending on the thing, run a sync.
+
+Events must be debounced (2-3 seconds after last event) before triggering a sync cycle, since git operations can produce thousands of filesystem events (e.g. during rebase or large merges).
 
 ### Git strategy: hybrid git2 + git CLI
 
@@ -358,7 +402,7 @@ Two layers for interacting with git:
 
 The `git_path` config option lets users point to a specific git binary. If unset, the daemon uses `git` from `$PATH`. On startup, the daemon logs the detected git version.
 
-Auth, SSH config, credential helpers — all handled by the git CLI transparently.
+All daemon-spawned git CLI commands set `GIT_TERMINAL_PROMPT=0` and have stdin redirected from `/dev/null` to prevent hanging on passphrase prompts or other TTY input requests. Auth, SSH config, credential helpers — all handled by the git CLI transparently.
 
 ### Repo disappearance
 
@@ -381,11 +425,13 @@ Log rotation: configurable max size, default 10MB, keep 3 rotated files.
 
 ### Error handling
 
-- **Auth failures:** log warning, skip repo for this cycle, notify user via shell hook
-- **Network unavailable:** skip all fetches/pushes, retry next cycle silently
+- **Auth failures:** log warning, skip repo for this cycle, notify user via shell hook. Exponential backoff — double the retry interval on each consecutive failure (max 1h). Reset on success.
+- **Protected branch / server-side rejection:** categorize the push failure. If the remote rejects the push (e.g. branch protections, required checks), back off aggressively and notify. Do not retry every cycle — use exponential backoff (max 1h) to avoid churn.
+- **Network unavailable:** skip all fetches/pushes, retry next cycle silently. Consecutive network failures trigger exponential backoff on push retries (fetch can stay at normal interval).
 - **Lock contention (`.git/index.lock`):** skip repo for this cycle, no warning (user is probably mid-operation)
 - **Dirty worktree on checked-out branch:** fetch and update-ref other branches, but skip ff-merge on checked-out branch. Mark as "pending ff (worktree dirty)". Retry next cycle.
 - **Corrupt repo state:** log error, disable repo, notify user
+- **Slow/failing git hooks:** Daemon-initiated `push` and `merge --ff-only` commands use a configurable timeout (default 30s, per-repo). If the command times out (e.g. a `pre-push` hook running a test suite), treat the branch the same as diverged — mark as "push blocked (hook timeout)" or "pull blocked (hook timeout)" in state, and surface via shell hook notifications. This preserves hook semantics (formatters still run) while preventing the daemon from hanging indefinitely.
 
 ---
 
@@ -476,5 +522,6 @@ The project includes a `flake.nix` for reproducible builds and easy installation
 - **Non-tracking branches:** Branches without an upstream are ignored by the daemon. Only branches with a configured tracking remote are synced.
 - **Multiple remotes:** Sync follows the branch's configured upstream remote. No attempt to sync with multiple remotes.
 - **Shallow clones:** Should work for fetch/pull. Push from a shallow clone may fail — log and skip.
-- **Worktrees:** Each worktree checkout is treated independently. The daemon watches the main `.git` dir.
+- **Worktrees:** The daemon discovers all linked worktrees (`git worktree list`) and tracks branch occupancy across them. A branch checked out in *any* worktree is treated as a checked-out branch — it is never advanced via `update-ref` silently. Instead, it follows the checked-out-branch path: check worktree cleanliness, then ff-merge (which updates the worktree and index), or skip if dirty. Non-checked-out branches (not occupied by any worktree) are still advanced via `update-ref` — this remains a core feature. Worktree discovery is refreshed each sync cycle.
+- **update-ref safety:** All `update-ref` calls use expected-old-OID semantics (`git update-ref <ref> <new> <old>`) to avoid races. If the ref moved since the daemon last read it, the update fails safely and retries next cycle.
 - **Bare repos:** Not supported (no use case for auto-sync).
