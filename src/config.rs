@@ -144,6 +144,13 @@ struct RawGlobalSettings {
     notification_cooldown: Option<Duration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     git_path: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_opt_duration",
+        serialize_with = "serialize_opt_duration",
+        skip_serializing_if = "Option::is_none"
+    )]
+    watcher_debounce: Option<Duration>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -205,6 +212,7 @@ pub struct GlobalSettings {
     pub emoji: bool,
     pub notification_cooldown: Duration,
     pub git_path: Option<String>,
+    pub watcher_debounce: Option<Duration>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -255,6 +263,7 @@ impl Default for GlobalSettings {
             emoji: true,
             notification_cooldown: Duration::from_secs(300),
             git_path: None,
+            watcher_debounce: None,
         }
     }
 }
@@ -294,6 +303,7 @@ impl From<RawUserConfig> for UserConfig {
                 emoji: g.emoji.unwrap_or(true),
                 notification_cooldown: g.notification_cooldown.unwrap_or(Duration::from_secs(300)),
                 git_path: g.git_path,
+                watcher_debounce: g.watcher_debounce,
             },
             None => GlobalSettings::default(),
         };
@@ -339,6 +349,7 @@ impl From<&UserConfig> for RawUserConfig {
             emoji: Some(cfg.global.emoji),
             notification_cooldown: Some(cfg.global.notification_cooldown),
             git_path: cfg.global.git_path.clone(),
+            watcher_debounce: cfg.global.watcher_debounce,
         });
         let trusted_hosts = if cfg.trusted_hosts.is_empty() {
             None

@@ -8,3 +8,4 @@ pub mod shell;
 pub mod state;
 pub mod transport;
 pub mod tui;
+pub mod watcher;

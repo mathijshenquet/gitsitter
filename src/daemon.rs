@@ -222,6 +222,13 @@ pub async fn run_daemon() -> Result<()> {
         sync_loop(daemon_for_sync, shutdown_rx_sync).await;
     });
 
+    // 12b. Spawn file watcher task
+    let daemon_for_watcher = Arc::clone(&daemon);
+    let shutdown_rx_watcher = shutdown_rx.clone();
+    let watcher_task = tokio::spawn(async move {
+        crate::watcher::run(daemon_for_watcher, shutdown_rx_watcher).await;
+    });
+
     // 13. Wait for shutdown signal (SIGTERM / SIGINT)
     let mut sigterm =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -246,6 +253,7 @@ pub async fn run_daemon() -> Result<()> {
         async {
             let _ = socket_task.await;
             let _ = sync_task.await;
+            let _ = watcher_task.await;
         },
     )
     .await;
@@ -1261,18 +1269,6 @@ async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         }
     }
 
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// File watcher (stub)
-// ---------------------------------------------------------------------------
-
-/// Stub file watcher. The polling-based sync loop handles everything for now.
-/// TODO: implement notify-based file watching for near-instant reaction to
-/// local commits.
-#[allow(dead_code)]
-pub async fn start_file_watcher(_daemon: SharedDaemon) -> Result<()> {
     Ok(())
 }
 
