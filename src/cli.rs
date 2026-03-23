@@ -773,6 +773,20 @@ fn format_uptime(secs: u64) -> String {
     format!("{}d {}h", days, hours % 24)
 }
 
+async fn wait_for_daemon_ready(timeout: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    let poll_interval = std::time::Duration::from_millis(50);
+
+    while start.elapsed() < timeout {
+        if transport::is_daemon_running() {
+            return true;
+        }
+        tokio::time::sleep(poll_interval).await;
+    }
+
+    false
+}
+
 #[cfg(windows)]
 async fn sc_command(args: &[&str]) -> Result<std::process::Output> {
     tokio::process::Command::new("sc.exe")
@@ -805,8 +819,11 @@ pub async fn handle_daemon_start() -> Result<()> {
                     .await;
                 if let Ok(status) = result {
                     if status.success() {
-                        println!("gitsitter daemon started via launchd");
-                        return Ok(());
+                        if wait_for_daemon_ready(std::time::Duration::from_secs(3)).await {
+                            println!("gitsitter daemon started via launchd");
+                            return Ok(());
+                        }
+                        bail!("launchd accepted the job, but the daemon socket did not appear");
                     }
                 }
             }
@@ -824,8 +841,11 @@ pub async fn handle_daemon_start() -> Result<()> {
 
         match systemd_result {
             Ok(status) if status.success() => {
-                println!("gitsitter daemon started via systemd");
-                return Ok(());
+                if wait_for_daemon_ready(std::time::Duration::from_secs(3)).await {
+                    println!("gitsitter daemon started via systemd");
+                    return Ok(());
+                }
+                bail!("systemd accepted the job, but the daemon socket did not appear");
             }
             _ => {
                 // systemd not available or unit not installed -- spawn directly
@@ -868,8 +888,16 @@ pub async fn handle_daemon_start() -> Result<()> {
         .spawn()
         .context("failed to spawn daemon process")?;
 
-    println!("gitsitter daemon started (PID: {})", child.id());
-    Ok(())
+    if wait_for_daemon_ready(std::time::Duration::from_secs(3)).await {
+        println!("gitsitter daemon started (PID: {})", child.id());
+        return Ok(());
+    }
+
+    bail!(
+        "spawned daemon process (PID: {}), but the daemon socket did not appear; check {}",
+        child.id(),
+        paths::daemon_log().display()
+    )
 }
 
 pub async fn handle_daemon_stop() -> Result<()> {
@@ -1125,7 +1153,12 @@ pub async fn handle_prompt() -> Result<()> {
 
         for b in &data.branches {
             let notification_type = match b.status.as_str() {
-                "diverged" | "upstream_gone" | "push_blocked" => b.status.as_str(),
+                "diverged"
+                | "upstream_gone"
+                | "push_rejected"
+                | "auth_failed"
+                | "network_error"
+                | "push_blocked_hook_timeout" => b.status.as_str(),
                 _ => continue,
             };
 
@@ -1152,9 +1185,27 @@ pub async fn handle_prompt() -> Result<()> {
                         b.name
                     );
                 }
-                "push_blocked" => {
+                "push_rejected" => {
                     println!(
-                        "\u{26A0}\u{FE0F}  gitsitter: push blocked for {}",
+                        "\u{26A0}\u{FE0F}  gitsitter: push rejected for {}",
+                        b.name
+                    );
+                }
+                "auth_failed" => {
+                    println!(
+                        "\u{26A0}\u{FE0F}  gitsitter: auth failed while syncing {}",
+                        b.name
+                    );
+                }
+                "network_error" => {
+                    println!(
+                        "\u{26A0}\u{FE0F}  gitsitter: network error while syncing {}",
+                        b.name
+                    );
+                }
+                "push_blocked_hook_timeout" => {
+                    println!(
+                        "\u{26A0}\u{FE0F}  gitsitter: push blocked by hook timeout for {}",
                         b.name
                     );
                 }
