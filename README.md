@@ -18,10 +18,10 @@ A git utility that keeps your local branches in sync with their tracking remotes
 # Build
 cargo build --release
 
-# Install shell hooks (auto-detects bash/zsh/fish)
+# Install shell hooks
 gitsitter install shell
 
-# Install systemd user service
+# Install the daemon service
 gitsitter install daemon
 
 # Or just run the daemon directly
@@ -29,6 +29,11 @@ gitsitter daemon run
 ```
 
 Once the shell hook is installed, repos are auto-registered when you `cd` into them. The daemon fetches, pulls, and pushes in the background based on your configuration.
+
+Platform notes:
+- Linux: `install daemon` writes a systemd user service.
+- macOS: `install daemon` writes a launchd plist.
+- Windows: `install daemon` creates a Windows service. This typically requires an elevated shell.
 
 ## Usage
 
@@ -47,13 +52,15 @@ gitsitter disable                  # disable current repo
 gitsitter log                      # show daemon log for current repo
 gitsitter log --global             # show global daemon log
 gitsitter daemon status            # check if daemon is running
-gitsitter daemon start             # start daemon (systemd or detached)
+gitsitter daemon start             # start daemon (service manager or detached)
 gitsitter daemon stop              # graceful shutdown
 ```
 
 ## Configuration
 
 Config file: `~/.config/gitsitter/config.toml`
+
+On Windows, the default config path is under `%APPDATA%\gitsitter\config.toml`.
 
 ```toml
 [global]
@@ -110,7 +117,9 @@ Teams can commit `.gitsitter.toml` to share defaults. User config always takes p
 ## Architecture
 
 - **Repo identity:** keyed by canonicalized common git dir (worktree-safe)
-- **Client-server:** CLI connects to daemon via Unix domain socket, JSON protocol
+- **Client-server:** CLI connects to daemon over local IPC, JSON protocol
+  - Unix: Unix domain socket
+  - Windows: named pipe
 - **Hybrid git:** `git2` for fast reads (merge analysis, status), `git` CLI for network/writes (fetch, push, merge)
 - **File watching:** `notify` crate watches `.git/refs/` and `.git/HEAD` for near-instant reaction to local commits
 - **State:** SQLite (`~/.local/state/gitsitter/state.db`) for sync timestamps, branch status, worktree info
@@ -138,6 +147,16 @@ Non-checked-out branches are updated via `git update-ref` (no checkout needed) �
 $XDG_RUNTIME_DIR/gitsitter.sock         # Unix domain socket
 ```
 
+Windows defaults:
+
+```
+%APPDATA%\gitsitter\config.toml         # user configuration
+%LOCALAPPDATA%\gitsitter\state.db       # SQLite state database
+%LOCALAPPDATA%\gitsitter\daemon.log     # daemon log
+%LOCALAPPDATA%\gitsitter\daemon.pid     # PID file
+\\.\pipe\gitsitter-<user>               # named pipe endpoint
+```
+
 ## Building
 
 Requires Rust 2024 edition. A Nix flake is provided for reproducible builds:
@@ -155,7 +174,11 @@ cargo test
 ## Supported Platforms
 
 - **Linux** — systemd user service, inotify file watching
-- **macOS** — launchd plist (planned), FSEvents file watching
+- **macOS** — launchd plist, FSEvents file watching
+- **Windows** — Windows service support, named-pipe IPC, PowerShell shell hook
+
+Known gap:
+- Windows end-to-end daemon integration tests are not implemented yet. Unit and integration coverage for the core code paths does run on Windows.
 
 ## License
 

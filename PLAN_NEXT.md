@@ -1,8 +1,8 @@
 # gitsitter — Next Steps
 
-## Current State (as of 2026-03-23)
+## Current State (as of 2026-03-24)
 
-~5400 lines of Rust across 13 source files. 52 tests passing. Core daemon loop, CLI, config resolution, file watcher, shell hooks, SQLite state, and Unix socket transport are all implemented and functional.
+Core daemon loop, CLI, config resolution, file watcher, shell hooks, SQLite state, and cross-platform local IPC transport are implemented and functional. Native Windows support now exists for daemon runtime, named-pipe transport, PowerShell shell hooks, and Windows service installation/start/stop. Windows still lacks end-to-end daemon integration tests.
 
 ### What's Implemented
 
@@ -16,12 +16,12 @@
 | File watcher | Done | notify-based, watches refs/heads, refs/remotes, HEAD; debounce; suppresses self-triggered events |
 | Shell hooks | Done | bash/zsh/fish generation, install/uninstall with markers |
 | State storage | Done | SQLite with WAL, repos/branches/worktrees/notification cooldowns |
-| Transport | Done | Length-prefixed JSON over Unix socket |
-| Path resolution | Done | XDG-compliant, env overrides for testing |
+| Transport | Done | Length-prefixed JSON over Unix socket / Windows named pipe |
+| Path resolution | Done | Platform-aware defaults, env overrides for testing |
 | Backoff | Done | Per-remote fetch backoff, per-ref push backoff, exponential with max 1h |
 | Error categorization | Done | Push: rejected/auth/network/hook-timeout; Fetch: timeout/failure |
 | Worktree support | Done | Multi-worktree discovery, branch occupancy map, dirty checks per worktree |
-| Systemd/launchd integration | Done | Service file generation for both platforms, start/stop via systemctl or launchctl |
+| System Services | Done | systemd on Linux, launchd on macOS, Windows service support |
 
 ---
 
@@ -97,4 +97,4 @@ These were considered and intentionally dropped:
 - **`--since` filtering for logs** — Same; `journalctl --since` already handles this.
 - **Log rotation** — System infra handles this. No need for tracing-appender rotation.
 - **Repo disappearance notifications** — No good use case for nagging about repos that vanished (may just be unmounted drives).
-- **Windows support** — Not a priority. Unix-only for now.
+- **Windows support** — Implemented. Follow-up work is CI/docs/E2E coverage rather than core platform support.

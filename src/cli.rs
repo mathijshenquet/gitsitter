@@ -1,7 +1,7 @@
 //! CLI command handlers.
 //!
 //! Each function corresponds to a CLI subcommand. They connect to the daemon
-//! via Unix socket, send a request, and print the response. When the daemon is
+//! via the local IPC transport, send a request, and print the response. When the daemon is
 //! down, some commands fall back to reading directly from SQLite/TOML.
 
 use std::path::{Path, PathBuf};
