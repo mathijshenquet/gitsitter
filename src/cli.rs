@@ -786,8 +786,9 @@ pub async fn handle_daemon_start() -> Result<()> {
             .map(|h| h.join("Library/LaunchAgents/com.gitsitter.daemon.plist"));
         if let Some(ref p) = plist_path {
             if p.exists() {
+                let domain_target = format!("gui/{}", unsafe { libc::getuid() });
                 let result = tokio::process::Command::new("launchctl")
-                    .args(["load", &p.display().to_string()])
+                    .args(["bootstrap", &domain_target, &p.display().to_string()])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::piped())
                     .status()
@@ -907,7 +908,7 @@ pub async fn handle_install(component: Option<String>, shell_name: Option<String
                 let plist_path = launch_agents.join("com.gitsitter.daemon.plist");
                 std::fs::write(&plist_path, plist)?;
                 println!("launchd plist written to {}", plist_path.display());
-                println!("Run: launchctl load {}", plist_path.display());
+                println!("Run: launchctl bootstrap gui/$(id -u) {}", plist_path.display());
             } else {
                 // Generate systemd unit file
                 let unit_dir = dirs::home_dir()
@@ -952,7 +953,7 @@ pub async fn handle_uninstall(component: Option<String>) -> Result<()> {
                     .context("cannot determine home directory")?
                     .join("Library/LaunchAgents/com.gitsitter.daemon.plist");
                 if plist_path.exists() {
-                    println!("Run first: launchctl unload {}", plist_path.display());
+                    println!("Run first: launchctl bootout gui/$(id -u) {}", plist_path.display());
                     std::fs::remove_file(&plist_path)?;
                     println!("launchd plist removed");
                 } else {
