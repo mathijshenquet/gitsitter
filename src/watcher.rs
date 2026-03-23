@@ -17,7 +17,7 @@ use tracing::{error, info, warn};
 use crate::daemon::Daemon;
 
 /// Default debounce interval for filesystem events.
-const DEFAULT_DEBOUNCE: Duration = Duration::from_secs(1);
+const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// Paths within a git dir that we watch.
 const WATCH_SUBDIRS: &[&str] = &["refs/heads", "refs/remotes"];
@@ -170,10 +170,10 @@ pub async fn run(
         for (repo_id, reason) in fired {
             pending.remove(&repo_id);
             info!("🔍  rescanning {} ({})", repo_id, reason);
-            // Reset the repo's last_sync to force an immediate sync.
             let mut repos = daemon.repos.write().await;
             if let Some(tr) = repos.get_mut(&repo_id) {
                 tr.last_sync = None;
+                tr.sync_reason = Some(reason.clone());
             }
             drop(repos);
             daemon.sync_notify.notify_one();

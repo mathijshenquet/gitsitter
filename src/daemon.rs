@@ -58,6 +58,7 @@ pub struct TrackedRepo {
     pub display_path: String,
     pub remote_url: Option<String>,
     pub last_sync: Option<Instant>,
+    pub sync_reason: Option<String>,
     pub backoff: BackoffState,
 }
 
@@ -176,6 +177,7 @@ pub async fn run_daemon() -> Result<()> {
                     display_path: rs.display_path.clone(),
                     remote_url: rs.remote_url.clone(),
                     last_sync: None, // will sync on first cycle
+                    sync_reason: None,
                     backoff: BackoffState::new(),
                 },
             );
@@ -486,6 +488,7 @@ async fn handle_register(daemon: &SharedDaemon, repo_path: &str) -> Response {
             display_path: display_path.clone(),
             remote_url: remote_url.clone(),
             last_sync: None,
+            sync_reason: None,
             backoff: BackoffState::new(),
         });
     }
@@ -596,6 +599,7 @@ async fn handle_shutdown(daemon: &SharedDaemon) -> Response {
             display_path: String::new(),
             remote_url: None,
             last_sync: None,
+            sync_reason: None,
             backoff: BackoffState::new(),
         },
     );
@@ -1263,15 +1267,21 @@ async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         let db = daemon.db.lock().await;
         let _ = db.update_repo_sync_time(repo_id);
     }
-    {
+    let reason = {
         let mut repos = daemon.repos.write().await;
+        let reason = repos.get(repo_id).and_then(|tr| tr.sync_reason.clone());
         if let Some(tr) = repos.get_mut(repo_id) {
             tr.last_sync = Some(Instant::now());
+            tr.sync_reason = None;
         }
-    }
+        reason
+    };
 
     let elapsed = sync_start.elapsed();
-    info!("✅ sync completed for {} in {:.1?}", repo_id, elapsed);
+    match reason {
+        Some(r) => info!("✅ sync completed for {} in {:.1?} ({})", repo_id, elapsed, r),
+        None => info!("✅ sync completed for {} in {:.1?} (scheduled)", repo_id, elapsed),
+    }
 
     Ok(())
 }
