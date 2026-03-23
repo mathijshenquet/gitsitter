@@ -673,7 +673,7 @@ async fn sync_loop(daemon: SharedDaemon, mut shutdown_rx: watch::Receiver<bool>)
         // Sync each due repo
         for repo_id in repos_to_sync {
             if let Err(e) = sync_repo(&daemon, &repo_id).await {
-                warn!("sync error for {}: {:#}", repo_id, e);
+                warn!("sync error for {}: {:#}", repo_log_label(&repo_id), e);
             }
         }
     }
@@ -709,11 +709,12 @@ async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
 async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
     let sync_start = Instant::now();
     let repo_path = PathBuf::from(repo_id);
+    let repo_label = repo_log_label(repo_id);
     let mut had_activity = false;
 
     // 1. Check repo exists
     if !repo_path.exists() {
-        warn!("repo path missing: {}", repo_id);
+        warn!("repo path missing: {}", repo_label);
         let db = daemon.db.lock().await;
         db.set_repo_missing(repo_id)?;
         drop(db);
@@ -741,7 +742,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
             // If it was marked missing but now exists, restore to active
             if rs.status == "missing" {
                 db.set_repo_status(repo_id, "active")?;
-                info!("repo restored (was missing): {}", repo_id);
+                info!("repo restored (was missing): {}", repo_label);
             }
         }
     }
@@ -855,7 +856,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         any_success = true;
                     }
                     Err(e) => {
-                        warn!("fetch failed for {} remote {}: {:#}", repo_id, remote, e);
+                        warn!("fetch failed for {} remote {}: {:#}", repo_label, remote, e);
                     }
                 }
             }
@@ -912,7 +913,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
             Err(e) => {
                 warn!(
                     "merge analysis failed for {}:{}: {:#}",
-                    repo_id, branch.name, e
+                    repo_label, branch.name, e
                 );
                 continue;
             }
@@ -923,7 +924,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         match analysis {
             // 5b. Upstream gone
             MergeAnalysis::UpstreamGone => {
-                info!("upstream gone for {}:{}", repo_id, branch.name);
+                info!("upstream gone for {}:{}", repo_label, branch.name);
                 let db = daemon.db.lock().await;
                 let _ = db.upsert_branch(
                     repo_id,
@@ -993,7 +994,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                     if is_dirty {
                         info!(
                             "skipping ff for {}:{} — worktree dirty",
-                            repo_id, branch.name
+                            repo_label, branch.name
                         );
                         let db = daemon.db.lock().await;
                         let _ = db.upsert_branch(
@@ -1023,7 +1024,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                     {
                         Ok(()) => {
                             had_activity = true;
-                            info!("ff-merged {}:{}", repo_id, branch.name);
+                            info!("ff-merged {}:{}", repo_label, branch.name);
                             let now = chrono::Utc::now().to_rfc3339();
                             let db = daemon.db.lock().await;
                             let _ = db.upsert_branch(
@@ -1043,7 +1044,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         Err(e) => {
                             warn!(
                                 "ff-merge failed for {}:{}: {:#}",
-                                repo_id, branch.name, e
+                                repo_label, branch.name, e
                             );
                             let db = daemon.db.lock().await;
                             let _ = db.upsert_branch(
@@ -1074,7 +1075,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                     {
                         Ok(()) => {
                             had_activity = true;
-                            info!("update-ref {}:{}", repo_id, branch.name);
+                            info!("update-ref {}:{}", repo_label, branch.name);
                             let now = chrono::Utc::now().to_rfc3339();
                             let db = daemon.db.lock().await;
                             let _ = db.upsert_branch(
@@ -1094,7 +1095,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         Err(e) => {
                             warn!(
                                 "update-ref failed for {}:{}: {:#}",
-                                repo_id, branch.name, e
+                                repo_label, branch.name, e
                             );
                             // Likely a race — retry next cycle
                         }
@@ -1151,7 +1152,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 {
                     Ok(PushResult::Success) => {
                         had_activity = true;
-                        info!("pushed {}:{}", repo_id, branch.name);
+                        info!("pushed {}:{}", repo_label, branch.name);
                         let now = chrono::Utc::now().to_rfc3339();
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
@@ -1174,7 +1175,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         );
                     }
                     Ok(PushResult::Rejected(msg)) => {
-                        warn!("push rejected for {}:{}: {}", repo_id, branch.name, msg);
+                        warn!("push rejected for {}:{}: {}", repo_label, branch.name, msg);
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_push_failure(&ref_name);
@@ -1196,7 +1197,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         );
                     }
                     Ok(PushResult::AuthFailed(msg)) => {
-                        warn!("push auth failed for {}:{}: {}", repo_id, branch.name, msg);
+                        warn!("push auth failed for {}:{}: {}", repo_label, branch.name, msg);
                         // Auth failure is per-remote, record on fetch backoff
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
@@ -1219,7 +1220,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         );
                     }
                     Ok(PushResult::NetworkError(msg)) => {
-                        warn!("push network error for {}:{}: {}", repo_id, branch.name, msg);
+                        warn!("push network error for {}:{}: {}", repo_label, branch.name, msg);
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_fetch_failure();
@@ -1241,7 +1242,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         );
                     }
                     Ok(PushResult::HookTimeout) => {
-                        warn!("push hook timeout for {}:{}", repo_id, branch.name);
+                        warn!("push hook timeout for {}:{}", repo_label, branch.name);
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_push_failure(&ref_name);
@@ -1263,14 +1264,14 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         );
                     }
                     Err(e) => {
-                        error!("push error for {}:{}: {:#}", repo_id, branch.name, e);
+                        error!("push error for {}:{}: {:#}", repo_label, branch.name, e);
                     }
                 }
             }
 
             // 5f. Diverged
             MergeAnalysis::Diverged => {
-                warn!("diverged: {}:{}", repo_id, branch.name);
+                warn!("diverged: {}:{}", repo_label, branch.name);
                 let db = daemon.db.lock().await;
                 let _ = db.upsert_branch(
                     repo_id,
@@ -1305,7 +1306,6 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
     };
 
     let elapsed = sync_start.elapsed();
-    let repo_label = repo_log_label(repo_id);
     match reason {
         Some(r) if had_activity => info!("✅ sync completed for {} in {:.1?} ({})", repo_label, elapsed, r),
         Some(r) => info!("• scan completed for {} in {:.1?} ({})", repo_label, elapsed, r),
