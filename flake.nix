@@ -42,6 +42,10 @@
             libgit2
             sqlite
           ];
+
+          shellHook = ''
+            export PATH="./target/debug:./target/release:$PATH"
+          '';
         };
       }
     );
