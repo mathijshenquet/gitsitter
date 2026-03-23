@@ -120,46 +120,58 @@ Branches do not control fetch (fetch is repo-wide). Branch modes are:
 - If any branch has a sync mode other than `none`, the repo implicitly has at least `fetch`.
 - **Default: `pull`** — push is opt-in. Use remote globs (see below) to enable push for repos owned by you or your org.
 
-### Remote-based trust model
+### Remote trust model
 
-All repos are **auto-registered** on `cd` — no opt-in needed. The sync mode is determined by matching the repo's remote URL(s) against remote globs:
+All repos are **auto-registered** on `cd` — no opt-in needed. Network activity is gated by two layers:
 
-- **Well-known hosts** (GitHub, GitLab, Codeberg, Bitbucket, SourceHut) ship as built-in `pull` defaults
-- **Unknown remotes** default to `none` — no network activity. The shell hook shows a one-time notification: "repo X has unknown remote, run `gitsitter config` to enable sync"
-- **`gitsitter status`** shows unsynced repos clearly with the reason (e.g. "remote not recognized")
+#### Trusted hosts (security gate)
 
-This eliminates the need for a separate trust/enable ceremony or an `auto_add` setting. No background network operations happen against unfamiliar remotes.
-
-### Remote globs
-
-Remote URL globs let you set sync modes based on who owns the remote, rather than configuring per-repo:
+The daemon will **never** make network requests to a host not in the trusted hosts list. This is the security boundary.
 
 ```toml
-[remotes]
-# Built-in defaults (shipped with gitsitter, can be overridden):
-# "*github.com*" = "pull"
-# "*gitlab.com*" = "pull"
-# "*codeberg.org*" = "pull"
-# "*bitbucket.org*" = "pull"
-# "*sr.ht*" = "pull"
+[trusted_hosts]
+# Built-in (always present, can be disabled by setting to false):
+# github.com = true
+# gitlab.com = true
+# codeberg.org = true
+# bitbucket.org = true
+# sr.ht = true
 
-# User config — evaluated before built-ins:
-"git@github.com:myuser/*" = "push+pull"     # my repos: full sync
-"git@github.com:myorg/*" = "push+pull"       # org repos: full sync
+# User additions:
+"git.corp.internal" = true
 ```
 
-Remote globs are evaluated in order — first match wins. User-defined globs take priority over built-in defaults. They act as defaults that can be overridden by per-repo or per-branch config.
+Host matching is **exact domain comparison** — the host is extracted from the remote URL and compared literally. No globs, no substring matching. This prevents attacks like `github.com.evil.com` bypassing the check.
+
+- **Untrusted host** → `none`, zero network activity. Shell hook shows a one-time notification: "repo X has untrusted remote host, run `gitsitter config` to add it"
+- **`gitsitter status`** shows unsynced repos clearly with the reason (e.g. "host not trusted")
+
+#### Remote defaults (sync mode)
+
+Once a host is trusted, remote URL globs control the default sync mode. Globs use prefix matching (`git@github.com:myuser/*`), which is safe because the `:` or `://host/` in the URL terminates the host — `git@github.com.evil.com:*` can never match a `git@github.com:*` pattern.
+
+```toml
+[defaults.remotes]
+"git@github.com:myuser/*" = "push+pull"     # my repos: full sync
+"git@github.com:myorg/*" = "push+pull"       # org repos: full sync
+"https://github.com/myuser/*" = "push+pull"
+"https://git.corp.internal/team/*" = "push+pull"
+```
+
+Remote defaults are evaluated in order — first match wins. They act as defaults that can be overridden by per-repo or per-branch config. Repos on trusted hosts with no matching remote default fall back to `pull`.
+
+Both `[trusted_hosts]` and `[defaults.remotes]` are **global config only** — they never appear in `.gitsitter.toml` (in-repo config). This prevents a malicious repo from whitelisting its own remotes.
 
 ### Config resolution algorithm
 
 **Repo effective mode** (evaluated top to bottom, first match wins):
 
+0. Remote host not in `[trusted_hosts]` → `none`, stop
 1. `disabled=true` on user per-repo config → repo disabled
 2. User per-repo `mode`
 3. In-repo `.gitsitter.toml` `mode`
-4. First matching user remote glob
-5. First matching built-in remote glob
-6. Fallback: `none`
+4. First matching `[defaults.remotes]` glob
+5. Fallback: `pull` (for any trusted host)
 
 **Branch effective mode** (evaluated top to bottom, first match wins):
 
@@ -167,8 +179,8 @@ Remote globs are evaluated in order — first match wins. User-defined globs tak
 2. Longest matching user per-repo branch glob
 3. Exact in-repo branch rule
 4. Longest matching in-repo branch glob
-5. Exact global branch rule
-6. Longest matching global branch glob
+5. Exact `[defaults.branches]` rule
+6. Longest matching `[defaults.branches]` glob
 7. Repo effective mode (inherit)
 
 Within any layer: exact name beats glob, longer glob beats shorter, declaration order breaks ties.
@@ -189,7 +201,7 @@ Within any layer: exact name beats glob, longer glob beats shorter, declaration 
 
 ### In-repo config file (`.gitsitter.toml`)
 
-Located at the repo root. One path, no ambiguity.
+Located at the repo root. One path, no ambiguity. **Cannot contain `[trusted_hosts]` or `[defaults.remotes]`** — remote trust is a user-level decision only, never controlled by the repo being synced.
 
 ```toml
 mode = "pull"                    # repo-level default: pull only
@@ -214,11 +226,16 @@ colors = true
 emoji = true
 notification_cooldown = "5m"
 
-[remotes]
+[trusted_hosts]
+# Built-in hosts (github.com, gitlab.com, etc.) are always present.
+# Add your own:
+"git.corp.internal" = true
+
+[defaults.remotes]
 "git@github.com:myuser/*" = "push+pull"    # my repos: full sync
 "git@github.com:myorg/*" = "push+pull"     # org repos: full sync
 
-[branches]
+[defaults.branches]
 "temp/*" = "none" # ignore temp branches
 
 [repos."/home/user/projects/my-app"]
@@ -282,6 +299,8 @@ gitsitter config --global/-g           # TUI: configure global settings
 gitsitter config --repo/-r <mode>      # set sync mode for current repo
 gitsitter config --branch/-b <mode>    # set sync mode for current branch
 gitsitter config --branch/-b <name> <mode>  # set sync mode for a specific branch
+gitsitter config --explain             # show full config resolution chain
+gitsitter config --explain --branch <name>  # explain config for a specific branch
 ```
 
 **Interactive TUI (`gitsitter config`):**
@@ -289,6 +308,34 @@ gitsitter config --branch/-b <name> <mode>  # set sync mode for a specific branc
 - Navigate settings with arrow keys
 - Inline editing for values
 - Changes are saved on exit, sent to daemon via socket for immediate application
+
+**Config explain (`gitsitter config --explain`):**
+
+Shows every config layer and which one won, for debugging the resolution chain:
+
+```
+📦 ~/projects/my-app  (effective: push+pull)
+
+  mode: push+pull
+    ├─ trusted host:              github.com ✅
+    ├─ defaults.remotes glob:     push+pull   (git@github.com:myuser/*)  ← applied
+    ├─ in-repo .gitsitter.toml:   —
+    └─ user per-repo config:      —
+
+  branch: main  (effective: pull)
+    ├─ repo effective mode:       push+pull
+    ├─ defaults.branches:         —
+    ├─ in-repo .gitsitter.toml:   pull        (exact match)  ← applied
+    └─ user per-repo branch:      —
+
+  branch: feature/foo  (effective: push+pull)
+    ├─ repo effective mode:       push+pull
+    ├─ defaults.branches:         —
+    ├─ in-repo .gitsitter.toml:   push+pull   (feature/*)  ← applied
+    └─ user per-repo branch:      —
+```
+
+Without `--branch`, shows all branches. With `--branch <name>`, shows only that branch's resolution.
 
 ### `gitsitter enable` / `gitsitter add`
 
