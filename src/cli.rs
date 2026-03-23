@@ -899,7 +899,7 @@ pub async fn handle_install(component: Option<String>, shell_name: Option<String
             std::fs::create_dir_all(&unit_dir)?;
             let exe = std::env::current_exe()?;
             let unit = format!(
-                "[Unit]\nDescription=gitsitter daemon\n\n[Service]\nExecStart={} daemon run\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+                "[Unit]\nDescription=gitsitter daemon\n\n[Service]\nType=exec\nExecStart={} daemon run\nRestart=on-failure\nRestartSec=5\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=default.target\n",
                 exe.display()
             );
             let unit_path = unit_dir.join("gitsitter.service");
