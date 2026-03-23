@@ -3,7 +3,7 @@
 
 A git utility that makes you forget the distinction between `BRANCH` and `origin/BRANCH`. Your local branches stay in sync with their tracking remotes — automatically, silently, and safely.
 
-Rust CLI + daemon. The CLI controls and configures the daemon. The daemon watches registered git repos in the background, fetches from tracking remotes, and fast-forward merges in both directions:
+Single Rust binary — acts as both CLI and daemon. The CLI controls and configures the daemon. The daemon watches registered git repos in the background, fetches from tracking remotes, and fast-forward merges in both directions:
 - **Remote ahead → ff-merge into local** (pull)
 - **Local ahead → push to remote** (push)
 - **Diverged → do nothing**, never force-push, notify the user
@@ -14,6 +14,54 @@ Rust CLI + daemon. The CLI controls and configures the daemon. The daemon watche
 - **Notify on problems.** Diverged branches, failed pushes, auth errors — surface these to the user.
 - **Never destructive.** No force-push, no rebase, no reset. If ff is not possible, stop and tell the user.
 - **Good git hygiene is assumed.** If you're on a tracked branch, treat commits as final. Use local branches for WIP/amend/squash workflows.
+
+---
+
+## Architecture
+
+### Single binary, client-server model
+
+`gitsitter` is one binary that acts as both daemon and CLI client.
+
+- `gitsitter daemon start` — starts the daemon (forks/backgrounds itself)
+- All other commands — connect to the daemon via socket, send a request, print the response
+
+### Communication: Unix domain socket / Windows named pipe
+
+The daemon listens on a socket. The CLI connects, sends a JSON request, gets a JSON response. Simple length-prefixed `serde_json` messages — no protocol framework needed.
+
+| Platform | Transport | Path |
+|----------|-----------|------|
+| Linux/macOS | Unix domain socket | `$XDG_RUNTIME_DIR/gitsitter.sock` or `/tmp/gitsitter-$UID.sock` |
+| Windows | Named pipe | `\\.\pipe\gitsitter` |
+
+Platform abstraction is a thin wrapper — everything else (git2, config, TUI) is cross-platform.
+
+### Daemon is source of truth
+
+- **On startup:** daemon reads config from TOML, loads last known state from SQLite into memory.
+- **During operation:** all sync results update in-memory state. State is persisted to SQLite periodically and on clean shutdown.
+- **CLI queries:** go through the socket → daemon replies from memory. Near-instant.
+- **Config changes via CLI:** go through the socket → daemon updates in-memory config to TOML on disk.
+
+### Daemon-down fallback
+
+When the CLI can't connect to the socket:
+- **Config commands:** CLI writes directly to the TOML file on disk. Daemon picks up changes on next start.
+- **Status commands:** CLI reads from SQLite directly, with a warning: "daemon not running, showing cached state".
+- **Shell hooks:** if socket connect fails (with short timeout ~20ms), silently skip. No notification is better than a hung terminal.
+
+### State storage: SQLite
+
+State (sync timestamps, branch status, divergence info, notification cooldowns) is stored in SQLite at `~/.local/state/gitsitter/state.db`.
+
+Why SQLite over TOML state files:
+- Atomic writes without temp-file-and-rename per repo
+- Queryable (e.g. "all diverged branches across all repos")
+- Single file, no directory of per-repo state files to manage
+- The daemon writes frequently — SQLite handles concurrent read/write safely
+
+Config stays in TOML — it's human-editable and version-controllable.
 
 ---
 
@@ -57,6 +105,7 @@ The in-repo file lets teams share sensible defaults (e.g. "never auto-push main"
 | `colors` | global | `true` | Enable colored output |
 | `emoji` | global | `true` | Enable emoji in output |
 | `notification_cooldown` | global | `5m` | Minimum time between shell hook notifications per repo |
+| `git_path` | global | `null` (auto-detect) | Path to git binary. If unset, uses `git` from `$PATH` |
 
 ### In-repo config file (`.gitsitter.toml` or `.config/gitsitter.toml`)
 
@@ -153,10 +202,10 @@ gitsitter config --branch/-b <name> <mode>  # set sync mode for a specific branc
 ```
 
 **Interactive TUI (`gitsitter config`):**
-- Shows current config with inheritance chain (global → repo → branch)
+- Shows current config with inheritance chain (global → in-repo → user-repo → branch)
 - Navigate settings with arrow keys
 - Inline editing for values
-- Changes are saved on exit, applied immediately by the daemon
+- Changes are saved on exit, sent to daemon via socket for immediate application
 
 ### `gitsitter enable` / `gitsitter add`
 
@@ -184,7 +233,7 @@ Show daemon activity log.
 ```
 gitsitter log                          # tail log for current repo
 gitsitter log --global/-g              # tail global daemon log
-gitsitter log --follow/-f              # follow mode (like tail -f)
+gitsitter log --follow/-f              # stream live from daemon via socket
 gitsitter log --since "1h"             # filter by time
 ```
 
@@ -195,6 +244,19 @@ Example output:
 [14:33:01] ⚠️  ~/projects/api-server  main: diverged from origin/main, ff not possible
 [14:34:01] 📥 ~/vendor/some-lib  main: pulled 1 commit from origin/main
 ```
+
+`gitsitter log --follow` streams directly from the daemon over the socket — no log file tailing.
+
+### `gitsitter sync`
+
+Trigger an immediate sync, bypassing the refresh interval timer.
+
+```
+gitsitter sync                         # sync current repo now
+gitsitter sync --all                   # sync all repos now
+```
+
+Sends a message to the daemon: "ignore the timer, run a sync cycle for this repo right now."
 
 ### `gitsitter register`
 
@@ -218,18 +280,18 @@ gitsitter install hooks              # only install shell hooks
 ```
 
 ```
-gitsitter uninstall [*]              # similarto above 
+gitsitter uninstall [*]              # similarto above
 ```
 
 Interactive TUI when called without arguments — shows what will be installed and asks for confirmation.
 
 ### `gitsitter daemon`
 
-Direct daemon (systemd) control (mostly for debugging / advanced use).
+Direct daemon control (mostly for debugging / advanced use).
 
 ```
 gitsitter daemon start                 # start the daemon
-gitsitter daemon stop                  # stop the daemon
+gitsitter daemon stop                  # stop the daemon (via socket, graceful shutdown)
 gitsitter daemon restart               # restart the daemon
 gitsitter daemon status                # show daemon status (pid, uptime, repos watched)
 ```
@@ -240,11 +302,11 @@ gitsitter daemon status                # show daemon status (pid, uptime, repos 
 
 ### Prompt hook (post-command / pre-prompt)
 
-Fires on every prompt display. Performs a cheap check:
+Fires on every prompt display. Connects to daemon socket with ~20ms timeout:
 
 1. Are we in a registered git repo?
 2. Has it been longer than `notification_cooldown` since last notification for this repo?
-3. Are there any diverged branches?
+3. Are there any diverged branches or pending warnings?
 
 If all three: print a one-line warning. Example:
 
@@ -252,11 +314,11 @@ If all three: print a one-line warning. Example:
 ⚠️  gitsitter: feature-x has diverged from origin/feature-x (ff not possible)
 ```
 
-The notification is rate-limited per repo (default: once per 5 minutes) to avoid noise. The check itself should be near-instant — read a small state file the daemon maintains, no git operations.
+The notification is rate-limited per repo (default: once per 5 minutes) to avoid noise. If the socket connect fails, silently skip — never hang the terminal.
 
 ### Registration hook
 
-if `auto_add` is enabled: call `gitsitter register` to ensure the repo is tracked. This is idempotent and fast.
+If `auto_add` is enabled: call `gitsitter register` to ensure the repo is tracked. This is idempotent and fast.
 
 ### Supported shells
 
@@ -268,13 +330,6 @@ if `auto_add` is enabled: call `gitsitter register` to ensure the repo is tracke
 
 ## Daemon
 
-### Architecture
-
-- Single-user systemd user service (`systemd --user`)
-- Long-running Rust process
-- Watches registered repos on a configurable interval
-- Maintains a state file per repo for cheap status checks by the CLI/shell hooks
-
 ### Sync loop (per repo, per refresh interval)
 
 1. **Check repo exists** — if path is gone, mark repo as `missing`, log it, skip
@@ -284,15 +339,26 @@ if `auto_add` is enabled: call `gitsitter register` to ensure the repo is tracke
    a. Determine local and remote HEAD
    b. If equal: nothing to do
    c. If remote is ahead and ff-possible:
-      - **Checked-out branch:** ff-merge (updates worktree)
-      - **Non-checked-out branch:** `git update-ref` to move the ref forward (no checkout needed)
+      - **Checked-out branch:** check worktree is clean first. If dirty, mark as "pending ff (worktree dirty)", skip. If clean, ff-merge (updates worktree and index).
+      - **Non-checked-out branch:** `git update-ref` to move the ref forward (no checkout needed). This is a core feature — when you `git checkout feature-x`, it's already up to date.
    d. If local is ahead: push (never force-push)
-   e. If diverged: mark as diverged, log warning, update state file
-5. **Write state file** with per-branch sync status and timestamps
+   e. If diverged: mark as diverged, log warning, update state
+5. **Persist state** to SQLite
 
 ### File watching
 
 Use the `notify` crate to watch `.git/refs/heads/` and `.git/HEAD` for changes and index.lock. This allows near-instant reaction to local commits (for pushing) rather than waiting for the next polling interval. The polling interval remains as a fallback and for fetching remote changes. Once things change, depending on the thing, run a sync.
+
+### Git strategy: hybrid git2 + git CLI
+
+Two layers for interacting with git:
+
+- **`git2` (libgit2)** — for fast, in-process read-only operations: merge analysis (`is_ancestor`), worktree status checks, ref inspection, branch enumeration. No auth needed, no fork/exec overhead.
+- **`git` CLI** — for all network and write operations: `fetch`, `push`, `merge --ff-only`, `update-ref`. This gets SSH config, credential helpers, GPG signing, and proxy settings for free — no reimplementation needed.
+
+The `git_path` config option lets users point to a specific git binary. If unset, the daemon uses `git` from `$PATH`. On startup, the daemon logs the detected git version.
+
+Auth, SSH config, credential helpers — all handled by the git CLI transparently.
 
 ### Repo disappearance
 
@@ -303,30 +369,42 @@ When a repo path no longer exists:
 - After configurable period (e.g. 7 days), notify user via shell hook that repo has been missing
 - `gitsitter status --global` shows missing repos clearly
 
-### State files
-
-Per-repo state files in `~/.local/state/gitsitter/` (or equivalent XDG path):
-
-```
-~/.local/state/gitsitter/repos/<hash>/state.toml
-```
-
-Contains: branch sync status, last fetch/push/pull time, divergence info, last notification time. This is what the shell hook reads for cheap status checks.
-
 ### Logging
 
-Append-only log file at `~/.local/state/gitsitter/daemon.log`.
+Structured logging via `tracing`. Logs written to `~/.local/state/gitsitter/daemon.log`.
 
 Log levels: `info` (syncs, fetches, pushes), `warn` (divergence, missing repos, auth failures), `error` (crashes, unrecoverable).
 
 Log rotation: configurable max size, default 10MB, keep 3 rotated files.
+
+`gitsitter log --follow` streams log entries from the daemon over the socket in real time.
 
 ### Error handling
 
 - **Auth failures:** log warning, skip repo for this cycle, notify user via shell hook
 - **Network unavailable:** skip all fetches/pushes, retry next cycle silently
 - **Lock contention (`.git/index.lock`):** skip repo for this cycle, no warning (user is probably mid-operation)
+- **Dirty worktree on checked-out branch:** fetch and update-ref other branches, but skip ff-merge on checked-out branch. Mark as "pending ff (worktree dirty)". Retry next cycle.
 - **Corrupt repo state:** log error, disable repo, notify user
+
+---
+
+## Platform support
+
+### Daemon management
+
+| Platform | Service manager | Fallback |
+|----------|----------------|----------|
+| Linux | systemd user service | Background process + PID file |
+| macOS | launchd (plist) | Background process + PID file |
+| Windows | Windows Service / Task Scheduler | Background process |
+
+### File watching
+
+The `notify` crate handles platform differences automatically:
+- Linux: inotify
+- macOS: FSEvents
+- Windows: ReadDirectoryChangesW
 
 ---
 
@@ -337,14 +415,18 @@ Log rotation: configurable max size, default 10MB, keep 3 rotated files.
   config.toml                    # user configuration
 
 ~/.local/state/gitsitter/
+  state.db                       # SQLite state database
   daemon.log                     # daemon activity log
   daemon.pid                     # daemon PID file
-  repos/
-    <sha256-of-path>/
-      state.toml                 # per-repo state (branch status, timestamps)
+
+$XDG_RUNTIME_DIR/ (or /tmp/)
+  gitsitter.sock                 # Unix domain socket (Linux/macOS)
 
 ~/.config/systemd/user/
-  gitsitter.service              # systemd user service file
+  gitsitter.service              # systemd user service file (Linux)
+
+~/Library/LaunchAgents/
+  com.gitsitter.daemon.plist     # launchd plist (macOS)
 ```
 
 Shell hook scripts are appended to the appropriate shell config file (`.bashrc`, `.zshrc`, `config.fish`).
@@ -355,14 +437,34 @@ Shell hook scripts are appended to the appropriate shell config file (`.bashrc`,
 
 | Crate | Purpose |
 |-------|---------|
-| `git2` | Git operations (fetch, merge, push, status) |
+| `git2` | Local repo reading (merge analysis, status, ref inspection) |
 | `notify` | Filesystem watching for `.git/` changes |
 | `clap` | CLI argument parsing |
 | `ratatui` | Terminal UI for interactive modes |
-| `toml` / `serde` | Config parsing |
-| `tracing` | Structured logging |
+| `toml` / `serde` / `serde_json` | Config parsing + socket protocol |
+| `rusqlite` | State storage |
+| `tokio` | Async runtime, Unix socket / named pipe |
+| `tracing` + `tracing-appender` | Structured logging with rotation |
 | `dirs` | XDG directory resolution |
-| `colored` | Terminal colors (respects `colors` config) |
+
+---
+
+## Distribution
+
+### Nix flake
+
+The project includes a `flake.nix` for reproducible builds and easy installation:
+
+- `nix run github:user/gitsitter` — run directly
+- `nix profile install github:user/gitsitter` — install to user profile
+- Dev shell with all build dependencies (`rust`, `pkg-config`, `openssl`, `libgit2`, `sqlite`)
+- Outputs: package, overlay, NixOS/home-manager module (configures systemd user service automatically)
+
+### Other distribution
+
+- Cargo: `cargo install gitsitter`
+- Pre-built binaries: GitHub releases (Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64)
+- AUR (Arch Linux)
 
 ---
 
@@ -370,6 +472,7 @@ Shell hook scripts are appended to the appropriate shell config file (`.bashrc`,
 
 - **Detached HEAD:** If a user detaches HEAD (e.g. cloned repo just for inspection), no branch is checked out, so push+pull has nothing to act on. This naturally opts out of sync.
 - **Non-checked-out branches:** Updated via `git update-ref` — no checkout needed. This is a core feature: when you `git checkout feature-x`, it's already up to date with remote. No more `git pull` after every checkout.
+- **Dirty worktree:** If the checked-out branch has uncommitted changes and remote is ahead, the daemon skips the ff-merge and marks the branch as "pending ff (worktree dirty)". It retries next cycle. Non-checked-out branches are still updated normally.
 - **Non-tracking branches:** Branches without an upstream are ignored by the daemon. Only branches with a configured tracking remote are synced.
 - **Multiple remotes:** Sync follows the branch's configured upstream remote. No attempt to sync with multiple remotes.
 - **Shallow clones:** Should work for fetch/pull. Push from a shallow clone may fail — log and skip.
