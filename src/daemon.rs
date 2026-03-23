@@ -60,6 +60,7 @@ pub struct TrackedRepo {
     pub remote_url: Option<String>,
     pub last_sync: Option<Instant>,
     pub sync_reason: Option<String>,
+    pub in_sync: bool,
     pub backoff: BackoffState,
 }
 
@@ -179,6 +180,7 @@ pub async fn run_daemon() -> Result<()> {
                     remote_url: rs.remote_url.clone(),
                     last_sync: None, // will sync on first cycle
                     sync_reason: None,
+                    in_sync: false,
                     backoff: BackoffState::new(),
                 },
             );
@@ -385,9 +387,10 @@ async fn handle_sync(
         // Reset last_sync on all repos to force immediate re-sync
         let mut repos = daemon.repos.write().await;
         for tr in repos.values_mut() {
-            tr.last_sync = None;
+            tr.sync_reason = Some("cli sync requested (all repos)".into());
         }
         drop(repos);
+        info!("⚡ event cli sync requested (all repos)");
         daemon.sync_notify.notify_one();
         Response::Ok {
             message: "sync triggered for all repos".into(),
@@ -398,8 +401,9 @@ async fn handle_sync(
                 let repo_id_str = repo_id.to_string_lossy().to_string();
                 let mut repos = daemon.repos.write().await;
                 if let Some(tr) = repos.get_mut(&repo_id_str) {
-                    tr.last_sync = None;
+                    tr.sync_reason = Some(format!("cli sync requested ({})", display_repo_label(&tr.display_path)));
                     drop(repos);
+                    info!("⚡ event cli sync requested {}", display_repo_label(&path));
                     daemon.sync_notify.notify_one();
                     Response::Ok {
                         message: format!("sync triggered for {}", path),
@@ -465,6 +469,7 @@ async fn handle_register(daemon: &SharedDaemon, repo_path: &str) -> Response {
             remote_url: remote_url.clone(),
             last_sync: None,
             sync_reason: None,
+            in_sync: false,
             backoff: BackoffState::new(),
         });
     }
@@ -639,14 +644,23 @@ async fn sync_loop(daemon: SharedDaemon, mut shutdown_rx: watch::Receiver<bool>)
             let mut due = Vec::new();
 
             for (repo_id, tracked) in repos.iter() {
+                if tracked.in_sync {
+                    continue;
+                }
+
                 let refresh_interval = config.effective_refresh_interval(
                     repo_id,
                     None, // in-repo config loaded per-sync
                 );
 
-                let is_due = match tracked.last_sync {
-                    None => true,
-                    Some(last) => last.elapsed() >= refresh_interval,
+                // sync_reason is set by CLI sync / watcher to bypass the timer
+                let is_due = if tracked.sync_reason.is_some() {
+                    true
+                } else {
+                    match tracked.last_sync {
+                        None => true,
+                        Some(last) => last.elapsed() >= refresh_interval,
+                    }
                 };
 
                 if is_due {
@@ -670,8 +684,32 @@ async fn sync_loop(daemon: SharedDaemon, mut shutdown_rx: watch::Receiver<bool>)
 // ---------------------------------------------------------------------------
 
 async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
+    {
+        let mut repos = daemon.repos.write().await;
+        if let Some(tr) = repos.get_mut(repo_id) {
+            if tr.in_sync {
+                return Ok(());
+            }
+            tr.in_sync = true;
+        }
+    }
+
+    let result = sync_repo_inner(daemon, repo_id).await;
+
+    {
+        let mut repos = daemon.repos.write().await;
+        if let Some(tr) = repos.get_mut(repo_id) {
+            tr.in_sync = false;
+        }
+    }
+
+    result
+}
+
+async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
     let sync_start = Instant::now();
     let repo_path = PathBuf::from(repo_id);
+    let mut had_activity = false;
 
     // 1. Check repo exists
     if !repo_path.exists() {
@@ -984,6 +1022,7 @@ async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                     .await
                     {
                         Ok(()) => {
+                            had_activity = true;
                             info!("ff-merged {}:{}", repo_id, branch.name);
                             let now = chrono::Utc::now().to_rfc3339();
                             let db = daemon.db.lock().await;
@@ -1034,6 +1073,7 @@ async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                     .await
                     {
                         Ok(()) => {
+                            had_activity = true;
                             info!("update-ref {}:{}", repo_id, branch.name);
                             let now = chrono::Utc::now().to_rfc3339();
                             let db = daemon.db.lock().await;
@@ -1110,6 +1150,7 @@ async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 .await
                 {
                     Ok(PushResult::Success) => {
+                        had_activity = true;
                         info!("pushed {}:{}", repo_id, branch.name);
                         let now = chrono::Utc::now().to_rfc3339();
                         let mut repos = daemon.repos.write().await;
@@ -1264,9 +1305,12 @@ async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
     };
 
     let elapsed = sync_start.elapsed();
+    let repo_label = repo_log_label(repo_id);
     match reason {
-        Some(r) => info!("✅ sync completed for {} in {:.1?} ({})", repo_id, elapsed, r),
-        None => info!("✅ sync completed for {} in {:.1?} (scheduled)", repo_id, elapsed),
+        Some(r) if had_activity => info!("✅ sync completed for {} in {:.1?} ({})", repo_label, elapsed, r),
+        Some(r) => info!("• scan completed for {} in {:.1?} ({})", repo_label, elapsed, r),
+        None if had_activity => info!("✅ sync completed for {} in {:.1?} (scheduled)", repo_label, elapsed),
+        None => info!("• scheduled scan completed for {} in {:.1?}", repo_label, elapsed),
     }
 
     Ok(())
@@ -1280,6 +1324,26 @@ async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
 fn resolve_repo_id_from_path(path: &str) -> Result<PathBuf> {
     let p = Path::new(path);
     git_ops::discover_repo_id(p)
+}
+
+pub(crate) fn display_repo_label(path: &str) -> String {
+    strip_windows_device_prefix(path).trim_end_matches(['\\', '/']).to_string()
+}
+
+pub(crate) fn display_path_label(path: &Path) -> String {
+    strip_windows_device_prefix(&path.display().to_string())
+}
+
+fn repo_log_label(repo_id: &str) -> String {
+    let repo_path = Path::new(repo_id);
+    git_ops::get_display_path(repo_path)
+        .ok()
+        .map(|path| display_path_label(&path))
+        .unwrap_or_else(|| display_repo_label(repo_id))
+}
+
+fn strip_windows_device_prefix(path: &str) -> String {
+    path.strip_prefix(r"\\?\").unwrap_or(path).replace('\\', "/")
 }
 
 async fn wait_for_shutdown_signal(shutdown_rx: &mut watch::Receiver<bool>) -> Result<()> {

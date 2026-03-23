@@ -18,6 +18,7 @@ use crate::daemon::Daemon;
 
 /// Default debounce interval for filesystem events.
 const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(200);
+const SELF_TRIGGER_SUPPRESSION: Duration = Duration::from_secs(5);
 
 /// Paths within a git dir that we watch.
 const WATCH_SUBDIRS: &[&str] = &["refs/heads", "refs/remotes"];
@@ -99,9 +100,8 @@ pub async fn run(
                         resolve_repo_id_for_path(&path, &watched_repos)
                             .and_then(|rid| repos_guard.get(&rid))
                             .map(|tr| match tr.last_sync {
-                                // last_sync is None when a sync is in-flight
-                                None => true,
-                                Some(last) => last.elapsed() < debounce * 5,
+                                None => tr.in_sync,
+                                Some(last) => tr.in_sync || last.elapsed() < SELF_TRIGGER_SUPPRESSION,
                             })
                             .unwrap_or(false)
                     };
@@ -163,10 +163,13 @@ pub async fn run(
         }
         for (repo_id, reason) in fired {
             pending.remove(&repo_id);
-            info!("🔍  rescanning {} ({})", repo_id, reason);
+            info!(
+                "⚡ event {} -> sync {}",
+                reason,
+                crate::daemon::display_repo_label(&repo_id)
+            );
             let mut repos = daemon.repos.write().await;
             if let Some(tr) = repos.get_mut(&repo_id) {
-                tr.last_sync = None;
                 tr.sync_reason = Some(reason.clone());
             }
             drop(repos);
@@ -203,7 +206,7 @@ fn add_repo_watches(
         }
     }
 
-    info!("👁️  watching {}", git_dir.display());
+    info!("👁️  watching {}", crate::daemon::display_path_label(&git_dir));
     watched.insert(repo_id.to_string(), paths);
     Ok(())
 }
@@ -224,7 +227,7 @@ fn remove_repo_watches(
 
 /// Derive a human-readable reason from a changed path.
 ///
-/// Examples: "ref update (main)", "HEAD changed", "remote ref (origin/main)"
+/// Examples: "local branch main changed", "HEAD changed", "remote origin/main changed"
 fn describe_change(path: &Path) -> String {
     let components: Vec<&str> = path
         .components()
@@ -235,7 +238,7 @@ fn describe_change(path: &Path) -> String {
     if let Some(pos) = components.iter().position(|&c| c == "heads") {
         let branch = components[pos + 1..].join("/");
         if !branch.is_empty() {
-            return format!("ref update ({})", branch);
+            return format!("local branch {branch} changed");
         }
     }
 
@@ -243,7 +246,7 @@ fn describe_change(path: &Path) -> String {
     if let Some(pos) = components.iter().position(|&c| c == "remotes") {
         let rest = components[pos + 1..].join("/");
         if !rest.is_empty() {
-            return format!("remote ref ({})", rest);
+            return format!("remote {rest} changed");
         }
     }
 
@@ -252,7 +255,7 @@ fn describe_change(path: &Path) -> String {
         return "HEAD changed".to_string();
     }
 
-    format!("file changed ({})", path.display())
+    format!("git metadata changed ({})", crate::daemon::display_path_label(path))
 }
 
 /// Check if a path is under refs/remotes/.
