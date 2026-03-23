@@ -19,11 +19,22 @@ Single Rust binary — acts as both CLI and daemon. The CLI controls and configu
 
 ## Architecture
 
+### Repo identity: common git dir
+
+The daemon keys repositories by **canonicalized common git dir**, not by working tree path. This is critical for worktree support — multiple working trees share one logical repository.
+
+- **`repo_id`** = canonicalized path to the common git dir (e.g. `/home/user/projects/my-app/.git`)
+- **`worktrees`** = list of `{ path, current_head, clean/dirty, last_seen }` per repo
+- **`display_path`** = preferred human-readable path for the repo (shortest worktree path, or the main working tree)
+
+When a user `cd`s into a linked worktree, the shell hook resolves it to the same `repo_id` as the main working tree. One repo, one sync policy, one branch occupancy map across all worktrees. No duplicate registrations.
+
 ### Single binary, client-server model
 
 `gitsitter` is one binary that acts as both daemon and CLI client.
 
-- `gitsitter daemon start` — starts the daemon (forks/backgrounds itself)
+- `gitsitter daemon run` — run the daemon in the foreground (used by service managers and for debugging)
+- `gitsitter daemon start` — ask systemd/launchd to start the service, or spawn a detached fallback process
 - All other commands — connect to the daemon via socket, send a request, print the response
 
 ### Communication: Unix domain socket / Windows named pipe
@@ -80,7 +91,9 @@ Configuration is resolved in order of specificity — more specific scopes overr
 
 The in-repo file lets teams share sensible defaults (e.g. "never auto-push main"). The user's personal config always wins over the in-repo file, so you can override team defaults locally.
 
-### Sync modes (per scope)
+### Sync modes
+
+#### Repo-level modes
 
 | Mode | Fetch | Pull (ff-merge in) | Push |
 |------|-------|---------------------|------|
@@ -90,7 +103,20 @@ The in-repo file lets teams share sensible defaults (e.g. "never auto-push main"
 | `push` | ✅ | ❌ | ✅ |
 | `push+pull` | ✅ | ✅ | ✅ |
 
-- `none` vs `fetch` distinction only exists at the repo level. At branch level, `none` means "don't sync this branch" while inheriting the repo's fetch behavior.
+#### Branch-level modes
+
+Branches do not control fetch (fetch is repo-wide). Branch modes are:
+
+| Mode | Pull | Push |
+|------|------|------|
+| `inherit` | from repo | from repo |
+| `none` | ❌ | ❌ |
+| `pull` | ✅ | ❌ |
+| `push` | ❌ | ✅ |
+| `push+pull` | ✅ | ✅ |
+
+`inherit` is the implicit default when no branch rule matches.
+
 - If any branch has a sync mode other than `none`, the repo implicitly has at least `fetch`.
 - **Default: `pull`** — push is opt-in. Use remote globs (see below) to enable push for repos owned by you or your org.
 
@@ -124,12 +150,28 @@ Remote URL globs let you set sync modes based on who owns the remote, rather tha
 
 Remote globs are evaluated in order — first match wins. User-defined globs take priority over built-in defaults. They act as defaults that can be overridden by per-repo or per-branch config.
 
-Precedence (most specific wins):
-1. Branch config (exact name > longest glob > declaration order)
-2. Per-repo config
-3. In-repo config (`.config/gitsitter.toml`)
-4. Remote globs (user-defined, then built-in)
-5. Global defaults (`none` for unmatched remotes)
+### Config resolution algorithm
+
+**Repo effective mode** (evaluated top to bottom, first match wins):
+
+1. `disabled=true` on user per-repo config → repo disabled
+2. User per-repo `mode`
+3. In-repo `.gitsitter.toml` `mode`
+4. First matching user remote glob
+5. First matching built-in remote glob
+6. Fallback: `none`
+
+**Branch effective mode** (evaluated top to bottom, first match wins):
+
+1. Exact user per-repo branch rule
+2. Longest matching user per-repo branch glob
+3. Exact in-repo branch rule
+4. Longest matching in-repo branch glob
+5. Exact global branch rule
+6. Longest matching global branch glob
+7. Repo effective mode (inherit)
+
+Within any layer: exact name beats glob, longer glob beats shorter, declaration order breaks ties.
 
 ### Repo-level special states
 
@@ -145,9 +187,9 @@ Precedence (most specific wins):
 | `notification_cooldown` | global | `5m` | Minimum time between shell hook notifications per repo |
 | `git_path` | global | `null` (auto-detect) | Path to git binary. If unset, uses `git` from `$PATH` |
 
-### In-repo config file (`.gitsitter.toml` or `.config/gitsitter.toml`)
+### In-repo config file (`.gitsitter.toml`)
 
-If both exists: warning and use the one in `.config/gitsitter.toml`.
+Located at the repo root. One path, no ambiguity.
 
 ```toml
 mode = "pull"                    # repo-level default: pull only
@@ -321,7 +363,10 @@ gitsitter install hooks              # only install shell hooks
 ```
 
 ```
-gitsitter uninstall [*]              # similarto above
+gitsitter uninstall                    # TUI: select what to uninstall
+gitsitter uninstall shell              # remove shell hooks
+gitsitter uninstall daemon             # remove systemd/launchd service
+gitsitter uninstall hooks              # remove shell hooks only
 ```
 
 Interactive TUI when called without arguments — shows what will be installed and asks for confirmation.
@@ -331,7 +376,8 @@ Interactive TUI when called without arguments — shows what will be installed a
 Direct daemon control (mostly for debugging / advanced use).
 
 ```
-gitsitter daemon start                 # start the daemon
+gitsitter daemon run                   # run daemon in foreground (for service managers / debugging)
+gitsitter daemon start                 # start via service manager, or spawn detached fallback
 gitsitter daemon stop                  # stop the daemon (via socket, graceful shutdown)
 gitsitter daemon restart               # restart the daemon
 gitsitter daemon status                # show daemon status (pid, uptime, repos watched)
@@ -379,12 +425,13 @@ On every prompt, calls `gitsitter register` to ensure the repo is tracked. This 
 4. **Fetch** from tracking remote(s)
 5. **For each tracked branch** (only `refs/heads/*` — ignore `refs/stash`, `refs/bisect/*`, `refs/notes/*`):
    a. Determine local and remote HEAD
-   b. If equal: nothing to do
-   c. If remote is ahead and ff-possible:
+   b. If upstream ref is gone (deleted remotely): mark as `upstream_gone`, warn once, stop syncing this branch. Never delete the local branch.
+   c. If equal: nothing to do
+   d. If remote is ahead and ff-possible:
       - **Checked-out branch (in any worktree):** check that worktree is clean first. If dirty, mark as "pending ff (worktree dirty)", skip. If clean, ff-merge (updates worktree and index).
       - **Non-checked-out branch:** `git update-ref` with expected-old-OID to move the ref forward (no checkout needed). This is a core feature — when you `git checkout feature-x`, it's already up to date.
-   d. If local is ahead: push (never force-push). Respect backoff state for this remote.
-   e. If diverged: mark as diverged, log warning, update state
+   e. If local is ahead: push (never force-push). Respect backoff state (per-ref for push rejections, per-remote for auth/network).
+   f. If diverged: mark as diverged, log warning, update state
 6. **Persist state** to SQLite
 
 ### File watching
@@ -425,9 +472,9 @@ Log rotation: configurable max size, default 10MB, keep 3 rotated files.
 
 ### Error handling
 
-- **Auth failures:** log warning, skip repo for this cycle, notify user via shell hook. Exponential backoff — double the retry interval on each consecutive failure (max 1h). Reset on success.
-- **Protected branch / server-side rejection:** categorize the push failure. If the remote rejects the push (e.g. branch protections, required checks), back off aggressively and notify. Do not retry every cycle — use exponential backoff (max 1h) to avoid churn.
-- **Network unavailable:** skip all fetches/pushes, retry next cycle silently. Consecutive network failures trigger exponential backoff on push retries (fetch can stay at normal interval).
+- **Auth failures:** log warning, skip repo for this cycle, notify user via shell hook. **Per-remote** exponential backoff — double the retry interval on each consecutive failure (max 1h). Reset on success.
+- **Protected branch / server-side rejection:** categorize the push failure. **Per-ref** exponential backoff (max 1h) — one protected branch does not suppress healthy pushes to other refs on the same remote. Notify user.
+- **Network unavailable:** skip all fetches/pushes, retry next cycle silently. **Per-remote** exponential backoff on retries (fetch can stay at normal interval).
 - **Lock contention (`.git/index.lock`):** skip repo for this cycle, no warning (user is probably mid-operation)
 - **Dirty worktree on checked-out branch:** fetch and update-ref other branches, but skip ff-merge on checked-out branch. Mark as "pending ff (worktree dirty)". Retry next cycle.
 - **Corrupt repo state:** log error, disable repo, notify user
@@ -518,7 +565,8 @@ The project includes a `flake.nix` for reproducible builds and easy installation
 
 - **Detached HEAD:** If a user detaches HEAD (e.g. cloned repo just for inspection), no branch is checked out, so push+pull has nothing to act on. This naturally opts out of sync.
 - **Non-checked-out branches:** Updated via `git update-ref` — no checkout needed. This is a core feature: when you `git checkout feature-x`, it's already up to date with remote. No more `git pull` after every checkout.
-- **Dirty worktree:** If the checked-out branch has uncommitted changes and remote is ahead, the daemon skips the ff-merge and marks the branch as "pending ff (worktree dirty)". It retries next cycle. Non-checked-out branches are still updated normally.
+- **Dirty worktree:** "Dirty" means any staged or unstaged changes to tracked files. Untracked files do not block ff-merge. If the checked-out branch has tracked-file changes and remote is ahead, the daemon skips the ff-merge and marks the branch as "pending ff (worktree dirty)". It retries next cycle. Non-checked-out branches are still updated normally.
+- **Remote-deleted upstream:** If a branch's upstream ref was deleted remotely, mark as `upstream_gone`. Never delete the local branch. Warn once via shell hook. Stop syncing that branch until the upstream is restored or the user changes tracking config.
 - **Non-tracking branches:** Branches without an upstream are ignored by the daemon. Only branches with a configured tracking remote are synced.
 - **Multiple remotes:** Sync follows the branch's configured upstream remote. No attempt to sync with multiple remotes.
 - **Shallow clones:** Should work for fetch/pull. Push from a shallow clone may fail — log and skip.
