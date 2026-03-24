@@ -112,9 +112,13 @@ mod config_tests {
 mode = "push"
 refresh_interval = "120s"
 
-[branches]
-"main" = "push+pull"
-"release/*" = "none"
+[[branches]]
+pattern = "main"
+mode = "push+pull"
+
+[[branches]]
+pattern = "release/*"
+mode = "none"
 "#;
         std::fs::write(tmp.path().join(".gitsitter.toml"), toml_str).unwrap();
         let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
@@ -144,23 +148,38 @@ git_path = "/usr/bin/git"
 "github.com" = true
 "evil.example.com" = false
 
-[defaults.remotes]
-"github.com/*" = "push+pull"
-"gitlab.com/*" = "fetch"
+[[defaults.remotes]]
+pattern = "github.com/*"
+mode = "push+pull"
 
-[defaults.branches]
-"main" = "push+pull"
-"develop" = "pull"
-"feature/*" = "push"
+[[defaults.remotes]]
+pattern = "gitlab.com/*"
+mode = "fetch"
+
+[[defaults.branches]]
+pattern = "main"
+mode = "push+pull"
+
+[[defaults.branches]]
+pattern = "develop"
+mode = "pull"
+
+[[defaults.branches]]
+pattern = "feature/*"
+mode = "push"
 
 [repos."/home/user/project"]
 mode = "push"
 refresh_interval = "30s"
 disabled = false
 
-[repos."/home/user/project".branches]
-"main" = "push+pull"
-"release/*" = "none"
+[[repos."/home/user/project".branches]]
+pattern = "main"
+mode = "push+pull"
+
+[[repos."/home/user/project".branches]]
+pattern = "release/*"
+mode = "none"
 "#;
         std::fs::write(config_dir.join("config.toml"), full_toml).unwrap();
 
@@ -200,9 +219,13 @@ disabled = false
 mode = "fetch"
 refresh_interval = "5m"
 
-[branches]
-"main" = "push+pull"
-"staging" = "pull"
+[[branches]]
+pattern = "main"
+mode = "push+pull"
+
+[[branches]]
+pattern = "staging"
+mode = "pull"
 "#;
         std::fs::write(repo_root.join(".gitsitter.toml"), toml_str).unwrap();
 
@@ -231,7 +254,7 @@ refresh_interval = "5m"
         assert!(cfg.global.emoji);
         assert_eq!(cfg.global.notification_cooldown, Duration::from_secs(300));
         assert!(cfg.global.git_path.is_none());
-        assert!(cfg.trusted_hosts.is_empty());
+        assert_eq!(cfg.trusted_hosts.get("github.com"), Some(&true));
         assert!(cfg.defaults.remotes.is_empty());
         assert!(cfg.repos.is_empty());
     }
@@ -627,6 +650,31 @@ refresh_interval = "5m"
         assert_eq!(repo.branches.len(), 1);
         assert_eq!(repo.branches[0].0, "dev");
         assert_eq!(repo.branches[0].1, BranchSyncMode::Pull);
+    }
+
+    #[test]
+    fn load_creates_default_config_file_with_examples() {
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join("config_bootstrap");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        unsafe {
+            std::env::set_var("GITSITTER_CONFIG_DIR", &config_dir);
+        }
+
+        let cfg = UserConfig::load().unwrap();
+        let config_path = config_dir.join("config.toml");
+        let written = std::fs::read_to_string(&config_path).unwrap();
+
+        unsafe {
+            std::env::remove_var("GITSITTER_CONFIG_DIR");
+        }
+
+        assert!(config_path.exists());
+        assert_eq!(cfg.global.refresh_interval, Duration::from_secs(60));
+        assert_eq!(cfg.trusted_hosts.get("github.com"), Some(&true));
+        assert!(written.contains("# Example remote defaults."));
+        assert!(written.contains("# [[defaults.branches]]"));
     }
 }
 

@@ -59,8 +59,10 @@ gitsitter daemon stop              # graceful shutdown
 ## Configuration
 
 Config file: `~/.config/gitsitter/config.toml`
+On Windows: `%APPDATA%\gitsitter\config.toml`.
 
-On Windows, the default config path is under `%APPDATA%\gitsitter\config.toml`.
+If that file does not exist yet, gitsitter creates it on first run from the
+shipped default config template, including commented examples.
 
 ```toml
 [global]
@@ -72,20 +74,29 @@ notification_cooldown = "5m"
 [trusted_hosts]
 "git.corp.internal" = true
 
-[defaults.remotes]
-"git@github.com:myuser/*" = "push+pull"
-"git@github.com:myorg/*" = "push+pull"
+[[defaults.remotes]]
+pattern = "git@github.com:myuser/*"
+mode = "push+pull"
 
-[defaults.branches]
-"temp/*" = "none"
+[[defaults.remotes]]
+pattern = "git@github.com:myorg/*"
+mode = "push+pull"
+
+[[defaults.branches]]
+pattern = "temp/*"
+mode = "none"
 
 [repos."/home/user/projects/my-app"]
 mode = "push+pull"
 refresh_interval = "30s"
 
-[repos."/home/user/projects/my-app".branches]
-main = "pull"
-"feature/*" = "push+pull"
+[[repos."/home/user/projects/my-app".branches]]
+pattern = "main"
+mode = "pull"
+
+[[repos."/home/user/projects/my-app".branches]]
+pattern = "feature/*"
+mode = "push+pull"
 ```
 
 ### Sync Modes
@@ -170,6 +181,59 @@ nix build            # build the package
 cargo build --release
 cargo test
 ```
+
+### Home Manager
+
+The flake also exports a Home Manager module at `homeManagerModules.default`.
+Use this when you want Nix to manage:
+
+- installing the `gitsitter` binary
+- writing `~/.config/gitsitter/config.toml`
+- creating the user `systemd` service
+- adding shell integration for bash, zsh, or fish
+
+Example:
+
+```nix
+{
+  inputs.gitsitter.url = "git+ssh://git@github.com/mathijshenquet/gitsitter";
+
+  outputs = { nixpkgs, home-manager, gitsitter, ... }: {
+    homeConfigurations."my-user" = home-manager.lib.homeManagerConfiguration {
+      pkgs = import nixpkgs { system = "x86_64-linux"; };
+      modules = [
+        gitsitter.homeManagerModules.default
+        ({ ... }: {
+          services.gitsitter = {
+            enable = true;
+            settings = {
+              global.refresh_interval = "60s";
+              trusted_hosts."github.com" = true;
+            };
+          };
+        })
+      ];
+    };
+  };
+}
+```
+
+The module merges your `services.gitsitter.settings` over a small default config:
+
+```toml
+[global]
+refresh_interval = "60s"
+colors = true
+emoji = true
+notification_cooldown = "5m"
+```
+
+That means you can override just the pieces you care about instead of repeating the
+full file.
+
+When using the Home Manager module, prefer that over `gitsitter install shell` and
+`gitsitter install daemon`, since those commands modify files imperatively outside
+Nix.
 
 ## Supported Platforms
 

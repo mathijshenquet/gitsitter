@@ -1,0 +1,32 @@
+[global]
+refresh_interval = "60s"
+colors = true
+emoji = true
+notification_cooldown = "5m"
+
+[trusted_hosts]
+"github.com" = true
+"gitlab.com" = true
+"codeberg.org" = true
+"bitbucket.org" = true
+"sr.ht" = true
+
+# Example remote defaults. Order matters: first match wins.
+#
+# [[defaults.remotes]]
+# pattern = "git@github.com:myuser/*"
+# mode = "push+pull"
+#
+# [[defaults.remotes]]
+# pattern = "git@github.com:myorg/*"
+# mode = "pull"
+
+# Example branch defaults.
+#
+# [[defaults.branches]]
+# pattern = "main"
+# mode = "pull"
+#
+# [[defaults.branches]]
+# pattern = "temp/*"
+# mode = "none"

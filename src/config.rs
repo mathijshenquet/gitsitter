@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -169,9 +170,21 @@ struct RawGlobalSettings {
 #[derive(Debug, Serialize, Deserialize)]
 struct RawDefaultsConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    remotes: Option<IndexMap<String, RepoSyncMode>>,
+    remotes: Option<Vec<RawRemoteRule>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    branches: Option<IndexMap<String, BranchSyncMode>>,
+    branches: Option<Vec<RawBranchRule>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawRemoteRule {
+    pattern: String,
+    mode: RepoSyncMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RawBranchRule {
+    pattern: String,
+    mode: BranchSyncMode,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -188,7 +201,7 @@ struct RawRepoConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     disabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    branches: Option<IndexMap<String, BranchSyncMode>>,
+    branches: Option<Vec<RawBranchRule>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -203,7 +216,7 @@ struct RawInRepoConfig {
     )]
     refresh_interval: Option<Duration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    branches: Option<IndexMap<String, BranchSyncMode>>,
+    branches: Option<Vec<RawBranchRule>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -252,17 +265,16 @@ pub struct InRepoConfig {
     pub branches: Vec<(String, BranchSyncMode)>,
 }
 
-// ---------------------------------------------------------------------------
-// Built-in trusted hosts
-// ---------------------------------------------------------------------------
+const DEFAULT_CONFIG_TOML: &str = include_str!("../config/default-config.toml");
 
-const BUILTIN_TRUSTED_HOSTS: &[&str] = &[
-    "github.com",
-    "gitlab.com",
-    "codeberg.org",
-    "bitbucket.org",
-    "sr.ht",
-];
+fn default_user_config() -> &'static UserConfig {
+    static DEFAULT_CONFIG: OnceLock<UserConfig> = OnceLock::new();
+    DEFAULT_CONFIG.get_or_init(|| {
+        let raw: RawUserConfig = toml::from_str(DEFAULT_CONFIG_TOML)
+            .expect("embedded default-config.toml must parse");
+        raw.into()
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -270,25 +282,13 @@ const BUILTIN_TRUSTED_HOSTS: &[&str] = &[
 
 impl Default for GlobalSettings {
     fn default() -> Self {
-        Self {
-            refresh_interval: Duration::from_secs(60),
-            colors: true,
-            emoji: true,
-            notification_cooldown: Duration::from_secs(300),
-            git_path: None,
-            watcher_debounce: None,
-        }
+        default_user_config().global.clone()
     }
 }
 
 impl Default for UserConfig {
     fn default() -> Self {
-        Self {
-            global: GlobalSettings::default(),
-            trusted_hosts: HashMap::new(),
-            defaults: DefaultsConfig::default(),
-            repos: HashMap::new(),
-        }
+        default_user_config().clone()
     }
 }
 
@@ -296,15 +296,38 @@ impl Default for UserConfig {
 // Conversions raw <-> public
 // ---------------------------------------------------------------------------
 
-fn index_map_to_vec<T: Clone>(map: Option<IndexMap<String, T>>) -> Vec<(String, T)> {
-    match map {
-        Some(m) => m.into_iter().collect(),
-        None => Vec::new(),
-    }
+fn remote_rules_to_vec(rules: Option<Vec<RawRemoteRule>>) -> Vec<(String, RepoSyncMode)> {
+    rules
+        .unwrap_or_default()
+        .into_iter()
+        .map(|rule| (rule.pattern, rule.mode))
+        .collect()
 }
 
-fn vec_to_index_map<T: Clone>(v: &[(String, T)]) -> IndexMap<String, T> {
-    v.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+fn branch_rules_to_vec(rules: Option<Vec<RawBranchRule>>) -> Vec<(String, BranchSyncMode)> {
+    rules
+        .unwrap_or_default()
+        .into_iter()
+        .map(|rule| (rule.pattern, rule.mode))
+        .collect()
+}
+
+fn vec_to_remote_rules(v: &[(String, RepoSyncMode)]) -> Vec<RawRemoteRule> {
+    v.iter()
+        .map(|(pattern, mode)| RawRemoteRule {
+            pattern: pattern.clone(),
+            mode: *mode,
+        })
+        .collect()
+}
+
+fn vec_to_branch_rules(v: &[(String, BranchSyncMode)]) -> Vec<RawBranchRule> {
+    v.iter()
+        .map(|(pattern, mode)| RawBranchRule {
+            pattern: pattern.clone(),
+            mode: *mode,
+        })
+        .collect()
 }
 
 impl From<RawUserConfig> for UserConfig {
@@ -323,8 +346,8 @@ impl From<RawUserConfig> for UserConfig {
         let trusted_hosts = raw.trusted_hosts.map(|m| m.into_iter().collect()).unwrap_or_default();
         let defaults = match raw.defaults {
             Some(d) => DefaultsConfig {
-                remotes: index_map_to_vec(d.remotes),
-                branches: index_map_to_vec(d.branches),
+                remotes: remote_rules_to_vec(d.remotes),
+                branches: branch_rules_to_vec(d.branches),
             },
             None => DefaultsConfig::default(),
         };
@@ -338,7 +361,7 @@ impl From<RawUserConfig> for UserConfig {
                             mode: v.mode,
                             refresh_interval: v.refresh_interval,
                             disabled: v.disabled,
-                            branches: index_map_to_vec(v.branches),
+                            branches: branch_rules_to_vec(v.branches),
                         },
                     )
                 })
@@ -378,12 +401,12 @@ impl From<&UserConfig> for RawUserConfig {
                     remotes: if d.remotes.is_empty() {
                         None
                     } else {
-                        Some(vec_to_index_map(&d.remotes))
+                        Some(vec_to_remote_rules(&d.remotes))
                     },
                     branches: if d.branches.is_empty() {
                         None
                     } else {
-                        Some(vec_to_index_map(&d.branches))
+                        Some(vec_to_branch_rules(&d.branches))
                     },
                 })
             }
@@ -404,7 +427,7 @@ impl From<&UserConfig> for RawUserConfig {
                                 branches: if v.branches.is_empty() {
                                     None
                                 } else {
-                                    Some(vec_to_index_map(&v.branches))
+                                    Some(vec_to_branch_rules(&v.branches))
                                 },
                             },
                         )
@@ -426,7 +449,7 @@ impl From<RawInRepoConfig> for InRepoConfig {
         Self {
             mode: raw.mode,
             refresh_interval: raw.refresh_interval,
-            branches: index_map_to_vec(raw.branches),
+            branches: branch_rules_to_vec(raw.branches),
         }
     }
 }
@@ -436,16 +459,33 @@ impl From<RawInRepoConfig> for InRepoConfig {
 // ---------------------------------------------------------------------------
 
 impl UserConfig {
-    /// Load user config from `paths::config_file()`. Returns defaults if the file doesn't exist.
-    pub fn load() -> Result<Self> {
+    fn ensure_exists() -> Result<()> {
         let path = paths::config_file();
-        if !path.exists() {
-            return Ok(Self::default());
+        if path.exists() {
+            return Ok(());
         }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create config directory: {}", parent.display()))?;
+        }
+        std::fs::write(&path, DEFAULT_CONFIG_TOML)
+            .with_context(|| format!("failed to initialize config file: {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Load user config from `paths::config_file()`, initializing it from the
+    /// embedded default config if it does not exist yet.
+    pub fn load() -> Result<Self> {
+        Self::ensure_exists()?;
+        let path = paths::config_file();
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read config file: {}", path.display()))?;
-        let raw: RawUserConfig = toml::from_str(&text)
-            .with_context(|| format!("failed to parse config file: {}", path.display()))?;
+        let raw: RawUserConfig = toml::from_str(&text).with_context(|| {
+            format!(
+                "failed to parse config file: {}. For now, remove it and rerun gitsitter to regenerate the default config",
+                path.display()
+            )
+        })?;
         Ok(raw.into())
     }
 
@@ -473,8 +513,12 @@ impl InRepoConfig {
         }
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read in-repo config: {}", path.display()))?;
-        let raw: RawInRepoConfig = toml::from_str(&text)
-            .with_context(|| format!("failed to parse in-repo config: {}", path.display()))?;
+        let raw: RawInRepoConfig = toml::from_str(&text).with_context(|| {
+            format!(
+                "failed to parse in-repo config: {}. For now, remove it and rerun",
+                path.display()
+            )
+        })?;
         Ok(Some(raw.into()))
     }
 }
@@ -484,13 +528,9 @@ impl InRepoConfig {
 // ---------------------------------------------------------------------------
 
 impl UserConfig {
-    /// Check whether a host is trusted. Built-in hosts are trusted unless
-    /// explicitly set to `false` in the user config.
+    /// Check whether a host is trusted.
     pub fn is_host_trusted(&self, host: &str) -> bool {
-        if let Some(&explicit) = self.trusted_hosts.get(host) {
-            return explicit;
-        }
-        BUILTIN_TRUSTED_HOSTS.contains(&host)
+        self.trusted_hosts.get(host).copied().unwrap_or(false)
     }
 }
 
