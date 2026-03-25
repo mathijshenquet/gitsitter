@@ -13,6 +13,43 @@ use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+// ---------------------------------------------------------------------------
+// Disabled enum (repo-level or per-remote)
+// ---------------------------------------------------------------------------
+
+/// A repo can be fully disabled (`true`), fully enabled (`false`),
+/// or have specific remotes disabled (`["origin", "upstream"]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Disabled {
+    All(bool),
+    Remotes(Vec<String>),
+}
+
+impl Disabled {
+    /// Is the entire repo disabled?
+    pub fn is_repo_disabled(&self) -> bool {
+        matches!(self, Disabled::All(true))
+    }
+
+    /// Is a specific remote disabled?
+    pub fn is_remote_disabled(&self, remote: &str) -> bool {
+        match self {
+            Disabled::All(true) => true,
+            Disabled::All(false) => false,
+            Disabled::Remotes(list) => list.iter().any(|r| r == remote),
+        }
+    }
+
+    /// List of explicitly disabled remote names (empty if whole-repo disabled or enabled).
+    pub fn disabled_remotes(&self) -> &[String] {
+        match self {
+            Disabled::Remotes(list) => list,
+            _ => &[],
+        }
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Duration helpers
@@ -212,7 +249,7 @@ struct RawRepoConfig {
     )]
     refresh_interval: Option<Duration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    disabled: Option<bool>,
+    disabled: Option<Disabled>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     branches: Option<Vec<RawBranchRule>>,
 }
@@ -266,7 +303,7 @@ pub struct DefaultsConfig {
 pub struct RepoConfig {
     pub mode: Option<RepoSyncMode>,
     pub refresh_interval: Option<Duration>,
-    pub disabled: Option<bool>,
+    pub disabled: Option<Disabled>,
     /// Ordered list of (pattern, mode).
     pub branches: Vec<(String, BranchSyncMode)>,
 }
@@ -436,7 +473,7 @@ impl From<&UserConfig> for RawUserConfig {
                             RawRepoConfig {
                                 mode: v.mode,
                                 refresh_interval: v.refresh_interval,
-                                disabled: v.disabled,
+                                disabled: v.disabled.clone(),
                                 branches: if v.branches.is_empty() {
                                     None
                                 } else {
@@ -718,34 +755,22 @@ impl UserConfig {
     /// Resolve the effective repo sync mode.
     ///
     /// Resolution order (first match wins):
-    /// 0. Remote host not trusted -> None
     /// 1. User per-repo disabled=true -> None (caller should treat as disabled)
     /// 2. User per-repo mode
     /// 3. In-repo .gitsitter.toml mode
     /// 4. First matching defaults.remotes glob
     /// 5. Fallback: Pull
+    ///
+    /// Note: trust checking is done per-remote at sync time, not here.
     pub fn resolve_repo_mode(
         &self,
         remote_url: &str,
         repo_path: &str,
         in_repo_config: Option<&InRepoConfig>,
     ) -> RepoSyncMode {
-        // Step 0: host trust check (local file:// URLs are always trusted,
-        // repos with no remote skip the check — no remote means no network requests)
-        if !remote_url.is_empty() && !remote_url.starts_with("file://") {
-            if let Some(host) = extract_host(remote_url) {
-                if !self.is_host_trusted(&host) {
-                    return RepoSyncMode::None;
-                }
-            } else {
-                // Can't determine host — don't make network requests
-                return RepoSyncMode::None;
-            }
-        }
-
         // Step 1 & 2: user per-repo config
         if let Some(repo_cfg) = self.repos.get(repo_path) {
-            if repo_cfg.disabled == Some(true) {
+            if repo_cfg.disabled.as_ref().map_or(false, |d| d.is_repo_disabled()) {
                 return RepoSyncMode::None;
             }
             if let Some(mode) = repo_cfg.mode {
@@ -769,6 +794,28 @@ impl UserConfig {
 
         // Step 5: fallback
         RepoSyncMode::Pull
+    }
+
+    /// Check whether a remote URL is trusted.
+    ///
+    /// Local `file://` URLs are always trusted. Empty URLs (no remote) are trusted.
+    /// For everything else, the host must appear in `trusted_hosts`.
+    pub fn is_remote_trusted(&self, remote_url: &str) -> bool {
+        if remote_url.is_empty() || remote_url.starts_with("file://") {
+            return true;
+        }
+        match extract_host(remote_url) {
+            Some(host) => self.is_host_trusted(&host),
+            None => false, // can't determine host — not trusted
+        }
+    }
+
+    /// Check whether a specific remote is disabled in per-repo config.
+    pub fn is_remote_disabled(&self, repo_path: &str, remote_name: &str) -> bool {
+        self.repos
+            .get(repo_path)
+            .and_then(|r| r.disabled.as_ref())
+            .map_or(false, |d| d.is_remote_disabled(remote_name))
     }
 
     /// Resolve the effective branch sync mode.
@@ -853,8 +900,8 @@ impl UserConfig {
     pub fn is_repo_disabled(&self, repo_path: &str) -> bool {
         self.repos
             .get(repo_path)
-            .and_then(|r| r.disabled)
-            .unwrap_or(false)
+            .and_then(|r| r.disabled.as_ref())
+            .map_or(false, |d| d.is_repo_disabled())
     }
 
     /// Get the effective refresh interval for a repo.

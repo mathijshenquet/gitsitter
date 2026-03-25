@@ -59,7 +59,8 @@ pub struct Daemon {
 pub struct TrackedRepo {
     pub repo_id: String,
     pub display_path: String,
-    pub remote_url: Option<String>,
+    /// Map of remote_name -> URL for all git remotes.
+    pub remote_urls: HashMap<String, String>,
     pub last_sync: Option<Instant>,
     pub last_sync_wall: Option<String>,
     pub sync_reason: Option<String>,
@@ -147,11 +148,11 @@ impl BackoffState {
 type SharedDaemon = Arc<Daemon>;
 
 impl TrackedRepo {
-    fn new(repo_id: String, display_path: String, remote_url: Option<String>) -> Self {
+    fn new(repo_id: String, display_path: String, remote_urls: HashMap<String, String>) -> Self {
         Self {
             repo_id,
             display_path,
-            remote_url,
+            remote_urls,
             last_sync: None,
             last_sync_wall: None,
             sync_reason: None,
@@ -160,6 +161,15 @@ impl TrackedRepo {
             branches: HashMap::new(),
             notification_cooldowns: HashMap::new(),
         }
+    }
+
+    /// Get the URL for the "origin" remote, or the first available remote URL.
+    fn primary_remote_url(&self) -> &str {
+        self.remote_urls
+            .get("origin")
+            .or_else(|| self.remote_urls.values().next())
+            .map(|s| s.as_str())
+            .unwrap_or("")
     }
 
     fn set_branch(&mut self, name: &str, state: BranchRuntimeState) {
@@ -211,17 +221,17 @@ pub async fn run_daemon(paths: &Paths) -> Result<()> {
     // 5. Seed repos from config.toml
     let mut repo_states: HashMap<String, TrackedRepo> = HashMap::new();
     for (repo_path, repo_cfg) in &config.repos {
-        if repo_cfg.disabled == Some(true) {
+        if repo_cfg.disabled.as_ref().map_or(false, |d| d.is_repo_disabled()) {
             continue;
         }
         let repo_id_path = PathBuf::from(repo_path);
         let display_path = git_ops::get_display_path(&repo_id_path)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| repo_path.clone());
-        let remote_url = git_ops::get_remote_url(&repo_id_path).ok().flatten();
+        let remote_urls = git_ops::get_all_remote_urls(&repo_id_path).unwrap_or_default();
         repo_states.insert(
             repo_path.clone(),
-            TrackedRepo::new(repo_path.clone(), display_path, remote_url),
+            TrackedRepo::new(repo_path.clone(), display_path, remote_urls),
         );
     }
     let repo_count = repo_states.len();
@@ -414,7 +424,7 @@ async fn handle_global_status(daemon: &SharedDaemon) -> Response {
     for tr in repos.values() {
         let in_repo = load_in_repo_config_for(tr).ok().flatten();
         let mode = config.resolve_repo_mode(
-            tr.remote_url.as_deref().unwrap_or(""),
+            tr.primary_remote_url(),
             &tr.repo_id,
             in_repo.as_ref(),
         );
@@ -558,7 +568,7 @@ pub(crate) async fn reload_config(daemon: &SharedDaemon) {
         let mut repos = daemon.repos.write().await;
         // Add new repos from config
         for (repo_path, repo_cfg) in &new_config.repos {
-            if repo_cfg.disabled == Some(true) {
+            if repo_cfg.disabled.as_ref().map_or(false, |d| d.is_repo_disabled()) {
                 continue;
             }
             if !repos.contains_key(repo_path) {
@@ -566,10 +576,10 @@ pub(crate) async fn reload_config(daemon: &SharedDaemon) {
                 let display_path = git_ops::get_display_path(&repo_id_path)
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| repo_path.clone());
-                let remote_url = git_ops::get_remote_url(&repo_id_path).ok().flatten();
+                let remote_urls = git_ops::get_all_remote_urls(&repo_id_path).unwrap_or_default();
                 repos.insert(
                     repo_path.clone(),
-                    TrackedRepo::new(repo_path.clone(), display_path, remote_url),
+                    TrackedRepo::new(repo_path.clone(), display_path, remote_urls),
                 );
                 info!("tracking new repo: {}", repo_path);
             }
@@ -618,10 +628,28 @@ fn build_status_data(tr: &TrackedRepo, config: &UserConfig) -> StatusData {
     let repo_id_path = PathBuf::from(&tr.repo_id);
     let in_repo = load_in_repo_config_for(tr).ok().flatten();
     let mode = config.resolve_repo_mode(
-        tr.remote_url.as_deref().unwrap_or(""),
+        tr.primary_remote_url(),
         &tr.repo_id,
         in_repo.as_ref(),
     );
+
+    // Collect untrusted and disabled remote names for status warnings
+    let mut untrusted_remotes = Vec::new();
+    let mut untrusted_hosts = Vec::new();
+    let mut disabled_remotes = Vec::new();
+    for (remote_name, remote_url) in &tr.remote_urls {
+        if !config.is_remote_trusted(remote_url) {
+            untrusted_remotes.push(remote_name.clone());
+            if let Some(host) = crate::config::extract_host(remote_url) {
+                if !untrusted_hosts.contains(&host) {
+                    untrusted_hosts.push(host);
+                }
+            }
+        }
+        if config.is_remote_disabled(&tr.repo_id, remote_name) {
+            disabled_remotes.push(remote_name.clone());
+        }
+    }
 
     // Look up upstream names from git2
     let git_branches = git_ops::list_branches(&repo_id_path).unwrap_or_default();
@@ -647,6 +675,9 @@ fn build_status_data(tr: &TrackedRepo, config: &UserConfig) -> StatusData {
         mode: mode.to_string(),
         last_sync: tr.last_sync_wall.clone(),
         branches,
+        untrusted_remotes,
+        untrusted_hosts,
+        disabled_remotes,
     }
 }
 
@@ -796,12 +827,12 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         return Ok(());
     }
 
-    let remote_url = {
+    let (remote_urls, primary_remote_url) = {
         let repos = daemon.repos.read().await;
-        repos
-            .get(repo_id)
-            .and_then(|tr| tr.remote_url.clone())
-            .unwrap_or_default()
+        match repos.get(repo_id) {
+            Some(tr) => (tr.remote_urls.clone(), tr.primary_remote_url().to_string()),
+            None => (HashMap::new(), String::new()),
+        }
     };
 
     let in_repo_config = {
@@ -810,7 +841,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         crate::config::InRepoConfig::load(&display_path).ok().flatten()
     };
     let repo_mode = config.resolve_repo_mode(
-        &remote_url,
+        &primary_remote_url,
         repo_id,
         in_repo_config.as_ref(),
     );
@@ -860,16 +891,34 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 .map(|wt| PathBuf::from(&wt.path))
                 .unwrap_or_else(|| repo_path.clone());
 
-            // Collect unique remotes from all tracked branches
+            // Collect unique remotes from all tracked branches,
+            // filtering out untrusted and disabled remotes.
             let mut remotes: Vec<String> = branches
                 .iter()
                 .filter(|b| b.upstream_name.is_some())
                 .map(|b| b.remote.clone())
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
+                .filter(|remote_name| {
+                    // Skip disabled remotes
+                    if config.is_remote_disabled(repo_id, remote_name) {
+                        return false;
+                    }
+                    // Skip untrusted remotes
+                    if let Some(url) = remote_urls.get(remote_name) {
+                        config.is_remote_trusted(url)
+                    } else {
+                        true // unknown remote URL — allow (will likely fail at fetch)
+                    }
+                })
                 .collect();
-            if remotes.is_empty() {
-                remotes.push("origin".to_string());
+            if remotes.is_empty() && !remote_urls.is_empty() {
+                // Only add "origin" fallback if there are actual remotes configured
+                if let Some(url) = remote_urls.get("origin") {
+                    if config.is_remote_trusted(url) && !config.is_remote_disabled(repo_id, "origin") {
+                        remotes.push("origin".to_string());
+                    }
+                }
             }
 
             let mut any_success = false;
@@ -1262,11 +1311,14 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
     };
 
     let elapsed = sync_start.elapsed();
+    let remote_count = remote_urls.len();
+    let branch_count = branches.len();
+    let summary = format!("{} remote(s), {} branch(es)", remote_count, branch_count);
     match reason {
-        Some(r) if had_activity => info!("✅ sync completed for {} in {:.1?} ({})", repo_label, elapsed, r),
-        Some(r) => info!("• scan completed for {} in {:.1?} ({})", repo_label, elapsed, r),
-        None if had_activity => info!("✅ sync completed for {} in {:.1?} (scheduled)", repo_label, elapsed),
-        None => info!("• scheduled scan completed for {} in {:.1?}", repo_label, elapsed),
+        Some(r) if had_activity => info!("✅ sync completed for {} in {:.1?}, {} ({})", repo_label, elapsed, summary, r),
+        Some(r) => info!("• scan completed for {} in {:.1?}, {} ({})", repo_label, elapsed, summary, r),
+        None if had_activity => info!("✅ sync completed for {} in {:.1?}, {} (scheduled)", repo_label, elapsed, summary),
+        None => info!("• scheduled scan completed for {} in {:.1?}, {}", repo_label, elapsed, summary),
     }
 
     Ok(())

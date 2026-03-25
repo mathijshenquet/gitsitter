@@ -192,7 +192,7 @@ mode = "none"
         let repo_cfg = cfg.repos.get("/home/user/project").unwrap();
         assert_eq!(repo_cfg.mode, Some(RepoSyncMode::Push));
         assert_eq!(repo_cfg.refresh_interval, Some(Duration::from_secs(30)));
-        assert_eq!(repo_cfg.disabled, Some(false));
+        assert_eq!(repo_cfg.disabled, Some(config::Disabled::All(false)));
         assert_eq!(repo_cfg.branches.len(), 2);
     }
 
@@ -345,14 +345,25 @@ mode = "pull"
     // -----------------------------------------------------------------------
 
     #[test]
-    fn repo_mode_untrusted_host_returns_none() {
+    fn repo_mode_untrusted_host_still_resolves_mode() {
+        // Trust is now checked per-remote at sync time, not in resolve_repo_mode
         let cfg = UserConfig::default();
         let mode = cfg.resolve_repo_mode(
             "git@evil.example.com:user/repo.git",
             "/home/user/repo",
             None,
         );
-        assert_eq!(mode, RepoSyncMode::None);
+        // Falls through to default (Pull), not None
+        assert_eq!(mode, RepoSyncMode::Pull);
+    }
+
+    #[test]
+    fn untrusted_remote_detected() {
+        let cfg = UserConfig::default();
+        assert!(!cfg.is_remote_trusted("git@evil.example.com:user/repo.git"));
+        assert!(cfg.is_remote_trusted("git@github.com:user/repo.git"));
+        assert!(cfg.is_remote_trusted("")); // no remote = trusted
+        assert!(cfg.is_remote_trusted("file:///local/path")); // local = trusted
     }
 
     #[test]
@@ -430,7 +441,7 @@ mode = "pull"
         cfg.repos.insert(
             "/home/user/repo".to_string(),
             RepoConfig {
-                disabled: Some(true),
+                disabled: Some(config::Disabled::All(true)),
                 ..Default::default()
             },
         );
@@ -603,7 +614,7 @@ mode = "pull"
                 RepoConfig {
                     mode: Some(RepoSyncMode::Push),
                     refresh_interval: Some(Duration::from_secs(30)),
-                    disabled: Some(false),
+                    disabled: Some(config::Disabled::All(false)),
                     branches: vec![("dev".to_string(), BranchSyncMode::Pull)],
                 },
             );
@@ -738,6 +749,9 @@ mod transport_tests {
                         status: "synced".into(),
                         last_action: None,
                     }],
+                    untrusted_remotes: vec![],
+                    untrusted_hosts: vec![],
+                    disabled_remotes: vec![],
                 },
             },
             Response::GlobalStatus {

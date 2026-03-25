@@ -110,6 +110,11 @@ pub fn pause_icon(opts: DisplayOpts) -> &'static str {
     if opts.emoji { "\u{23F8}" } else { "-" }
 }
 
+/// Format a warning icon.
+pub fn warning_icon(opts: DisplayOpts) -> &'static str {
+    if opts.emoji { "\u{26A0}\u{FE0F}" } else { "!" }
+}
+
 /// Status icon for a branch sync status string.
 pub fn branch_status_icon(status: &str, opts: DisplayOpts) -> &'static str {
     if opts.emoji {

@@ -28,15 +28,31 @@ enum Commands {
         #[arg(long)]
         explain: bool,
     },
-    /// Enable a repo
+    /// Enable a repo or a specific remote
     Enable {
-        path: Option<String>,
+        /// Path to repo, or remote name if --remote is set
+        target: Option<String>,
+        /// Treat target as a remote name in the current repo
+        #[arg(long)]
+        remote: bool,
     },
-    /// Disable a repo
+    /// Disable a repo or a specific remote
     Disable {
-        path: Option<String>,
+        /// Path to repo, or remote name if --remote is set
+        target: Option<String>,
+        /// Treat target as a remote name in the current repo
+        #[arg(long)]
+        remote: bool,
         #[arg(long)]
         purge: bool,
+    },
+    /// Trust a remote host (allows syncing with remotes on this host)
+    Trust {
+        host: String,
+    },
+    /// Untrust a remote host
+    Untrust {
+        host: String,
     },
     /// Show daemon log
     Log {
@@ -101,8 +117,22 @@ async fn main() {
             branch,
             explain,
         }) => cli::handle_config(&paths, global, repo, branch, explain).await,
-        Some(Commands::Enable { path }) => cli::handle_enable(&paths, path).await,
-        Some(Commands::Disable { path, purge }) => cli::handle_disable(&paths, path, purge).await,
+        Some(Commands::Enable { target, remote }) => {
+            if remote {
+                cli::handle_remote_enable(&paths, target.as_deref()).await
+            } else {
+                cli::handle_enable(&paths, target).await
+            }
+        }
+        Some(Commands::Disable { target, remote, purge }) => {
+            if remote {
+                cli::handle_remote_disable(&paths, target.as_deref()).await
+            } else {
+                cli::handle_disable(&paths, target, purge).await
+            }
+        }
+        Some(Commands::Trust { host }) => cli::handle_trust(&paths, &host).await,
+        Some(Commands::Untrust { host }) => cli::handle_untrust(&paths, &host).await,
         Some(Commands::Log {
             global,
             follow,

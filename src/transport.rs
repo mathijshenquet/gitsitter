@@ -76,6 +76,15 @@ pub struct StatusData {
     pub mode: String,
     pub last_sync: Option<String>,
     pub branches: Vec<BranchStatusData>,
+    /// Remote names that are not trusted (host not in trusted_hosts).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untrusted_remotes: Vec<String>,
+    /// Unique hosts of untrusted remotes (for actionable hints).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untrusted_hosts: Vec<String>,
+    /// Remote names explicitly disabled in config.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_remotes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

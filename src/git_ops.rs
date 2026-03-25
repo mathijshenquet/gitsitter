@@ -121,6 +121,24 @@ pub fn get_remote_url(repo_id: &Path) -> Result<Option<String>> {
     Ok(remote.url().map(|s| s.to_string()))
 }
 
+/// Get a map of remote_name -> URL for all remotes in a repo.
+pub fn get_all_remote_urls(repo_id: &Path) -> Result<HashMap<String, String>> {
+    let repo = git2::Repository::open(repo_id)
+        .with_context(|| format!("failed to open repo at {}", repo_id.display()))?;
+    let remote_names = repo.remotes()?;
+    let mut map = HashMap::new();
+    for i in 0..remote_names.len() {
+        if let Some(name) = remote_names.get(i) {
+            if let Ok(remote) = repo.find_remote(name) {
+                if let Some(url) = remote.url() {
+                    map.insert(name.to_string(), url.to_string());
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
 /// List all local tracking branches with their upstream info.
 pub fn list_branches(repo_id: &Path) -> Result<Vec<RepoBranch>> {
     let repo = git2::Repository::open(repo_id)
