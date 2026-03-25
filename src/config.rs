@@ -13,7 +13,6 @@ use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::paths;
 
 // ---------------------------------------------------------------------------
 // Duration helpers
@@ -459,53 +458,98 @@ impl From<RawInRepoConfig> for InRepoConfig {
 // ---------------------------------------------------------------------------
 
 impl UserConfig {
-    /// Returns `true` if the config file was newly created.
-    fn ensure_exists() -> Result<bool> {
-        let path = paths::config_file();
-        if path.exists() {
-            return Ok(false);
+    /// Load user config, creating the default if the file doesn't exist.
+    pub fn load(config_file: &Path) -> Result<Self> {
+        if !config_file.exists() {
+            if let Some(parent) = config_file.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create config directory: {}", parent.display()))?;
+            }
+            std::fs::write(config_file, DEFAULT_CONFIG_TOML)
+                .with_context(|| format!("failed to initialize config file: {}", config_file.display()))?;
+            eprintln!("initialized config at {}", config_file.display());
         }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create config directory: {}", parent.display()))?;
-        }
-        std::fs::write(&path, DEFAULT_CONFIG_TOML)
-            .with_context(|| format!("failed to initialize config file: {}", path.display()))?;
-        Ok(true)
-    }
-
-    /// Load user config from `paths::config_file()`, initializing it from the
-    /// embedded default config if it does not exist yet.
-    pub fn load() -> Result<Self> {
-        let created = Self::ensure_exists()?;
-        if created {
-            eprintln!("initialized config at {}", paths::config_file().display());
-        }
-        let path = paths::config_file();
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read config file: {}", path.display()))?;
+        let text = std::fs::read_to_string(config_file)
+            .with_context(|| format!("failed to read config file: {}", config_file.display()))?;
         let raw: RawUserConfig = toml::from_str(&text).with_context(|| {
             format!(
-                "failed to parse config file: {}. For now, remove it and rerun gitsitter to regenerate the default config",
-                path.display()
+                "failed to parse config file: {}. Remove it and rerun gitsitter to regenerate the default config",
+                config_file.display()
             )
         })?;
         Ok(raw.into())
     }
 
-    /// Serialize and write the config to `paths::config_file()`.
-    pub fn save(&self) -> Result<()> {
-        let path = paths::config_file();
-        if let Some(parent) = path.parent() {
+    /// Atomically read-modify-write the config file under a file lock.
+    ///
+    /// Safe to call concurrently from multiple processes (CLI + daemon).
+    pub fn modify<F>(config_file: &Path, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut UserConfig),
+    {
+        let lock_path = config_file.with_extension("toml.lock");
+
+        if let Some(parent) = config_file.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create config directory: {}", parent.display()))?;
         }
-        let raw = RawUserConfig::from(self);
+
+        let lock_file = std::fs::File::create(&lock_path)
+            .with_context(|| format!("failed to create lock file: {}", lock_path.display()))?;
+        lock_exclusive(&lock_file)
+            .context("failed to acquire config lock")?;
+
+        let mut cfg = Self::load(config_file)?;
+        f(&mut cfg);
+
+        // Write to temp file and atomically rename
+        let raw = RawUserConfig::from(&cfg);
         let text = toml::to_string_pretty(&raw).context("failed to serialize config")?;
-        std::fs::write(&path, text)
-            .with_context(|| format!("failed to write config file: {}", path.display()))?;
+        let tmp = config_file.with_extension("toml.tmp");
+        std::fs::write(&tmp, &text)
+            .with_context(|| format!("failed to write temp config: {}", tmp.display()))?;
+        std::fs::rename(&tmp, config_file)
+            .with_context(|| format!("failed to rename config into place: {}", config_file.display()))?;
+
+        // Lock released on drop of lock_file
         Ok(())
     }
+}
+
+/// Acquire an exclusive (write) lock on a file.
+#[cfg(unix)]
+fn lock_exclusive(file: &std::fs::File) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        anyhow::bail!("flock failed: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Acquire an exclusive (write) lock on a file.
+#[cfg(windows)]
+fn lock_exclusive(file: &std::fs::File) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as _,
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if ok == 0 {
+        anyhow::bail!("LockFileEx failed: {}", std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 impl InRepoConfig {

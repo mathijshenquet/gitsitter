@@ -22,7 +22,7 @@ use crate::config::{
 use crate::git_ops::{
     self, MergeAnalysis, PushResult,
 };
-use crate::paths;
+use crate::paths::Paths;
 use crate::transport::{
     self, BranchStatusData,
     RepoStatusData, StatusData, Request, Response,
@@ -47,6 +47,7 @@ const MAX_BACKOFF_SECS: u64 = 3600;
 
 /// Shared daemon state, held behind an `Arc` so multiple tasks can access it.
 pub struct Daemon {
+    pub paths: Paths,
     pub config: RwLock<UserConfig>,
     pub start_time: Instant,
     pub repos: RwLock<HashMap<String, TrackedRepo>>,
@@ -182,19 +183,16 @@ impl TrackedRepo {
 // ---------------------------------------------------------------------------
 
 /// Run the daemon. This is the main entry point called by `gitsitter daemon run`.
-pub async fn run_daemon() -> Result<()> {
+pub async fn run_daemon(paths: &Paths) -> Result<()> {
     // 1. Ensure directories exist
-    paths::ensure_dirs()?;
+    paths.ensure_dirs()?;
 
     // 2. Write PID file
     let pid = std::process::id();
-    let pid_path = paths::daemon_pid();
-    std::fs::write(&pid_path, pid.to_string())
-        .with_context(|| format!("failed to write PID file at {}", pid_path.display()))?;
+    std::fs::write(&paths.daemon_pid, pid.to_string())
+        .with_context(|| format!("failed to write PID file at {}", paths.daemon_pid.display()))?;
 
-    // 3. Set up tracing (log to stderr — captured by systemd/journald,
-    //    redirected to daemon.log by `daemon start`, or visible in terminal
-    //    when running `daemon run` interactively)
+    // 3. Set up tracing
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -207,9 +205,8 @@ pub async fn run_daemon() -> Result<()> {
     info!("gitsitter daemon starting (pid={})", pid);
 
     // 4. Load config
-    let config = UserConfig::load().context("failed to load config")?;
-    let config_path = paths::config_file();
-    info!("initialized config from {}", config_path.display());
+    let config = UserConfig::load(&paths.config_file).context("failed to load config")?;
+    info!("initialized config from {}", paths.config_file.display());
 
     // 5. Seed repos from config.toml
     let mut repo_states: HashMap<String, TrackedRepo> = HashMap::new();
@@ -235,6 +232,7 @@ pub async fn run_daemon() -> Result<()> {
 
     // 7. Build shared state
     let daemon = Arc::new(Daemon {
+        paths: paths.clone(),
         config: RwLock::new(config),
         start_time: Instant::now(),
         repos: RwLock::new(repo_states),
@@ -243,11 +241,11 @@ pub async fn run_daemon() -> Result<()> {
     });
 
     // 8. Remove stale endpoint if it exists
-    transport::cleanup_endpoint();
+    transport::cleanup_endpoint(&paths.socket_path);
 
     // 9. Start listener
-    let listener = transport::bind_listener()?;
-    info!("listening on {}", transport::endpoint_display());
+    let listener = transport::bind_listener(&paths.socket_path)?;
+    info!("listening on {}", paths.socket_path.display());
 
     // 10. Spawn socket handler task
     let daemon_for_socket = Arc::clone(&daemon);
@@ -290,8 +288,8 @@ pub async fn run_daemon() -> Result<()> {
     .await;
 
     // 14. Cleanup: remove endpoint and PID file
-    transport::cleanup_endpoint();
-    let _ = std::fs::remove_file(&pid_path);
+    transport::cleanup_endpoint(&paths.socket_path);
+    let _ = std::fs::remove_file(&paths.daemon_pid);
 
     info!("daemon stopped cleanly");
     Ok(())
@@ -308,7 +306,7 @@ async fn socket_accept_loop(
 ) {
     loop {
         tokio::select! {
-            result = transport::accept_connection(&mut listener) => {
+            result = transport::accept_connection(&mut listener, &daemon.paths.socket_path) => {
                 match result {
                     Ok(stream) => {
                         let d = Arc::clone(&daemon);
@@ -507,14 +505,13 @@ async fn handle_prompt_check(daemon: &SharedDaemon, repo_path: &str) -> Response
     };
 
     if !already_tracked {
-        // Write to config.toml and reload
-        let mut cfg = match UserConfig::load() {
-            Ok(c) => c,
-            Err(_) => return Response::Error { message: "failed to load config".into() },
-        };
-        if !cfg.repos.contains_key(&repo_id_str) {
-            cfg.repos.insert(repo_id_str.clone(), Default::default());
-            let _ = cfg.save();
+        // Write to config.toml under lock and reload
+        let id = repo_id_str.clone();
+        let cf = daemon.paths.config_file.clone();
+        if let Err(e) = UserConfig::modify(&cf, move |cfg| {
+            cfg.repos.entry(id).or_default();
+        }) {
+            warn!("failed to register repo in config: {:#}", e);
         }
         reload_config(daemon).await;
     }
@@ -533,7 +530,7 @@ async fn handle_reload_config(daemon: &SharedDaemon) -> Response {
 ///
 /// Called from: ReloadConfig RPC, PromptCheck, and the file watcher.
 pub(crate) async fn reload_config(daemon: &SharedDaemon) {
-    let new_config = match UserConfig::load() {
+    let new_config = match UserConfig::load(&daemon.paths.config_file) {
         Ok(c) => c,
         Err(e) => {
             warn!("failed to reload config: {:#}", e);

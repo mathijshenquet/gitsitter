@@ -7,6 +7,7 @@ use gitsitter::config::{
     self, BranchSyncMode, InRepoConfig, RepoConfig,
     RepoSyncMode, UserConfig,
 };
+use gitsitter::paths::Paths;
 use gitsitter::transport::{self, BranchStatusData, Request, Response};
 
 // ===========================================================================
@@ -59,31 +60,18 @@ fn make_commit(repo: &git2::Repository, filename: &str, content: &str, message: 
 }
 
 /// Set up env overrides pointing to a temp directory structure.
-/// Returns (config_dir, state_dir, socket_path).
+/// Build test Paths from a temp base directory.
 #[cfg(unix)]
-fn setup_test_env(base: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+fn test_paths(base: &Path) -> Paths {
     let config_dir = base.join("config");
     let state_dir = base.join("state");
-    let socket_path = base.join("gitsitter-test.sock");
-
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
-
-    unsafe {
-        std::env::set_var("GITSITTER_CONFIG_DIR", &config_dir);
-        std::env::set_var("GITSITTER_STATE_DIR", &state_dir);
-        std::env::set_var("GITSITTER_SOCKET_PATH", &socket_path);
-    }
-
-    (config_dir, state_dir, socket_path)
-}
-
-#[cfg(unix)]
-fn teardown_test_env() {
-    unsafe {
-        std::env::remove_var("GITSITTER_CONFIG_DIR");
-        std::env::remove_var("GITSITTER_STATE_DIR");
-        std::env::remove_var("GITSITTER_SOCKET_PATH");
+    Paths {
+        config_file: config_dir.join("config.toml"),
+        daemon_log: state_dir.join("daemon.log"),
+        daemon_pid: state_dir.join("daemon.pid"),
+        socket_path: base.join("gitsitter-test.sock"),
     }
 }
 
@@ -182,9 +170,7 @@ mode = "none"
 "#;
         std::fs::write(config_dir.join("config.toml"), full_toml).unwrap();
 
-        unsafe { std::env::set_var("GITSITTER_CONFIG_DIR", &config_dir); }
-        let cfg = UserConfig::load().unwrap();
-        unsafe { std::env::remove_var("GITSITTER_CONFIG_DIR"); }
+        let cfg = UserConfig::load(&config_dir.join("config.toml")).unwrap();
 
         assert_eq!(cfg.global.refresh_interval, Duration::from_secs(120));
         assert!(!cfg.global.colors);
@@ -601,38 +587,28 @@ mode = "pull"
         let config_dir = tmp.path().join("config_rt");
         std::fs::create_dir_all(&config_dir).unwrap();
 
-        // Set env vars, save, load, then restore -- all in sequence.
-        // There is inherent raciness with env vars in parallel tests,
-        // but we minimize the window.
-        unsafe {
-            std::env::set_var("GITSITTER_CONFIG_DIR", &config_dir);
-        }
+        let config_file = config_dir.join("config.toml");
 
-        let mut cfg = UserConfig::default();
-        cfg.global.refresh_interval = Duration::from_secs(120);
-        cfg.global.colors = false;
-        cfg.global.emoji = false;
-        cfg.global.notification_cooldown = Duration::from_secs(600);
-        cfg.global.git_path = Some("/usr/bin/git".to_string());
-        cfg.trusted_hosts.insert("myhost.com".to_string(), true);
-        cfg.defaults.remotes.push(("*github.com*".to_string(), RepoSyncMode::PushPull));
-        cfg.defaults.branches.push(("main".to_string(), BranchSyncMode::PushPull));
-        cfg.repos.insert(
-            "/home/user/project".to_string(),
-            RepoConfig {
-                mode: Some(RepoSyncMode::Push),
-                refresh_interval: Some(Duration::from_secs(30)),
-                disabled: Some(false),
-                branches: vec![("dev".to_string(), BranchSyncMode::Pull)],
-            },
-        );
-
-        cfg.save().unwrap();
-        let loaded = UserConfig::load().unwrap();
-
-        unsafe {
-            std::env::remove_var("GITSITTER_CONFIG_DIR");
-        }
+        UserConfig::modify(&config_file, |cfg| {
+            cfg.global.refresh_interval = Duration::from_secs(120);
+            cfg.global.colors = false;
+            cfg.global.emoji = false;
+            cfg.global.notification_cooldown = Duration::from_secs(600);
+            cfg.global.git_path = Some("/usr/bin/git".to_string());
+            cfg.trusted_hosts.insert("myhost.com".to_string(), true);
+            cfg.defaults.remotes.push(("*github.com*".to_string(), RepoSyncMode::PushPull));
+            cfg.defaults.branches.push(("main".to_string(), BranchSyncMode::PushPull));
+            cfg.repos.insert(
+                "/home/user/project".to_string(),
+                RepoConfig {
+                    mode: Some(RepoSyncMode::Push),
+                    refresh_interval: Some(Duration::from_secs(30)),
+                    disabled: Some(false),
+                    branches: vec![("dev".to_string(), BranchSyncMode::Pull)],
+                },
+            );
+        }).unwrap();
+        let loaded = UserConfig::load(&config_file).unwrap();
 
         // Verify the loaded config matches what we saved
         assert_eq!(loaded.global.refresh_interval, Duration::from_secs(120));
@@ -656,18 +632,10 @@ mode = "pull"
         let tmp = TempDir::new().unwrap();
         let config_dir = tmp.path().join("config_bootstrap");
         std::fs::create_dir_all(&config_dir).unwrap();
-
-        unsafe {
-            std::env::set_var("GITSITTER_CONFIG_DIR", &config_dir);
-        }
-
-        let cfg = UserConfig::load().unwrap();
         let config_path = config_dir.join("config.toml");
-        let written = std::fs::read_to_string(&config_path).unwrap();
 
-        unsafe {
-            std::env::remove_var("GITSITTER_CONFIG_DIR");
-        }
+        let cfg = UserConfig::load(&config_path).unwrap();
+        let written = std::fs::read_to_string(&config_path).unwrap();
 
         assert!(config_path.exists());
         assert_eq!(cfg.global.refresh_interval, Duration::from_secs(60));
@@ -927,7 +895,6 @@ mod git_ops_tests {
 #[cfg(unix)]
 mod e2e_tests {
     use super::*;
-    use serial_test::serial;
     use std::path::PathBuf;
     use tokio::net::UnixStream;
     use tokio::task::JoinHandle;
@@ -938,7 +905,7 @@ mod e2e_tests {
 
     struct E2eHarness {
         _tmp: TempDir,
-        socket_path: PathBuf,
+        paths: Paths,
         repo_id_str: String,
         local_dir: PathBuf,
         bare_dir: PathBuf,
@@ -952,7 +919,7 @@ mod e2e_tests {
         async fn start(repo_mode: &str) -> Self {
             let tmp = temp_dir();
             let base = tmp.path().to_path_buf();
-            let (config_dir, _state_dir, socket_path) = setup_test_env(&base);
+            let paths = test_paths(&base);
 
             // Create bare remote via a temp working copy
             let bare_dir = base.join("remote.git");
@@ -1002,18 +969,19 @@ mode = "{}"
 "#,
                 repo_id_str, repo_mode
             );
-            std::fs::write(config_dir.join("config.toml"), &config_toml).unwrap();
+            std::fs::write(&paths.config_file, &config_toml).unwrap();
 
             // Start daemon
+            let daemon_paths = paths.clone();
             let daemon_handle = tokio::spawn(async move {
-                let _ = gitsitter::daemon::run_daemon().await;
+                let _ = gitsitter::daemon::run_daemon(&daemon_paths).await;
             });
 
             // Wait for socket
             let deadline =
                 tokio::time::Instant::now() + Duration::from_secs(5);
             loop {
-                if socket_path.exists() {
+                if paths.socket_path.exists() {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     break;
                 }
@@ -1025,7 +993,7 @@ mode = "{}"
 
             // Ensure daemon has loaded the config
             let resp = Self::roundtrip_static(
-                &socket_path,
+                &paths.socket_path,
                 &Request::ReloadConfig,
             )
             .await;
@@ -1036,7 +1004,7 @@ mode = "{}"
 
             Self {
                 _tmp: tmp,
-                socket_path,
+                paths,
                 repo_id_str,
                 local_dir,
                 bare_dir,
@@ -1056,7 +1024,7 @@ mode = "{}"
         }
 
         async fn roundtrip(&self, req: &Request) -> Response {
-            Self::roundtrip_static(&self.socket_path, req).await
+            Self::roundtrip_static(&self.paths.socket_path, req).await
         }
 
         /// Trigger a sync and poll until the branch appears with
@@ -1123,7 +1091,6 @@ mode = "{}"
                 self.daemon_handle,
             )
             .await;
-            teardown_test_env();
         }
     }
 
@@ -1133,8 +1100,7 @@ mode = "{}"
 
     /// Basic lifecycle: register, status, daemon-status, config-update, shutdown.
     #[tokio::test]
-    #[serial]
-    async fn daemon_lifecycle() {
+async fn daemon_lifecycle() {
         let h = E2eHarness::start("push+pull").await;
 
         // Status
@@ -1175,7 +1141,7 @@ mode = "{}"
         assert!(matches!(resp, Response::Ok { .. }));
 
         // Shutdown cleans up socket
-        let socket = h.socket_path.clone();
+        let socket = h.paths.socket_path.clone();
         h.shutdown().await;
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
@@ -1186,8 +1152,7 @@ mode = "{}"
 
     /// A local commit is auto-pushed to the remote.
     #[tokio::test]
-    #[serial]
-    async fn local_commit_is_pushed() {
+async fn local_commit_is_pushed() {
         let h = E2eHarness::start("push+pull").await;
 
         // Make a local commit
@@ -1230,8 +1195,7 @@ mode = "{}"
 
     /// A remote update is fast-forward merged into the local branch.
     #[tokio::test]
-    #[serial]
-    async fn remote_update_is_pulled() {
+async fn remote_update_is_pulled() {
         let h = E2eHarness::start("push+pull").await;
 
         // Simulate another user pushing to the remote
@@ -1292,8 +1256,7 @@ mode = "{}"
 
     /// Diverged branches: local and remote both have independent commits.
     #[tokio::test]
-    #[serial]
-    async fn diverged_branches_detected() {
+async fn diverged_branches_detected() {
         let h = E2eHarness::start("pull").await;
 
         // Make a local commit (won't be pushed because mode is "pull")
@@ -1345,8 +1308,7 @@ mode = "{}"
 
     /// Push rejected by a server-side pre-receive hook.
     #[tokio::test]
-    #[serial]
-    async fn push_rejected_by_hook() {
+async fn push_rejected_by_hook() {
         let h = E2eHarness::start("push+pull").await;
 
         // Install a pre-receive hook that rejects all pushes
@@ -1395,8 +1357,7 @@ mode = "{}"
 
     /// Dirty worktree prevents fast-forward pull.
     #[tokio::test]
-    #[serial]
-    async fn dirty_worktree_blocks_ff() {
+async fn dirty_worktree_blocks_ff() {
         let h = E2eHarness::start("push+pull").await;
 
         // Push a commit to the remote via second clone
@@ -1444,8 +1405,7 @@ mode = "{}"
 
     /// Operation in progress (index.lock) causes daemon to skip sync.
     #[tokio::test]
-    #[serial]
-    async fn operation_in_progress_skips_sync() {
+async fn operation_in_progress_skips_sync() {
         let h = E2eHarness::start("push+pull").await;
 
         // Wait for initial sync to complete so the branch is "synced"
@@ -1506,8 +1466,7 @@ mode = "{}"
 
     /// Pull-only mode: local commits are NOT pushed (status should be "local_ahead").
     #[tokio::test]
-    #[serial]
-    async fn pull_only_local_ahead_not_pushed() {
+async fn pull_only_local_ahead_not_pushed() {
         let h = E2eHarness::start("pull").await;
 
         // Make a local commit — should NOT be pushed in pull-only mode
@@ -1555,8 +1514,7 @@ mode = "{}"
 
     /// Push-only mode: local commits are pushed but remote-ahead is not pulled.
     #[tokio::test]
-    #[serial]
-    async fn push_only_mode() {
+async fn push_only_mode() {
         let h = E2eHarness::start("push").await;
 
         // Make a local commit — should be pushed
@@ -1596,8 +1554,7 @@ mode = "{}"
     /// Fetch-only mode: remote changes are fetched but local branch is NOT
     /// fast-forwarded (status should be "remote_ahead").
     #[tokio::test]
-    #[serial]
-    async fn fetch_only_mode_no_merge() {
+async fn fetch_only_mode_no_merge() {
         let h = E2eHarness::start("fetch").await;
 
         // Push a commit to the remote via second clone
@@ -1648,8 +1605,7 @@ mode = "{}"
 
     /// Explicit sync request triggers immediate processing.
     #[tokio::test]
-    #[serial]
-    async fn explicit_sync_request() {
+async fn explicit_sync_request() {
         let h = E2eHarness::start("push+pull").await;
 
         let local_repo = h.open_local_repo();
@@ -1678,8 +1634,7 @@ mode = "{}"
 
     /// PromptCheck registers the repo and returns status.
     #[tokio::test]
-    #[serial]
-    async fn prompt_check_registers_and_returns_status() {
+async fn prompt_check_registers_and_returns_status() {
         let h = E2eHarness::start("push+pull").await;
 
         let resp = h

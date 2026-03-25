@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 use gitsitter::cli;
+use gitsitter::paths::Paths;
 
 #[derive(Parser)]
 #[command(name = "gitsitter", about = "Keep local branches in sync with remotes")]
@@ -88,40 +89,41 @@ enum DaemonAction {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    let args = Cli::parse();
+    let paths = Paths::resolve();
 
-    let result = match cli.command {
-        None => cli::handle_status(false).await,
-        Some(Commands::Status { global }) => cli::handle_status(global).await,
+    let result = match args.command {
+        None => cli::handle_status(&paths, false).await,
+        Some(Commands::Status { global }) => cli::handle_status(&paths, global).await,
         Some(Commands::Config {
             global,
             repo,
             branch,
             explain,
-        }) => cli::handle_config(global, repo, branch, explain).await,
-        Some(Commands::Enable { path }) => cli::handle_enable(path).await,
-        Some(Commands::Disable { path, purge }) => cli::handle_disable(path, purge).await,
+        }) => cli::handle_config(&paths, global, repo, branch, explain).await,
+        Some(Commands::Enable { path }) => cli::handle_enable(&paths, path).await,
+        Some(Commands::Disable { path, purge }) => cli::handle_disable(&paths, path, purge).await,
         Some(Commands::Log {
             global,
             follow,
             since,
-        }) => cli::handle_log(global, follow, since).await,
-        Some(Commands::Sync { all }) => cli::handle_sync(all).await,
-        Some(Commands::Register { path }) => cli::handle_register(path).await,
+        }) => cli::handle_log(&paths, global, follow, since).await,
+        Some(Commands::Sync { all }) => cli::handle_sync(&paths, all).await,
+        Some(Commands::Register { path }) => cli::handle_register(&paths, path).await,
         Some(Commands::Install { component, shell_name }) => {
             cli::handle_install(component, shell_name).await
         }
         Some(Commands::Uninstall { component }) => {
             cli::handle_uninstall(component).await
         }
-        Some(Commands::Prompt) => cli::handle_prompt().await,
+        Some(Commands::Prompt) => cli::handle_prompt(&paths).await,
         Some(Commands::Daemon { action }) => match action {
-            DaemonAction::Run => cli::handle_daemon_run().await,
+            DaemonAction::Run => cli::handle_daemon_run(&paths).await,
             DaemonAction::Service => cli::handle_daemon_service().await,
-            DaemonAction::Start => cli::handle_daemon_start().await,
-            DaemonAction::Stop => cli::handle_daemon_stop().await,
-            DaemonAction::Restart => cli::handle_daemon_restart().await,
-            DaemonAction::Status => cli::handle_daemon_status().await,
+            DaemonAction::Start => cli::handle_daemon_start(&paths).await,
+            DaemonAction::Stop => cli::handle_daemon_stop(&paths).await,
+            DaemonAction::Restart => cli::handle_daemon_restart(&paths).await,
+            DaemonAction::Status => cli::handle_daemon_status(&paths).await,
         },
     };
 

@@ -69,7 +69,7 @@ pub async fn run(
     let mut pending: HashMap<String, (Instant, String)> = HashMap::new();
 
     // Watch config.toml for changes.
-    let config_path = crate::paths::config_file();
+    let config_path = daemon.paths.config_file.clone();
     if let Some(config_dir) = config_path.parent() {
         if config_dir.exists() {
             if let Err(e) = watcher.watch(config_dir, RecursiveMode::NonRecursive) {

@@ -1,85 +1,62 @@
-//! XDG and platform-specific path resolution for gitsitter.
+//! Path resolution for gitsitter.
+//!
+//! [`Paths`] is resolved once at startup and threaded through the program.
+//! Tests construct it directly with temp directories — no env var races.
 
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-/// Returns the gitsitter config directory.
-///
-/// Resolution order:
-/// 1. `GITSITTER_CONFIG_DIR` (for testing)
-/// 2. `$XDG_CONFIG_HOME/gitsitter/`
-/// 3. `~/.config/gitsitter/`
-pub fn config_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("GITSITTER_CONFIG_DIR") {
-        return PathBuf::from(dir);
+/// Resolved set of gitsitter paths. Immutable after construction.
+#[derive(Debug, Clone)]
+pub struct Paths {
+    pub config_file: PathBuf,
+    pub daemon_log: PathBuf,
+    pub daemon_pid: PathBuf,
+    pub socket_path: PathBuf,
+}
+
+impl Paths {
+    /// Resolve paths from environment variables and platform defaults.
+    pub fn resolve() -> Self {
+        let config_dir = std::env::var_os("GITSITTER_CONFIG_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::config_dir().expect("cannot determine config directory")
+            })
+            .join("gitsitter");
+
+        let state_dir = std::env::var_os("GITSITTER_STATE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                dirs::state_dir()
+                    .or_else(dirs::data_local_dir)
+                    .expect("cannot determine state directory")
+            })
+            .join("gitsitter");
+
+        let socket_path = std::env::var_os("GITSITTER_SOCKET_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(platform_socket_path);
+
+        Self {
+            config_file: config_dir.join("config.toml"),
+            daemon_log: state_dir.join("daemon.log"),
+            daemon_pid: state_dir.join("daemon.pid"),
+            socket_path,
+        }
     }
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::config_dir())
-        .unwrap_or_else(|| {
-            let mut p = dirs::home_dir().expect("cannot determine home directory");
-            p.push(".config");
-            p
-        })
-        .join("gitsitter")
-}
 
-/// Returns the path to `config.toml`.
-pub fn config_file() -> PathBuf {
-    config_dir().join("config.toml")
-}
-
-/// Returns the gitsitter state directory.
-///
-/// Resolution order:
-/// 1. `GITSITTER_STATE_DIR` (for testing)
-/// 2. `$XDG_STATE_HOME/gitsitter/`
-/// 3. `~/.local/state/gitsitter/`
-pub fn state_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("GITSITTER_STATE_DIR") {
-        return PathBuf::from(dir);
+    /// Creates parent directories for all paths if they don't exist.
+    pub fn ensure_dirs(&self) -> Result<()> {
+        for path in [&self.config_file, &self.daemon_log, &self.daemon_pid] {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("failed to create directory: {}", parent.display()))?;
+            }
+        }
+        Ok(())
     }
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::state_dir())
-        .unwrap_or_else(|| {
-            let mut p = dirs::home_dir().expect("cannot determine home directory");
-            p.push(".local/state");
-            p
-        })
-        .join("gitsitter")
-}
-
-/// Returns the path to `daemon.log`.
-pub fn daemon_log() -> PathBuf {
-    state_dir().join("daemon.log")
-}
-
-/// Returns the path to `daemon.pid`.
-pub fn daemon_pid() -> PathBuf {
-    state_dir().join("daemon.pid")
-}
-
-/// Returns the daemon IPC endpoint path.
-///
-/// Resolution order:
-/// 1. `GITSITTER_SOCKET_PATH` (for testing)
-/// 2. Platform default runtime path / named pipe
-pub fn socket_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("GITSITTER_SOCKET_PATH") {
-        return PathBuf::from(path);
-    }
-    platform_socket_path()
-}
-
-/// Creates the config and state directories if they don't exist.
-pub fn ensure_dirs() -> Result<()> {
-    std::fs::create_dir_all(config_dir())
-        .context("failed to create config directory")?;
-    std::fs::create_dir_all(state_dir())
-        .context("failed to create state directory")?;
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -116,43 +93,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn config_file_ends_with_config_toml() {
-        let p = config_file();
-        assert_eq!(p.file_name().unwrap(), "config.toml");
-        assert!(p.parent().unwrap().ends_with("gitsitter"));
+    fn resolve_produces_absolute_paths() {
+        let p = Paths::resolve().unwrap();
+        assert!(p.config_file.is_absolute());
+        assert!(p.socket_path.is_absolute());
     }
 
     #[test]
-    fn state_paths_under_state_dir() {
-        let dir = state_dir();
-        assert!(daemon_log().starts_with(&dir));
-        assert!(daemon_pid().starts_with(&dir));
-    }
-
-    #[test]
-    fn socket_path_is_absolute() {
-        assert!(socket_path().is_absolute());
-    }
-
-    #[test]
-    fn respects_xdg_config_home() {
-        if cfg!(windows) {
-            return;
-        }
-        // Temporarily override — won't affect other threads in parallel tests,
-        // but fine for a unit test.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", "/tmp/test-xdg-config") };
-        assert_eq!(config_dir(), PathBuf::from("/tmp/test-xdg-config/gitsitter"));
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-    }
-
-    #[test]
-    fn respects_xdg_state_home() {
-        if cfg!(windows) {
-            return;
-        }
-        unsafe { std::env::set_var("XDG_STATE_HOME", "/tmp/test-xdg-state") };
-        assert_eq!(state_dir(), PathBuf::from("/tmp/test-xdg-state/gitsitter"));
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    fn direct_construction() {
+        let p = Paths {
+            config_file: PathBuf::from("/tmp/test/config.toml"),
+            daemon_log: PathBuf::from("/tmp/test/daemon.log"),
+            daemon_pid: PathBuf::from("/tmp/test/daemon.pid"),
+            socket_path: PathBuf::from("/tmp/test/test.sock"),
+        };
+        assert_eq!(p.config_file.file_name().unwrap(), "config.toml");
+        assert_eq!(p.daemon_log.file_name().unwrap(), "daemon.log");
     }
 }

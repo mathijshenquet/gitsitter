@@ -183,36 +183,27 @@ pub async fn recv_response<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Respo
 
 #[cfg(unix)]
 mod platform {
-    use std::path::PathBuf;
+    use std::path::Path;
 
     use anyhow::{Context, Result};
     use tokio::net::{UnixListener, UnixStream};
 
-    use crate::paths;
-
     pub type DaemonStream = UnixStream;
     pub type DaemonListener = UnixListener;
 
-    pub fn endpoint() -> PathBuf {
-        paths::socket_path()
-    }
-
-    pub fn cleanup_endpoint() {
-        let path = endpoint();
+    pub fn cleanup_endpoint(path: &Path) {
         if path.exists() {
             let _ = std::fs::remove_file(path);
         }
     }
 
-    pub fn bind_listener() -> Result<DaemonListener> {
-        let path = endpoint();
-        UnixListener::bind(&path)
+    pub fn bind_listener(path: &Path) -> Result<DaemonListener> {
+        UnixListener::bind(path)
             .with_context(|| format!("failed to bind socket at {}", path.display()))
     }
 
-    pub async fn connect_to_daemon() -> Result<DaemonStream> {
-        let path = endpoint();
-        UnixStream::connect(&path)
+    pub async fn connect_to_daemon(path: &Path) -> Result<DaemonStream> {
+        UnixStream::connect(path)
             .await
             .with_context(|| format!("failed to connect to daemon socket at {}", path.display()))
     }
@@ -225,20 +216,19 @@ mod platform {
             .context("failed to accept daemon connection")
     }
 
-    pub fn is_daemon_running() -> bool {
-        let path = endpoint();
+    pub fn is_daemon_running(path: &Path) -> bool {
         if !path.exists() {
             return false;
         }
-        std::os::unix::net::UnixStream::connect(&path).is_ok()
+        std::os::unix::net::UnixStream::connect(path).is_ok()
     }
 }
 
 #[cfg(windows)]
 mod platform {
     use std::io;
+    use std::path::Path;
     use std::pin::Pin;
-    use std::path::PathBuf;
     use std::task::{Context as TaskContext, Poll};
     use std::time::{Duration, Instant};
 
@@ -248,8 +238,6 @@ mod platform {
         ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
     };
     use tokio::time::sleep;
-
-    use crate::paths;
 
     const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
     const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -307,32 +295,26 @@ mod platform {
         }
     }
 
-    pub fn endpoint() -> PathBuf {
-        paths::socket_path()
-    }
+    pub fn cleanup_endpoint(_path: &Path) {}
 
-    pub fn cleanup_endpoint() {}
-
-    fn create_server(first_instance: bool) -> Result<DaemonListener> {
-        let path = endpoint();
+    fn create_server(path: &Path, first_instance: bool) -> Result<DaemonListener> {
         let mut options = ServerOptions::new();
         if first_instance {
             options.first_pipe_instance(true);
         }
         options
-            .create(&path)
+            .create(path)
             .with_context(|| format!("failed to create named pipe at {}", path.display()))
     }
 
-    pub fn bind_listener() -> Result<DaemonListener> {
-        create_server(true)
+    pub fn bind_listener(path: &Path) -> Result<DaemonListener> {
+        create_server(path, true)
     }
 
-    pub async fn connect_to_daemon() -> Result<DaemonStream> {
-        let path = endpoint();
+    pub async fn connect_to_daemon(path: &Path) -> Result<DaemonStream> {
         let deadline = Instant::now() + CONNECT_TIMEOUT;
         loop {
-            match ClientOptions::new().open(&path) {
+            match ClientOptions::new().open(path) {
                 Ok(stream) => return Ok(DaemonStream::Client(stream)),
                 Err(err) if err.raw_os_error() == Some(2) => {
                     return Err(err).with_context(|| {
@@ -359,18 +341,18 @@ mod platform {
         }
     }
 
-    pub async fn accept(listener: &mut DaemonListener) -> Result<DaemonStream> {
+    pub async fn accept(listener: &mut DaemonListener, path: &Path) -> Result<DaemonStream> {
         listener
             .connect()
             .await
             .context("failed to accept daemon connection")?;
-        let next = create_server(false)?;
+        let next = create_server(path, false)?;
         let connected = std::mem::replace(listener, next);
         Ok(DaemonStream::Server(connected))
     }
 
-    pub fn is_daemon_running() -> bool {
-        match ClientOptions::new().open(endpoint()) {
+    pub fn is_daemon_running(path: &Path) -> bool {
+        match ClientOptions::new().open(path) {
             Ok(_) => true,
             Err(err) if err.raw_os_error() == Some(231) => true,
             Err(err) if err.kind() == io::ErrorKind::NotFound => false,
@@ -382,32 +364,31 @@ mod platform {
 pub use platform::DaemonStream;
 pub use platform::DaemonListener;
 
-pub fn cleanup_endpoint() {
-    platform::cleanup_endpoint();
+pub fn cleanup_endpoint(socket_path: &std::path::Path) {
+    platform::cleanup_endpoint(socket_path);
 }
 
-pub fn endpoint_display() -> String {
-    platform::endpoint().display().to_string()
+pub fn bind_listener(socket_path: &std::path::Path) -> Result<platform::DaemonListener> {
+    platform::bind_listener(socket_path)
 }
 
-pub fn bind_listener() -> Result<platform::DaemonListener> {
-    platform::bind_listener()
-}
-
-/// Connect to the running daemon.
-pub async fn connect_to_daemon() -> Result<DaemonStream> {
-    platform::connect_to_daemon().await
+pub async fn connect_to_daemon(socket_path: &std::path::Path) -> Result<DaemonStream> {
+    platform::connect_to_daemon(socket_path).await
 }
 
 pub async fn accept_connection(
     listener: &mut platform::DaemonListener,
+    #[allow(unused)] socket_path: &std::path::Path,
 ) -> Result<DaemonStream> {
-    platform::accept(listener).await
+    #[cfg(unix)]
+    { platform::accept(listener).await }
+    #[cfg(windows)]
+    { platform::accept(listener, socket_path).await }
 }
 
 /// Quick synchronous check whether the daemon appears to be running.
-pub fn is_daemon_running() -> bool {
-    platform::is_daemon_running()
+pub fn is_daemon_running(socket_path: &std::path::Path) -> bool {
+    platform::is_daemon_running(socket_path)
 }
 
 // ---------------------------------------------------------------------------
@@ -508,16 +489,10 @@ mod tests {
     #[test]
     fn no_daemon_running() {
         let missing_path = if cfg!(windows) {
-            r"\\.\pipe\gitsitter-test-nonexistent".to_string()
+            std::path::PathBuf::from(r"\\.\pipe\gitsitter-test-nonexistent")
         } else {
-            "/tmp/gitsitter-test-nonexistent.sock".to_string()
+            std::path::PathBuf::from("/tmp/gitsitter-test-nonexistent.sock")
         };
-        unsafe {
-            std::env::set_var("GITSITTER_SOCKET_PATH", &missing_path);
-        }
-        assert!(!is_daemon_running());
-        unsafe {
-            std::env::remove_var("GITSITTER_SOCKET_PATH");
-        }
+        assert!(!is_daemon_running(&missing_path));
     }
 }

@@ -10,26 +10,23 @@ use chrono::{DateTime, Utc};
 
 use crate::config::{self, RepoSyncMode, UserConfig};
 use crate::git_ops;
-use crate::paths;
+use crate::paths::Paths;
 use crate::transport::{
-    self, connect_to_daemon, DaemonStream, Request, Response,
+    self, DaemonStream, Request, Response,
 };
 
 /// Connect to the daemon, returning a consistent error if it's not running.
-async fn require_daemon() -> Result<DaemonStream> {
-    connect_to_daemon()
+async fn require_daemon(paths: &Paths) -> Result<DaemonStream> {
+    transport::connect_to_daemon(&paths.socket_path)
         .await
         .context("daemon not running. Start it with `gitsitter daemon start`")
 }
 
-/// Write config.toml and tell the daemon to reload (if running).
-async fn save_config_and_notify(cfg: &UserConfig) -> Result<()> {
-    cfg.save()?;
-    // Best-effort notify — if daemon is down, the config is still saved.
-    if let Ok(mut stream) = connect_to_daemon().await {
+/// Best-effort notify the daemon to reload config.
+async fn notify_daemon_reload(paths: &Paths) {
+    if let Ok(mut stream) = transport::connect_to_daemon(&paths.socket_path).await {
         let _ = roundtrip(&mut stream, &Request::ReloadConfig).await;
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -144,8 +141,8 @@ fn status_label(status: &str) -> &'static str {
 // Handlers
 // ---------------------------------------------------------------------------
 
-pub async fn handle_status(global: bool) -> Result<()> {
-    let mut stream = require_daemon().await?;
+pub async fn handle_status(paths: &Paths, global: bool) -> Result<()> {
+    let mut stream = require_daemon(paths).await?;
     let repo_path = if global {
         None
     } else {
@@ -218,47 +215,46 @@ fn print_repo_status(data: &transport::StatusData) {
     }
 }
 
-pub async fn handle_config(
+pub async fn handle_config(paths: &Paths,
     global: bool,
     repo: Option<String>,
     branch: Option<String>,
     explain: bool,
 ) -> Result<()> {
     if explain {
-        return handle_config_explain().await;
+        return handle_config_explain(paths).await;
     }
 
     if repo.is_some() || branch.is_some() {
         let repo_path = resolve_cwd_repo_path()?;
-        write_config_change(&repo_path, repo.as_deref(), branch.as_deref()).await?;
+        write_config_change(paths, &repo_path, repo.as_deref(), branch.as_deref()).await?;
         return Ok(());
     }
 
     // No flags: just print current config summary
     if global {
-        print_global_config()?;
+        print_global_config(paths)?;
     } else {
-        print_repo_config()?;
+        print_repo_config(paths)?;
     }
     Ok(())
 }
 
-async fn write_config_change(
+async fn write_config_change(paths: &Paths,
     repo_path: &str,
     repo_mode: Option<&str>,
     branch_mode: Option<&str>,
 ) -> Result<()> {
-    let mut cfg = UserConfig::load()?;
+    // Parse modes before taking the lock
+    let parsed_repo_mode = repo_mode
+        .map(|s| {
+            serde_json::from_value::<RepoSyncMode>(serde_json::Value::String(s.to_string()))
+                .with_context(|| format!("invalid repo sync mode: {}", s))
+        })
+        .transpose()?;
 
-    if let Some(mode_str) = repo_mode {
-        let mode: RepoSyncMode = serde_json::from_value(serde_json::Value::String(mode_str.to_string()))
-            .with_context(|| format!("invalid repo sync mode: {}", mode_str))?;
-        let entry = cfg.repos.entry(repo_path.to_string()).or_default();
-        entry.mode = Some(mode);
-    }
-
-    if let Some(mode_str) = branch_mode {
-        let branch_mode: config::BranchSyncMode =
+    let parsed_branch = if let Some(mode_str) = branch_mode {
+        let mode: config::BranchSyncMode =
             serde_json::from_value(serde_json::Value::String(mode_str.to_string()))
                 .with_context(|| format!("invalid branch sync mode: {}", mode_str))?;
         let cwd = std::env::current_dir()?;
@@ -266,29 +262,39 @@ async fn write_config_change(
         let repo = git2::Repository::open(&repo_id_path)?;
         let head = repo.head()?;
         let branch_name = head.shorthand().unwrap_or("HEAD").to_string();
+        println!("Set branch '{}' to {:?}", branch_name, mode);
+        Some((branch_name, mode))
+    } else {
+        None
+    };
 
-        let entry = cfg.repos.entry(repo_path.to_string()).or_default();
-        // Check if branch already in list
-        let mut found = false;
-        for (name, mode) in &mut entry.branches {
-            if name == &branch_name {
-                *mode = branch_mode;
-                found = true;
-                break;
+    let repo_path = repo_path.to_string();
+    UserConfig::modify(&paths.config_file, move |cfg: &mut UserConfig| {
+        if let Some(mode) = parsed_repo_mode {
+            let entry = cfg.repos.entry(repo_path.clone()).or_default();
+            entry.mode = Some(mode);
+        }
+        if let Some((branch_name, branch_mode)) = parsed_branch {
+            let entry = cfg.repos.entry(repo_path.clone()).or_default();
+            let mut found = false;
+            for (name, mode) in &mut entry.branches {
+                if name == &branch_name {
+                    *mode = branch_mode;
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                entry.branches.push((branch_name, branch_mode));
             }
         }
-        if !found {
-            entry.branches.push((branch_name.clone(), branch_mode));
-        }
-        println!("Set branch '{}' to {:?}", branch_name, branch_mode);
-    }
-
-    save_config_and_notify(&cfg).await?;
+    })?;
+    notify_daemon_reload(paths).await;
     Ok(())
 }
 
-fn print_global_config() -> Result<()> {
-    let cfg = UserConfig::load()?;
+fn print_global_config(paths: &Paths) -> Result<()> {
+    let cfg = UserConfig::load(&paths.config_file)?;
     println!("Global settings:");
     println!("  refresh_interval: {:?}", cfg.global.refresh_interval);
     println!("  colors: {}", cfg.global.colors);
@@ -337,8 +343,8 @@ fn print_global_config() -> Result<()> {
     Ok(())
 }
 
-fn print_repo_config() -> Result<()> {
-    let cfg = UserConfig::load()?;
+fn print_repo_config(paths: &Paths) -> Result<()> {
+    let cfg = UserConfig::load(&paths.config_file)?;
     let repo_path = match resolve_cwd_repo_path() {
         Ok(p) => p,
         Err(_) => {
@@ -373,8 +379,8 @@ fn print_repo_config() -> Result<()> {
     Ok(())
 }
 
-async fn handle_config_explain() -> Result<()> {
-    let cfg = UserConfig::load()?;
+async fn handle_config_explain(paths: &Paths) -> Result<()> {
+    let cfg = UserConfig::load(&paths.config_file)?;
     let repo_path = resolve_cwd_repo_path()?;
     let dp = display_path(&repo_path);
 
@@ -472,7 +478,7 @@ async fn handle_config_explain() -> Result<()> {
     Ok(())
 }
 
-pub async fn handle_enable(path: Option<String>) -> Result<()> {
+pub async fn handle_enable(paths: &Paths, path: Option<String>) -> Result<()> {
     let repo_path = resolve_path_or_cwd(path.as_deref())?;
 
     // Verify it's a git repo
@@ -484,35 +490,40 @@ pub async fn handle_enable(path: Option<String>) -> Result<()> {
     let repo_id = git_ops::discover_repo_id(Path::new(&repo_path))?;
     let repo_id_str = repo_id.to_string_lossy().to_string();
 
-    let mut cfg = UserConfig::load()?;
-    let entry = cfg.repos.entry(repo_id_str.clone()).or_default();
-    entry.disabled = Some(false);
-    save_config_and_notify(&cfg).await?;
+    UserConfig::modify(&paths.config_file, |cfg| {
+        let entry = cfg.repos.entry(repo_id_str.clone()).or_default();
+        entry.disabled = Some(false);
+    })?;
+    notify_daemon_reload(paths).await;
 
     println!("Enabled {}", display_path(&repo_id_str));
     Ok(())
 }
 
-pub async fn handle_disable(path: Option<String>, purge: bool) -> Result<()> {
+pub async fn handle_disable(paths: &Paths, path: Option<String>, purge: bool) -> Result<()> {
     let repo_path = resolve_path_or_cwd(path.as_deref())?;
     let repo_id = git_ops::discover_repo_id(Path::new(&repo_path))?;
     let repo_id_str = repo_id.to_string_lossy().to_string();
 
-    let mut cfg = UserConfig::load()?;
-    if purge {
-        cfg.repos.remove(&repo_id_str);
-    } else {
-        let entry = cfg.repos.entry(repo_id_str.clone()).or_default();
-        entry.disabled = Some(true);
-    }
-    save_config_and_notify(&cfg).await?;
+    UserConfig::modify(&paths.config_file, {
+        let repo_id = repo_id_str.clone();
+        move |cfg| {
+            if purge {
+                cfg.repos.remove(&repo_id);
+            } else {
+                let entry = cfg.repos.entry(repo_id).or_default();
+                entry.disabled = Some(true);
+            }
+        }
+    })?;
+    notify_daemon_reload(paths).await;
 
     println!("Disabled {}", display_path(&repo_id_str));
     Ok(())
 }
 
-pub async fn handle_log(_global: bool, _follow: bool, since: Option<String>) -> Result<()> {
-    let log_path = paths::daemon_log();
+pub async fn handle_log(paths: &Paths, _global: bool, _follow: bool, since: Option<String>) -> Result<()> {
+    let log_path = paths.daemon_log.clone();
     if !log_path.exists() {
         println!("No log file found at {}", log_path.display());
         return Ok(());
@@ -541,8 +552,8 @@ pub async fn handle_log(_global: bool, _follow: bool, since: Option<String>) -> 
     Ok(())
 }
 
-pub async fn handle_sync(all: bool) -> Result<()> {
-    let mut stream = require_daemon().await?;
+pub async fn handle_sync(paths: &Paths, all: bool) -> Result<()> {
+    let mut stream = require_daemon(paths).await?;
     let repo_path = if all {
         None
     } else {
@@ -558,24 +569,26 @@ pub async fn handle_sync(all: bool) -> Result<()> {
     Ok(())
 }
 
-pub async fn handle_register(path: Option<String>) -> Result<()> {
+pub async fn handle_register(paths: &Paths, path: Option<String>) -> Result<()> {
     let repo_path = resolve_path_or_cwd(path.as_deref())?;
     let repo_id = git_ops::discover_repo_id(Path::new(&repo_path))
         .context("not a git repository")?;
     let repo_id_str = repo_id.to_string_lossy().to_string();
 
-    let mut cfg = UserConfig::load()?;
-    if !cfg.repos.contains_key(&repo_id_str) {
-        cfg.repos.insert(repo_id_str.clone(), Default::default());
-    }
-    save_config_and_notify(&cfg).await?;
+    UserConfig::modify(&paths.config_file, {
+        let repo_id = repo_id_str.clone();
+        move |cfg| {
+            cfg.repos.entry(repo_id).or_default();
+        }
+    })?;
+    notify_daemon_reload(paths).await;
 
     println!("Registered {}", display_path(&repo_id_str));
     Ok(())
 }
 
-pub async fn handle_daemon_status() -> Result<()> {
-    match connect_to_daemon().await {
+pub async fn handle_daemon_status(paths: &Paths) -> Result<()> {
+    match transport::connect_to_daemon(&paths.socket_path).await {
         Ok(mut stream) => {
             let req = Request::DaemonStatus;
             let resp = roundtrip(&mut stream, &req).await?;
@@ -621,12 +634,12 @@ fn format_uptime(secs: u64) -> String {
     format!("{}d {}h", days, hours % 24)
 }
 
-async fn wait_for_daemon_ready(timeout: std::time::Duration) -> bool {
+async fn wait_for_daemon_ready(paths: &Paths, timeout: std::time::Duration) -> bool {
     let start = std::time::Instant::now();
     let poll_interval = std::time::Duration::from_millis(50);
 
     while start.elapsed() < timeout {
-        if transport::is_daemon_running() {
+        if transport::is_daemon_running(&paths.socket_path) {
             return true;
         }
         tokio::time::sleep(poll_interval).await;
@@ -644,9 +657,9 @@ async fn sc_command(args: &[&str]) -> Result<std::process::Output> {
         .with_context(|| format!("failed to run sc.exe {}", args.join(" ")))
 }
 
-pub async fn handle_daemon_start() -> Result<()> {
+pub async fn handle_daemon_start(paths: &Paths) -> Result<()> {
     // Check if already running
-    if transport::is_daemon_running() {
+    if transport::is_daemon_running(&paths.socket_path) {
         println!("gitsitter daemon is already running");
         return Ok(());
     }
@@ -667,7 +680,7 @@ pub async fn handle_daemon_start() -> Result<()> {
                     .await;
                 if let Ok(status) = result {
                     if status.success() {
-                        if wait_for_daemon_ready(std::time::Duration::from_secs(3)).await {
+                        if wait_for_daemon_ready(paths, std::time::Duration::from_secs(3)).await {
                             println!("gitsitter daemon started via launchd");
                             return Ok(());
                         }
@@ -689,7 +702,7 @@ pub async fn handle_daemon_start() -> Result<()> {
 
         match systemd_result {
             Ok(status) if status.success() => {
-                if wait_for_daemon_ready(std::time::Duration::from_secs(3)).await {
+                if wait_for_daemon_ready(paths, std::time::Duration::from_secs(3)).await {
                     println!("gitsitter daemon started via systemd");
                     return Ok(());
                 }
@@ -722,9 +735,9 @@ pub async fn handle_daemon_start() -> Result<()> {
 
     // Spawn self as a detached background process
     let exe = std::env::current_exe().context("failed to determine own executable path")?;
-    paths::ensure_dirs()?;
+    paths.ensure_dirs()?;
 
-    let log_file = std::fs::File::create(paths::daemon_log())
+    let log_file = std::fs::File::create(paths.daemon_log.clone())
         .context("failed to create daemon log file")?;
     let log_stderr = log_file.try_clone()?;
 
@@ -736,7 +749,7 @@ pub async fn handle_daemon_start() -> Result<()> {
         .spawn()
         .context("failed to spawn daemon process")?;
 
-    if wait_for_daemon_ready(std::time::Duration::from_secs(3)).await {
+    if wait_for_daemon_ready(paths, std::time::Duration::from_secs(3)).await {
         println!("gitsitter daemon started (PID: {})", child.id());
         return Ok(());
     }
@@ -744,11 +757,11 @@ pub async fn handle_daemon_start() -> Result<()> {
     bail!(
         "spawned daemon process (PID: {}), but the daemon socket did not appear; check {}",
         child.id(),
-        paths::daemon_log().display()
+        paths.daemon_log.clone().display()
     )
 }
 
-pub async fn handle_daemon_stop() -> Result<()> {
+pub async fn handle_daemon_stop(paths: &Paths) -> Result<()> {
     #[cfg(windows)]
     {
         let service_result = sc_command(&["stop", crate::service::SERVICE_NAME]).await;
@@ -760,7 +773,7 @@ pub async fn handle_daemon_stop() -> Result<()> {
         }
     }
 
-    match connect_to_daemon().await {
+    match transport::connect_to_daemon(&paths.socket_path).await {
         Ok(mut stream) => {
             let req = Request::Shutdown;
             let resp = roundtrip(&mut stream, &req).await;
@@ -779,10 +792,10 @@ pub async fn handle_daemon_stop() -> Result<()> {
     Ok(())
 }
 
-pub async fn handle_daemon_restart() -> Result<()> {
+pub async fn handle_daemon_restart(paths: &Paths) -> Result<()> {
     // Stop if running
-    if transport::is_daemon_running() {
-        if let Ok(mut stream) = connect_to_daemon().await {
+    if transport::is_daemon_running(&paths.socket_path) {
+        if let Ok(mut stream) = transport::connect_to_daemon(&paths.socket_path).await {
             let req = Request::Shutdown;
             let _ = roundtrip(&mut stream, &req).await;
             // Give it a moment to shut down
@@ -790,11 +803,11 @@ pub async fn handle_daemon_restart() -> Result<()> {
         }
     }
     // Start
-    handle_daemon_start().await
+    handle_daemon_start(paths).await
 }
 
-pub async fn handle_daemon_run() -> Result<()> {
-    crate::daemon::run_daemon().await
+pub async fn handle_daemon_run(paths: &Paths) -> Result<()> {
+    crate::daemon::run_daemon(paths).await
 }
 
 pub async fn handle_daemon_service() -> Result<()> {
@@ -960,11 +973,11 @@ pub async fn handle_uninstall(component: Option<String>) -> Result<()> {
 }
 
 /// Hidden command used by shell hooks to check for notifications.
-pub async fn handle_prompt() -> Result<()> {
+pub async fn handle_prompt(paths: &Paths) -> Result<()> {
     // Quick check: try to connect to daemon with short timeout
     let connect = tokio::time::timeout(
         std::time::Duration::from_millis(20),
-        connect_to_daemon(),
+        transport::connect_to_daemon(&paths.socket_path),
     )
     .await;
 
