@@ -51,11 +51,6 @@ pub fn state_dir() -> PathBuf {
         .join("gitsitter")
 }
 
-/// Returns the path to `state.db`.
-pub fn state_db() -> PathBuf {
-    state_dir().join("state.db")
-}
-
 /// Returns the path to `daemon.log`.
 pub fn daemon_log() -> PathBuf {
     state_dir().join("daemon.log")
@@ -130,7 +125,6 @@ mod tests {
     #[test]
     fn state_paths_under_state_dir() {
         let dir = state_dir();
-        assert!(state_db().starts_with(&dir));
         assert!(daemon_log().starts_with(&dir));
         assert!(daemon_pid().starts_with(&dir));
     }

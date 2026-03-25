@@ -1,16 +1,18 @@
 //! Daemon sync loop and management.
 //!
 //! The daemon runs in the background, watches registered repos, and keeps
-//! local branches in sync with their tracking remotes. It listens on a local
-//! IPC endpoint for CLI requests and periodically runs sync cycles.
+//! local branches in sync with their tracking remotes. It listens on a Unix
+//! domain socket for CLI requests and periodically runs sync cycles.
+//!
+//! All runtime state lives in memory. Config.toml is the source of truth for
+//! which repos are tracked. No SQLite database is used.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, Notify, RwLock, watch};
 use tracing::{error, info, warn};
 
@@ -21,9 +23,9 @@ use crate::git_ops::{
     self, MergeAnalysis, PushResult,
 };
 use crate::paths;
-use crate::state::{BranchState, StateDb, WorktreeState};
 use crate::transport::{
-    self, Request, Response,
+    self, BranchStatusData,
+    RepoStatusData, StatusData, Request, Response,
 };
 
 // ---------------------------------------------------------------------------
@@ -46,11 +48,13 @@ const MAX_BACKOFF_SECS: u64 = 3600;
 /// Shared daemon state, held behind an `Arc` so multiple tasks can access it.
 pub struct Daemon {
     pub config: RwLock<UserConfig>,
-    pub db: Mutex<StateDb>,
     pub start_time: Instant,
     pub repos: RwLock<HashMap<String, TrackedRepo>>,
     pub sync_notify: Notify,
     pub shutdown_tx: watch::Sender<bool>,
+    /// Protects config.toml writes so concurrent register/enable/disable
+    /// don't race.
+    config_write_lock: Mutex<()>,
 }
 
 /// In-memory tracking info for a single repo.
@@ -59,9 +63,23 @@ pub struct TrackedRepo {
     pub display_path: String,
     pub remote_url: Option<String>,
     pub last_sync: Option<Instant>,
+    pub last_sync_wall: Option<String>,
     pub sync_reason: Option<String>,
     pub in_sync: bool,
     pub backoff: BackoffState,
+    pub branches: HashMap<String, BranchRuntimeState>,
+    pub notification_cooldowns: HashMap<String, Instant>,
+}
+
+/// Runtime state for a single branch, kept in memory only.
+#[derive(Debug, Clone)]
+pub struct BranchRuntimeState {
+    pub sync_status: String,
+    pub last_pull_at: Option<String>,
+    pub last_push_at: Option<String>,
+    pub local_oid: Option<String>,
+    pub remote_oid: Option<String>,
+    pub error_message: Option<String>,
 }
 
 /// Backoff state for a repo's network operations.
@@ -94,7 +112,7 @@ impl BackoffState {
             INITIAL_BACKOFF_SECS * 2u64.saturating_pow(self.fetch_consecutive_failures - 1),
             MAX_BACKOFF_SECS,
         );
-        self.fetch_backoff_until = Some(Instant::now() + std::time::Duration::from_secs(secs));
+        self.fetch_backoff_until = Some(Instant::now() + Duration::from_secs(secs));
     }
 
     fn reset_fetch_backoff(&mut self) {
@@ -120,7 +138,7 @@ impl BackoffState {
             MAX_BACKOFF_SECS,
         );
         let entry = self.per_ref_backoff.get_mut(ref_name).unwrap();
-        entry.0 = Instant::now() + std::time::Duration::from_secs(secs);
+        entry.0 = Instant::now() + Duration::from_secs(secs);
     }
 
     fn reset_push_backoff(&mut self, ref_name: &str) {
@@ -129,6 +147,38 @@ impl BackoffState {
 }
 
 type SharedDaemon = Arc<Daemon>;
+
+impl TrackedRepo {
+    fn new(repo_id: String, display_path: String, remote_url: Option<String>) -> Self {
+        Self {
+            repo_id,
+            display_path,
+            remote_url,
+            last_sync: None,
+            last_sync_wall: None,
+            sync_reason: None,
+            in_sync: false,
+            backoff: BackoffState::new(),
+            branches: HashMap::new(),
+            notification_cooldowns: HashMap::new(),
+        }
+    }
+
+    fn set_branch(&mut self, name: &str, state: BranchRuntimeState) {
+        self.branches.insert(name.to_string(), state);
+    }
+
+    fn should_notify(&self, key: &str, cooldown: Duration) -> bool {
+        match self.notification_cooldowns.get(key) {
+            None => true,
+            Some(last) => last.elapsed() >= cooldown,
+        }
+    }
+
+    fn record_notification(&mut self, key: &str) {
+        self.notification_cooldowns.insert(key.to_string(), Instant::now());
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Main entry point
@@ -161,86 +211,80 @@ pub async fn run_daemon() -> Result<()> {
 
     // 4. Load config
     let config = UserConfig::load().context("failed to load config")?;
-    info!("loaded config from {}", paths::config_file().display());
+    let config_path = paths::config_file();
+    info!("initialized config from {}", config_path.display());
 
-    // 5. Open state database
-    let db = StateDb::open().context("failed to open state database")?;
-    info!("opened state database at {}", paths::state_db().display());
-
-    // 6. Load known repos from DB into memory
-    let repo_states = {
-        let repos = db.list_repos()?;
-        let mut map = HashMap::new();
-        for rs in repos {
-            map.insert(
-                rs.repo_id.clone(),
-                TrackedRepo {
-                    repo_id: rs.repo_id.clone(),
-                    display_path: rs.display_path.clone(),
-                    remote_url: rs.remote_url.clone(),
-                    last_sync: None, // will sync on first cycle
-                    sync_reason: None,
-                    in_sync: false,
-                    backoff: BackoffState::new(),
-                },
-            );
+    // 5. Seed repos from config.toml
+    let mut repo_states: HashMap<String, TrackedRepo> = HashMap::new();
+    for (repo_path, repo_cfg) in &config.repos {
+        if repo_cfg.disabled == Some(true) {
+            continue;
         }
-        map
-    };
+        let repo_id_path = PathBuf::from(repo_path);
+        let display_path = git_ops::get_display_path(&repo_id_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| repo_path.clone());
+        let remote_url = git_ops::get_remote_url(&repo_id_path).ok().flatten();
+        repo_states.insert(
+            repo_path.clone(),
+            TrackedRepo::new(repo_path.clone(), display_path, remote_url),
+        );
+    }
     let repo_count = repo_states.len();
-    info!("loaded {} repos from state database", repo_count);
+    info!("loaded {} repos from config", repo_count);
 
-    // 7. Shutdown channel (created early so it can be stored in Daemon)
+    // 6. Shutdown channel (created early so it can be stored in Daemon)
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // 8. Build shared state
+    // 7. Build shared state
     let daemon = Arc::new(Daemon {
         config: RwLock::new(config),
-        db: Mutex::new(db),
         start_time: Instant::now(),
         repos: RwLock::new(repo_states),
         sync_notify: Notify::new(),
         shutdown_tx,
+        config_write_lock: Mutex::new(()),
     });
 
-    // 9. Remove stale endpoint if it exists
+    // 8. Remove stale endpoint if it exists
     transport::cleanup_endpoint();
 
-    // 10. Start IPC listener
+    // 9. Start listener
     let listener = transport::bind_listener()?;
     info!("listening on {}", transport::endpoint_display());
 
-    // 11. Spawn socket handler task
+    // 10. Spawn socket handler task
     let daemon_for_socket = Arc::clone(&daemon);
     let shutdown_rx_socket = shutdown_rx.clone();
     let socket_task = tokio::spawn(async move {
         socket_accept_loop(daemon_for_socket, listener, shutdown_rx_socket).await;
     });
 
-    // 12. Spawn sync loop task
+    // 11. Spawn sync loop task
     let daemon_for_sync = Arc::clone(&daemon);
     let shutdown_rx_sync = shutdown_rx.clone();
     let sync_task = tokio::spawn(async move {
         sync_loop(daemon_for_sync, shutdown_rx_sync).await;
     });
 
-    // 12b. Spawn file watcher task
+    // 11b. Spawn file watcher task
     let daemon_for_watcher = Arc::clone(&daemon);
     let shutdown_rx_watcher = shutdown_rx.clone();
     let watcher_task = tokio::spawn(async move {
         crate::watcher::run(daemon_for_watcher, shutdown_rx_watcher).await;
     });
 
+    // 12. Wait for shutdown signal
     let mut shutdown_rx_main = shutdown_rx.clone();
     wait_for_shutdown_signal(&mut shutdown_rx_main).await?;
 
-    // 14. Signal shutdown to all tasks
+    // 13. Signal shutdown to all tasks
     info!("shutting down...");
     let _ = daemon.shutdown_tx.send(true);
 
     // Give tasks a moment to finish
     let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        Duration::from_secs(5),
         async {
             let _ = socket_task.await;
             let _ = sync_task.await;
@@ -249,7 +293,7 @@ pub async fn run_daemon() -> Result<()> {
     )
     .await;
 
-    // 15. Cleanup: remove endpoint and PID file
+    // 14. Cleanup: remove endpoint and PID file
     transport::cleanup_endpoint();
     let _ = std::fs::remove_file(&pid_path);
 
@@ -280,8 +324,6 @@ async fn socket_accept_loop(
                     }
                     Err(e) => {
                         error!("failed to accept connection: {}", e);
-                        #[cfg(windows)]
-                        return;
                     }
                 }
             }
@@ -295,10 +337,7 @@ async fn socket_accept_loop(
     }
 }
 
-async fn handle_connection<S>(daemon: SharedDaemon, mut stream: S) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
+async fn handle_connection(daemon: SharedDaemon, mut stream: transport::DaemonStream) -> Result<()> {
     let request = transport::recv_request(&mut stream).await?;
 
     let response = process_request(&daemon, request).await;
@@ -355,27 +394,59 @@ async fn handle_status(daemon: &SharedDaemon, repo_path: Option<String>) -> Resp
     };
     let repo_id_str = repo_id.to_string_lossy().to_string();
 
-    let db = daemon.db.lock().await;
+    let repos = daemon.repos.read().await;
     let config = daemon.config.read().await;
 
-    match crate::queries::build_repo_status(&db, &config, &repo_id_str) {
-        Ok(data) => Response::Status { data },
-        Err(e) => Response::Error {
-            message: format!("{}", e),
+    match repos.get(&repo_id_str) {
+        Some(tr) => {
+            let data = build_status_data(tr, &config);
+            Response::Status { data }
+        }
+        None => Response::Error {
+            message: format!("repo not registered: {}", repo_path),
         },
     }
 }
 
 async fn handle_global_status(daemon: &SharedDaemon) -> Response {
-    let db = daemon.db.lock().await;
+    let repos = daemon.repos.read().await;
     let config = daemon.config.read().await;
 
-    match crate::queries::build_global_status(&db, &config) {
-        Ok(repos) => Response::GlobalStatus { repos },
-        Err(e) => Response::Error {
-            message: format!("database error: {}", e),
-        },
+    let mut result = Vec::with_capacity(repos.len());
+    for tr in repos.values() {
+        let in_repo = load_in_repo_config_for(tr).ok().flatten();
+        let mode = config.resolve_repo_mode(
+            tr.remote_url.as_deref().unwrap_or(""),
+            &tr.repo_id,
+            in_repo.as_ref(),
+        );
+
+        let total = tr.branches.len();
+        let synced = tr.branches.values()
+            .filter(|b| b.sync_status == "synced" || b.sync_status == "up_to_date")
+            .count();
+        let diverged = tr.branches.values()
+            .filter(|b| b.sync_status == "diverged")
+            .count();
+
+        let disabled = config.is_repo_disabled(&tr.repo_id);
+        let status_summary = if disabled {
+            "disabled".to_string()
+        } else if diverged > 0 {
+            format!("{}/{} diverged", diverged, total)
+        } else {
+            format!("{} synced", synced)
+        };
+
+        result.push(RepoStatusData {
+            display_path: tr.display_path.clone(),
+            mode: mode.to_string(),
+            status_summary,
+            last_sync: tr.last_sync_wall.clone(),
+        });
     }
+
+    Response::GlobalStatus { repos: result }
 }
 
 async fn handle_sync(
@@ -384,7 +455,6 @@ async fn handle_sync(
     all: bool,
 ) -> Response {
     if all {
-        // Reset last_sync on all repos to force immediate re-sync
         let mut repos = daemon.repos.write().await;
         for tr in repos.values_mut() {
             tr.sync_reason = Some("cli sync requested (all repos)".into());
@@ -450,27 +520,35 @@ async fn handle_register(daemon: &SharedDaemon, repo_path: &str) -> Response {
         .ok()
         .flatten();
 
-    // Upsert into DB
+    // Write to config.toml if not already present
     {
-        let db = daemon.db.lock().await;
-        if let Err(e) = db.upsert_repo(&repo_id_str, &display_path, remote_url.as_deref()) {
-            return Response::Error {
-                message: format!("database error: {}", e),
-            };
+        let _lock = daemon.config_write_lock.lock().await;
+        let mut cfg = match UserConfig::load() {
+            Ok(c) => c,
+            Err(e) => {
+                return Response::Error {
+                    message: format!("failed to load config: {}", e),
+                };
+            }
+        };
+        if !cfg.repos.contains_key(&repo_id_str) {
+            cfg.repos.insert(repo_id_str.clone(), Default::default());
+            if let Err(e) = cfg.save() {
+                return Response::Error {
+                    message: format!("failed to save config: {}", e),
+                };
+            }
         }
+        // Reload config into daemon
+        let mut config = daemon.config.write().await;
+        *config = cfg;
     }
 
     // Add to in-memory tracking
     {
         let mut repos = daemon.repos.write().await;
-        repos.entry(repo_id_str.clone()).or_insert_with(|| TrackedRepo {
-            repo_id: repo_id_str.clone(),
-            display_path: display_path.clone(),
-            remote_url: remote_url.clone(),
-            last_sync: None,
-            sync_reason: None,
-            in_sync: false,
-            backoff: BackoffState::new(),
+        repos.entry(repo_id_str.clone()).or_insert_with(|| {
+            TrackedRepo::new(repo_id_str.clone(), display_path.clone(), remote_url)
         });
     }
 
@@ -492,17 +570,44 @@ async fn handle_enable(daemon: &SharedDaemon, repo_path: &str) -> Response {
     match resolve_repo_id_from_path(repo_path) {
         Ok(repo_id) => {
             let repo_id_str = repo_id.to_string_lossy().to_string();
-            let db = daemon.db.lock().await;
-            match db.set_repo_status(&repo_id_str, "active") {
-                Ok(()) => {
-                    info!("enabled repo: {}", repo_path);
-                    Response::Ok {
-                        message: format!("enabled {}", repo_path),
+
+            // Update config.toml
+            {
+                let _lock = daemon.config_write_lock.lock().await;
+                let mut cfg = match UserConfig::load() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Response::Error {
+                            message: format!("failed to load config: {}", e),
+                        };
                     }
+                };
+                let entry = cfg.repos.entry(repo_id_str.clone()).or_default();
+                entry.disabled = Some(false);
+                if let Err(e) = cfg.save() {
+                    return Response::Error {
+                        message: format!("failed to save config: {}", e),
+                    };
                 }
-                Err(e) => Response::Error {
-                    message: format!("database error: {}", e),
-                },
+                let mut config = daemon.config.write().await;
+                *config = cfg;
+            }
+
+            // Add to in-memory tracking if not present
+            {
+                let display_path = git_ops::get_display_path(&repo_id)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| repo_path.to_string());
+                let remote_url = git_ops::get_remote_url(&repo_id).ok().flatten();
+                let mut repos = daemon.repos.write().await;
+                repos.entry(repo_id_str.clone()).or_insert_with(|| {
+                    TrackedRepo::new(repo_id_str.clone(), display_path, remote_url)
+                });
+            }
+
+            info!("enabled repo: {}", repo_path);
+            Response::Ok {
+                message: format!("enabled {}", repo_path),
             }
         }
         Err(e) => Response::Error {
@@ -515,33 +620,45 @@ async fn handle_disable(daemon: &SharedDaemon, repo_path: &str, purge: bool) -> 
     match resolve_repo_id_from_path(repo_path) {
         Ok(repo_id) => {
             let repo_id_str = repo_id.to_string_lossy().to_string();
-            let db = daemon.db.lock().await;
-            if purge {
-                match db.remove_repo(&repo_id_str) {
-                    Ok(()) => {
-                        drop(db);
-                        let mut repos = daemon.repos.write().await;
-                        repos.remove(&repo_id_str);
-                        info!("purged repo: {}", repo_path);
-                        Response::Ok {
-                            message: format!("purged {}", repo_path),
-                        }
+
+            // Update config.toml
+            {
+                let _lock = daemon.config_write_lock.lock().await;
+                let mut cfg = match UserConfig::load() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return Response::Error {
+                            message: format!("failed to load config: {}", e),
+                        };
                     }
-                    Err(e) => Response::Error {
-                        message: format!("database error: {}", e),
-                    },
+                };
+                if purge {
+                    cfg.repos.remove(&repo_id_str);
+                } else {
+                    let entry = cfg.repos.entry(repo_id_str.clone()).or_default();
+                    entry.disabled = Some(true);
+                }
+                if let Err(e) = cfg.save() {
+                    return Response::Error {
+                        message: format!("failed to save config: {}", e),
+                    };
+                }
+                let mut config = daemon.config.write().await;
+                *config = cfg;
+            }
+
+            // Remove from in-memory tracking
+            if purge {
+                let mut repos = daemon.repos.write().await;
+                repos.remove(&repo_id_str);
+                info!("purged repo: {}", repo_path);
+                Response::Ok {
+                    message: format!("purged {}", repo_path),
                 }
             } else {
-                match db.set_repo_status(&repo_id_str, "disabled") {
-                    Ok(()) => {
-                        info!("disabled repo: {}", repo_path);
-                        Response::Ok {
-                            message: format!("disabled {}", repo_path),
-                        }
-                    }
-                    Err(e) => Response::Error {
-                        message: format!("database error: {}", e),
-                    },
+                info!("disabled repo: {}", repo_path);
+                Response::Ok {
+                    message: format!("disabled {}", repo_path),
                 }
             }
         }
@@ -554,6 +671,36 @@ async fn handle_disable(daemon: &SharedDaemon, repo_path: &str, purge: bool) -> 
 async fn handle_config_update(daemon: &SharedDaemon) -> Response {
     match UserConfig::load() {
         Ok(new_config) => {
+            // Sync in-memory repos with new config
+            {
+                let mut repos = daemon.repos.write().await;
+                // Add new repos from config
+                for (repo_path, repo_cfg) in &new_config.repos {
+                    if repo_cfg.disabled == Some(true) {
+                        continue;
+                    }
+                    if !repos.contains_key(repo_path) {
+                        let repo_id_path = PathBuf::from(repo_path);
+                        let display_path = git_ops::get_display_path(&repo_id_path)
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| repo_path.clone());
+                        let remote_url = git_ops::get_remote_url(&repo_id_path).ok().flatten();
+                        repos.insert(
+                            repo_path.clone(),
+                            TrackedRepo::new(repo_path.clone(), display_path, remote_url),
+                        );
+                    }
+                }
+                // Remove repos no longer in config
+                let to_remove: Vec<String> = repos.keys()
+                    .filter(|id| !new_config.repos.contains_key(*id))
+                    .cloned()
+                    .collect();
+                for id in to_remove {
+                    repos.remove(&id);
+                }
+            }
+
             let mut config = daemon.config.write().await;
             *config = new_config;
             info!("config reloaded from disk");
@@ -611,11 +758,57 @@ async fn handle_log(
 }
 
 // ---------------------------------------------------------------------------
+// Status building (from in-memory state)
+// ---------------------------------------------------------------------------
+
+fn build_status_data(tr: &TrackedRepo, config: &UserConfig) -> StatusData {
+    let repo_id_path = PathBuf::from(&tr.repo_id);
+    let in_repo = load_in_repo_config_for(tr).ok().flatten();
+    let mode = config.resolve_repo_mode(
+        tr.remote_url.as_deref().unwrap_or(""),
+        &tr.repo_id,
+        in_repo.as_ref(),
+    );
+
+    // Look up upstream names from git2
+    let git_branches = git_ops::list_branches(&repo_id_path).unwrap_or_default();
+    let upstream_map: HashMap<&str, &str> = git_branches
+        .iter()
+        .filter_map(|b| b.upstream_name.as_deref().map(|u| (b.name.as_str(), u)))
+        .collect();
+
+    let branches = tr.branches.iter()
+        .map(|(name, bs)| BranchStatusData {
+            name: name.clone(),
+            upstream: upstream_map.get(name.as_str()).map(|s| s.to_string()),
+            status: bs.sync_status.clone(),
+            last_action: bs.last_pull_at.as_ref()
+                .or(bs.last_push_at.as_ref())
+                .cloned(),
+        })
+        .collect();
+
+    StatusData {
+        repo_id: tr.repo_id.clone(),
+        display_path: tr.display_path.clone(),
+        mode: mode.to_string(),
+        last_sync: tr.last_sync_wall.clone(),
+        branches,
+    }
+}
+
+fn load_in_repo_config_for(tr: &TrackedRepo) -> Result<Option<crate::config::InRepoConfig>> {
+    let repo_id_path = PathBuf::from(&tr.repo_id);
+    let display_path = git_ops::get_display_path(&repo_id_path)?;
+    crate::config::InRepoConfig::load(&display_path)
+}
+
+// ---------------------------------------------------------------------------
 // Sync loop
 // ---------------------------------------------------------------------------
 
 async fn sync_loop(daemon: SharedDaemon, mut shutdown_rx: watch::Receiver<bool>) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -645,6 +838,11 @@ async fn sync_loop(daemon: SharedDaemon, mut shutdown_rx: watch::Receiver<bool>)
 
             for (repo_id, tracked) in repos.iter() {
                 if tracked.in_sync {
+                    continue;
+                }
+
+                // Skip disabled repos
+                if config.is_repo_disabled(repo_id) {
                     continue;
                 }
 
@@ -715,36 +913,12 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
     // 1. Check repo exists
     if !repo_path.exists() {
         warn!("repo path missing: {}", repo_label);
-        let db = daemon.db.lock().await;
-        db.set_repo_missing(repo_id)?;
-        drop(db);
         // Update last_sync so we don't hammer every second
         let mut repos = daemon.repos.write().await;
         if let Some(tr) = repos.get_mut(repo_id) {
             tr.last_sync = Some(Instant::now());
         }
         return Ok(());
-    }
-
-    // Check repo is active (not disabled/missing)
-    {
-        let db = daemon.db.lock().await;
-        if let Some(rs) = db.get_repo(repo_id)? {
-            if rs.status == "disabled" {
-                // Update last_sync to avoid rechecking every second
-                drop(db);
-                let mut repos = daemon.repos.write().await;
-                if let Some(tr) = repos.get_mut(repo_id) {
-                    tr.last_sync = Some(Instant::now());
-                }
-                return Ok(());
-            }
-            // If it was marked missing but now exists, restore to active
-            if rs.status == "missing" {
-                db.set_repo_status(repo_id, "active")?;
-                info!("repo restored (was missing): {}", repo_label);
-            }
-        }
     }
 
     // 2. Check for in-progress operations
@@ -759,6 +933,16 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
 
     // Load config and determine modes
     let config = daemon.config.read().await;
+
+    // Skip disabled repos
+    if config.is_repo_disabled(repo_id) {
+        let mut repos = daemon.repos.write().await;
+        if let Some(tr) = repos.get_mut(repo_id) {
+            tr.last_sync = Some(Instant::now());
+        }
+        return Ok(());
+    }
+
     let remote_url = {
         let repos = daemon.repos.read().await;
         repos
@@ -767,7 +951,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
             .unwrap_or_default()
     };
 
-    let in_repo_config = crate::queries::load_in_repo_config(&repo_path).ok().flatten();
+    let in_repo_config = {
+        let repo_id_path = PathBuf::from(repo_id);
+        let display_path = git_ops::get_display_path(&repo_id_path)?;
+        crate::config::InRepoConfig::load(&display_path).ok().flatten()
+    };
     let repo_mode = config.resolve_repo_mode(
         &remote_url,
         repo_id,
@@ -793,23 +981,6 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         .unwrap_or_default();
     let occupancy = git_ops::branch_occupancy(&repo_path)
         .unwrap_or_default();
-
-    // Persist worktree state
-    {
-        let db = daemon.db.lock().await;
-        let now = chrono::Utc::now().to_rfc3339();
-        for wt in &worktrees {
-            let wt_state = WorktreeState {
-                path: wt.path.clone(),
-                current_head: wt.head_branch.clone(),
-                is_clean: wt.is_clean,
-                last_seen: now.clone(),
-            };
-            let _ = db.upsert_worktree(repo_id, &wt_state);
-        }
-        let current_paths: Vec<&str> = worktrees.iter().map(|wt| wt.path.as_str()).collect();
-        let _ = db.remove_stale_worktrees(repo_id, &current_paths);
-    }
 
     // 4. List branches (needed to determine remotes for fetch)
     let branches = git_ops::list_branches(&repo_path).unwrap_or_default();
@@ -866,9 +1037,6 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 if let Some(tr) = repos.get_mut(repo_id) {
                     tr.backoff.reset_fetch_backoff();
                 }
-                drop(repos);
-                let db = daemon.db.lock().await;
-                let _ = db.update_repo_fetch_time(repo_id);
             } else {
                 let mut repos = daemon.repos.write().await;
                 if let Some(tr) = repos.get_mut(repo_id) {
@@ -925,58 +1093,49 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
             // 5b. Upstream gone
             MergeAnalysis::UpstreamGone => {
                 info!("upstream gone for {}:{}", repo_label, branch.name);
-                let db = daemon.db.lock().await;
-                let _ = db.upsert_branch(
-                    repo_id,
-                    &BranchState {
-                        branch_name: branch.name.clone(),
+                let mut repos = daemon.repos.write().await;
+                if let Some(tr) = repos.get_mut(repo_id) {
+                    tr.set_branch(&branch.name, BranchRuntimeState {
                         sync_status: "upstream_gone".into(),
                         last_pull_at: None,
                         last_push_at: None,
                         local_oid: Some(branch.local_oid.clone()),
                         remote_oid: None,
                         error_message: Some("upstream ref deleted".into()),
-                        push_backoff_until: None,
-                    },
-                );
+                    });
+                }
             }
 
             // 5c. Up to date
             MergeAnalysis::UpToDate => {
-                let db = daemon.db.lock().await;
-                let _ = db.upsert_branch(
-                    repo_id,
-                    &BranchState {
-                        branch_name: branch.name.clone(),
+                let mut repos = daemon.repos.write().await;
+                if let Some(tr) = repos.get_mut(repo_id) {
+                    tr.set_branch(&branch.name, BranchRuntimeState {
                         sync_status: "synced".into(),
                         last_pull_at: None,
                         last_push_at: None,
                         local_oid: Some(branch.local_oid.clone()),
                         remote_oid: branch.remote_oid.clone(),
                         error_message: None,
-                        push_backoff_until: None,
-                    },
-                );
+                    });
+                }
             }
 
             // 5d. Remote ahead (fast-forward possible)
             MergeAnalysis::FastForward => {
                 if !allows_pull {
                     // Mode doesn't allow pulling — just record state
-                    let db = daemon.db.lock().await;
-                    let _ = db.upsert_branch(
-                        repo_id,
-                        &BranchState {
-                            branch_name: branch.name.clone(),
+                    let mut repos = daemon.repos.write().await;
+                    if let Some(tr) = repos.get_mut(repo_id) {
+                        tr.set_branch(&branch.name, BranchRuntimeState {
                             sync_status: "remote_ahead".into(),
                             last_pull_at: None,
                             last_push_at: None,
                             local_oid: Some(branch.local_oid.clone()),
                             remote_oid: branch.remote_oid.clone(),
                             error_message: None,
-                            push_backoff_until: None,
-                        },
-                    );
+                        });
+                    }
                     continue;
                 }
 
@@ -996,20 +1155,17 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                             "skipping ff for {}:{} — worktree dirty",
                             repo_label, branch.name
                         );
-                        let db = daemon.db.lock().await;
-                        let _ = db.upsert_branch(
-                            repo_id,
-                            &BranchState {
-                                branch_name: branch.name.clone(),
+                        let mut repos = daemon.repos.write().await;
+                        if let Some(tr) = repos.get_mut(repo_id) {
+                            tr.set_branch(&branch.name, BranchRuntimeState {
                                 sync_status: "pending_ff_dirty".into(),
                                 last_pull_at: None,
                                 last_push_at: None,
                                 local_oid: Some(branch.local_oid.clone()),
                                 remote_oid: Some(remote_oid),
                                 error_message: Some("worktree dirty, ff pending".into()),
-                                push_backoff_until: None,
-                            },
-                        );
+                            });
+                        }
                         continue;
                     }
 
@@ -1026,40 +1182,34 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                             had_activity = true;
                             info!("ff-merged {}:{}", repo_label, branch.name);
                             let now = chrono::Utc::now().to_rfc3339();
-                            let db = daemon.db.lock().await;
-                            let _ = db.upsert_branch(
-                                repo_id,
-                                &BranchState {
-                                    branch_name: branch.name.clone(),
+                            let mut repos = daemon.repos.write().await;
+                            if let Some(tr) = repos.get_mut(repo_id) {
+                                tr.set_branch(&branch.name, BranchRuntimeState {
                                     sync_status: "synced".into(),
                                     last_pull_at: Some(now),
                                     last_push_at: None,
                                     local_oid: Some(remote_oid.clone()),
                                     remote_oid: Some(remote_oid),
                                     error_message: None,
-                                    push_backoff_until: None,
-                                },
-                            );
+                                });
+                            }
                         }
                         Err(e) => {
                             warn!(
                                 "ff-merge failed for {}:{}: {:#}",
                                 repo_label, branch.name, e
                             );
-                            let db = daemon.db.lock().await;
-                            let _ = db.upsert_branch(
-                                repo_id,
-                                &BranchState {
-                                    branch_name: branch.name.clone(),
+                            let mut repos = daemon.repos.write().await;
+                            if let Some(tr) = repos.get_mut(repo_id) {
+                                tr.set_branch(&branch.name, BranchRuntimeState {
                                     sync_status: "error".into(),
                                     last_pull_at: None,
                                     last_push_at: None,
                                     local_oid: Some(branch.local_oid.clone()),
                                     remote_oid: Some(remote_oid),
                                     error_message: Some(format!("{:#}", e)),
-                                    push_backoff_until: None,
-                                },
-                            );
+                                });
+                            }
                         }
                     }
                 } else {
@@ -1077,20 +1227,17 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                             had_activity = true;
                             info!("update-ref {}:{}", repo_label, branch.name);
                             let now = chrono::Utc::now().to_rfc3339();
-                            let db = daemon.db.lock().await;
-                            let _ = db.upsert_branch(
-                                repo_id,
-                                &BranchState {
-                                    branch_name: branch.name.clone(),
+                            let mut repos = daemon.repos.write().await;
+                            if let Some(tr) = repos.get_mut(repo_id) {
+                                tr.set_branch(&branch.name, BranchRuntimeState {
                                     sync_status: "synced".into(),
                                     last_pull_at: Some(now),
                                     last_push_at: None,
                                     local_oid: Some(remote_oid.clone()),
                                     remote_oid: Some(remote_oid),
                                     error_message: None,
-                                    push_backoff_until: None,
-                                },
-                            );
+                                });
+                            }
                         }
                         Err(e) => {
                             warn!(
@@ -1106,20 +1253,17 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
             // 5e. Local ahead — push
             MergeAnalysis::LocalAhead => {
                 if !allows_push {
-                    let db = daemon.db.lock().await;
-                    let _ = db.upsert_branch(
-                        repo_id,
-                        &BranchState {
-                            branch_name: branch.name.clone(),
+                    let mut repos = daemon.repos.write().await;
+                    if let Some(tr) = repos.get_mut(repo_id) {
+                        tr.set_branch(&branch.name, BranchRuntimeState {
                             sync_status: "local_ahead".into(),
                             last_pull_at: None,
                             last_push_at: None,
                             local_oid: Some(branch.local_oid.clone()),
                             remote_oid: branch.remote_oid.clone(),
                             error_message: None,
-                            push_backoff_until: None,
-                        },
-                    );
+                        });
+                    }
                     continue;
                 }
 
@@ -1157,111 +1301,75 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.reset_push_backoff(&ref_name);
-                        }
-                        drop(repos);
-                        let db = daemon.db.lock().await;
-                        let _ = db.upsert_branch(
-                            repo_id,
-                            &BranchState {
-                                branch_name: branch.name.clone(),
+                            tr.set_branch(&branch.name, BranchRuntimeState {
                                 sync_status: "synced".into(),
                                 last_pull_at: None,
                                 last_push_at: Some(now),
                                 local_oid: Some(branch.local_oid.clone()),
                                 remote_oid: Some(branch.local_oid.clone()),
                                 error_message: None,
-                                push_backoff_until: None,
-                            },
-                        );
+                            });
+                        }
                     }
                     Ok(PushResult::Rejected(msg)) => {
                         warn!("push rejected for {}:{}: {}", repo_label, branch.name, msg);
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_push_failure(&ref_name);
-                        }
-                        drop(repos);
-                        let db = daemon.db.lock().await;
-                        let _ = db.upsert_branch(
-                            repo_id,
-                            &BranchState {
-                                branch_name: branch.name.clone(),
+                            tr.set_branch(&branch.name, BranchRuntimeState {
                                 sync_status: "push_rejected".into(),
                                 last_pull_at: None,
                                 last_push_at: None,
                                 local_oid: Some(branch.local_oid.clone()),
                                 remote_oid: branch.remote_oid.clone(),
                                 error_message: Some(msg),
-                                push_backoff_until: None,
-                            },
-                        );
+                            });
+                        }
                     }
                     Ok(PushResult::AuthFailed(msg)) => {
                         warn!("push auth failed for {}:{}: {}", repo_label, branch.name, msg);
-                        // Auth failure is per-remote, record on fetch backoff
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_fetch_failure();
-                        }
-                        drop(repos);
-                        let db = daemon.db.lock().await;
-                        let _ = db.upsert_branch(
-                            repo_id,
-                            &BranchState {
-                                branch_name: branch.name.clone(),
+                            tr.set_branch(&branch.name, BranchRuntimeState {
                                 sync_status: "auth_failed".into(),
                                 last_pull_at: None,
                                 last_push_at: None,
                                 local_oid: Some(branch.local_oid.clone()),
                                 remote_oid: branch.remote_oid.clone(),
                                 error_message: Some(msg),
-                                push_backoff_until: None,
-                            },
-                        );
+                            });
+                        }
                     }
                     Ok(PushResult::NetworkError(msg)) => {
                         warn!("push network error for {}:{}: {}", repo_label, branch.name, msg);
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_fetch_failure();
-                        }
-                        drop(repos);
-                        let db = daemon.db.lock().await;
-                        let _ = db.upsert_branch(
-                            repo_id,
-                            &BranchState {
-                                branch_name: branch.name.clone(),
+                            tr.set_branch(&branch.name, BranchRuntimeState {
                                 sync_status: "network_error".into(),
                                 last_pull_at: None,
                                 last_push_at: None,
                                 local_oid: Some(branch.local_oid.clone()),
                                 remote_oid: branch.remote_oid.clone(),
                                 error_message: Some(msg),
-                                push_backoff_until: None,
-                            },
-                        );
+                            });
+                        }
                     }
                     Ok(PushResult::HookTimeout) => {
                         warn!("push hook timeout for {}:{}", repo_label, branch.name);
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_push_failure(&ref_name);
-                        }
-                        drop(repos);
-                        let db = daemon.db.lock().await;
-                        let _ = db.upsert_branch(
-                            repo_id,
-                            &BranchState {
-                                branch_name: branch.name.clone(),
+                            tr.set_branch(&branch.name, BranchRuntimeState {
                                 sync_status: "push_blocked_hook_timeout".into(),
                                 last_pull_at: None,
                                 last_push_at: None,
                                 local_oid: Some(branch.local_oid.clone()),
                                 remote_oid: branch.remote_oid.clone(),
                                 error_message: Some("push hook timed out".into()),
-                                push_backoff_until: None,
-                            },
-                        );
+                            });
+                        }
                     }
                     Err(e) => {
                         error!("push error for {}:{}: {:#}", repo_label, branch.name, e);
@@ -1272,34 +1380,29 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
             // 5f. Diverged
             MergeAnalysis::Diverged => {
                 warn!("diverged: {}:{}", repo_label, branch.name);
-                let db = daemon.db.lock().await;
-                let _ = db.upsert_branch(
-                    repo_id,
-                    &BranchState {
-                        branch_name: branch.name.clone(),
+                let mut repos = daemon.repos.write().await;
+                if let Some(tr) = repos.get_mut(repo_id) {
+                    tr.set_branch(&branch.name, BranchRuntimeState {
                         sync_status: "diverged".into(),
                         last_pull_at: None,
                         last_push_at: None,
                         local_oid: Some(branch.local_oid.clone()),
                         remote_oid: branch.remote_oid.clone(),
                         error_message: Some("branch has diverged, ff not possible".into()),
-                        push_backoff_until: None,
-                    },
-                );
+                    });
+                }
             }
         }
     }
 
     // 6. Update sync timestamp
-    {
-        let db = daemon.db.lock().await;
-        let _ = db.update_repo_sync_time(repo_id);
-    }
+    let now_wall = chrono::Utc::now().to_rfc3339();
     let reason = {
         let mut repos = daemon.repos.write().await;
         let reason = repos.get(repo_id).and_then(|tr| tr.sync_reason.clone());
         if let Some(tr) = repos.get_mut(repo_id) {
             tr.last_sync = Some(Instant::now());
+            tr.last_sync_wall = Some(now_wall);
             tr.sync_reason = None;
         }
         reason

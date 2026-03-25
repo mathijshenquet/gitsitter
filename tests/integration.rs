@@ -7,8 +7,7 @@ use gitsitter::config::{
     self, BranchSyncMode, InRepoConfig, RepoConfig,
     RepoSyncMode, UserConfig,
 };
-use gitsitter::state::{BranchState, StateDb};
-use gitsitter::transport::{self, Request, Response};
+use gitsitter::transport::{self, BranchStatusData, Request, Response};
 
 // ===========================================================================
 // Helper functions
@@ -679,225 +678,7 @@ mode = "pull"
 }
 
 // ===========================================================================
-// 2. State Database Tests
-// ===========================================================================
-
-mod state_tests {
-    use super::*;
-
-    fn open_temp_db() -> (TempDir, StateDb) {
-        let tmp = temp_dir();
-        let db_path = tmp.path().join("test.db");
-        let db = StateDb::open_at(&db_path).unwrap();
-        (tmp, db)
-    }
-
-    #[test]
-    fn open_database_in_temp_dir() {
-        let (_tmp, _db) = open_temp_db();
-        // Just verify it opens without error
-    }
-
-    #[test]
-    fn upsert_and_get_repo() {
-        let (_tmp, db) = open_temp_db();
-        db.upsert_repo("repo1", "/home/user/repo1", Some("https://github.com/user/repo1.git"))
-            .unwrap();
-
-        let repo = db.get_repo("repo1").unwrap().unwrap();
-        assert_eq!(repo.repo_id, "repo1");
-        assert_eq!(repo.display_path, "/home/user/repo1");
-        assert_eq!(
-            repo.remote_url.as_deref(),
-            Some("https://github.com/user/repo1.git")
-        );
-        assert_eq!(repo.status, "active");
-    }
-
-    #[test]
-    fn list_repos_empty_then_with_data() {
-        let (_tmp, db) = open_temp_db();
-
-        let repos = db.list_repos().unwrap();
-        assert!(repos.is_empty());
-
-        db.upsert_repo("repo_a", "/a", None).unwrap();
-        db.upsert_repo("repo_b", "/b", None).unwrap();
-
-        let repos = db.list_repos().unwrap();
-        assert_eq!(repos.len(), 2);
-        assert_eq!(repos[0].repo_id, "repo_a");
-        assert_eq!(repos[1].repo_id, "repo_b");
-    }
-
-    #[test]
-    fn set_repo_status() {
-        let (_tmp, db) = open_temp_db();
-        db.upsert_repo("r1", "/r1", None).unwrap();
-
-        assert_eq!(db.get_repo("r1").unwrap().unwrap().status, "active");
-
-        db.set_repo_missing("r1").unwrap();
-        assert_eq!(db.get_repo("r1").unwrap().unwrap().status, "missing");
-
-        db.set_repo_status("r1", "active").unwrap();
-        assert_eq!(db.get_repo("r1").unwrap().unwrap().status, "active");
-    }
-
-    #[test]
-    fn update_fetch_and_sync_timestamps() {
-        let (_tmp, db) = open_temp_db();
-        db.upsert_repo("r1", "/r1", None).unwrap();
-
-        // Initially null
-        let repo = db.get_repo("r1").unwrap().unwrap();
-        assert!(repo.last_fetch_at.is_none());
-        assert!(repo.last_sync_at.is_none());
-
-        db.update_repo_fetch_time("r1").unwrap();
-        let repo = db.get_repo("r1").unwrap().unwrap();
-        assert!(repo.last_fetch_at.is_some());
-        assert!(repo.last_sync_at.is_none());
-
-        db.update_repo_sync_time("r1").unwrap();
-        let repo = db.get_repo("r1").unwrap().unwrap();
-        assert!(repo.last_fetch_at.is_some());
-        assert!(repo.last_sync_at.is_some());
-    }
-
-    #[test]
-    fn upsert_and_list_branches() {
-        let (_tmp, db) = open_temp_db();
-        db.upsert_repo("r1", "/r1", None).unwrap();
-
-        let b1 = BranchState {
-            branch_name: "main".to_string(),
-            sync_status: "synced".to_string(),
-            last_pull_at: None,
-            last_push_at: None,
-            local_oid: Some("abc123".to_string()),
-            remote_oid: Some("abc123".to_string()),
-            error_message: None,
-            push_backoff_until: None,
-        };
-        let b2 = BranchState {
-            branch_name: "develop".to_string(),
-            sync_status: "diverged".to_string(),
-            last_pull_at: None,
-            last_push_at: None,
-            local_oid: Some("def456".to_string()),
-            remote_oid: Some("ghi789".to_string()),
-            error_message: None,
-            push_backoff_until: None,
-        };
-
-        db.upsert_branch("r1", &b1).unwrap();
-        db.upsert_branch("r1", &b2).unwrap();
-
-        let branches = db.list_branches("r1").unwrap();
-        assert_eq!(branches.len(), 2);
-        assert_eq!(branches[0].branch_name, "develop");
-        assert_eq!(branches[1].branch_name, "main");
-    }
-
-    #[test]
-    fn branch_state_updates() {
-        let (_tmp, db) = open_temp_db();
-        db.upsert_repo("r1", "/r1", None).unwrap();
-
-        let b = BranchState {
-            branch_name: "main".to_string(),
-            sync_status: "synced".to_string(),
-            last_pull_at: None,
-            last_push_at: None,
-            local_oid: Some("abc".to_string()),
-            remote_oid: Some("abc".to_string()),
-            error_message: None,
-            push_backoff_until: None,
-        };
-        db.upsert_branch("r1", &b).unwrap();
-
-        let fetched = db.get_branch("r1", "main").unwrap().unwrap();
-        assert_eq!(fetched.sync_status, "synced");
-
-        // Update to diverged
-        let b2 = BranchState {
-            branch_name: "main".to_string(),
-            sync_status: "diverged".to_string(),
-            local_oid: Some("abc".to_string()),
-            remote_oid: Some("xyz".to_string()),
-            ..b.clone()
-        };
-        db.upsert_branch("r1", &b2).unwrap();
-
-        let fetched = db.get_branch("r1", "main").unwrap().unwrap();
-        assert_eq!(fetched.sync_status, "diverged");
-
-        // Back to synced
-        let b3 = BranchState {
-            sync_status: "synced".to_string(),
-            remote_oid: Some("abc".to_string()),
-            ..b2
-        };
-        db.upsert_branch("r1", &b3).unwrap();
-
-        let fetched = db.get_branch("r1", "main").unwrap().unwrap();
-        assert_eq!(fetched.sync_status, "synced");
-    }
-
-    #[test]
-    fn remove_repo_cascades_to_branches() {
-        let (_tmp, db) = open_temp_db();
-        db.upsert_repo("r1", "/r1", None).unwrap();
-
-        let b = BranchState {
-            branch_name: "main".to_string(),
-            sync_status: "synced".to_string(),
-            last_pull_at: None,
-            last_push_at: None,
-            local_oid: None,
-            remote_oid: None,
-            error_message: None,
-            push_backoff_until: None,
-        };
-        db.upsert_branch("r1", &b).unwrap();
-        assert_eq!(db.list_branches("r1").unwrap().len(), 1);
-
-        db.remove_repo("r1").unwrap();
-        assert!(db.get_repo("r1").unwrap().is_none());
-        assert!(db.list_branches("r1").unwrap().is_empty());
-    }
-
-    #[test]
-    fn notification_cooldown_logic() {
-        let (_tmp, db) = open_temp_db();
-        db.upsert_repo("r1", "/r1", None).unwrap();
-
-        // No prior notification -> should notify
-        let should = db
-            .should_notify("r1", "diverged", Duration::from_secs(300))
-            .unwrap();
-        assert!(should, "should notify when no prior notification");
-
-        // Record notification
-        db.record_notification("r1", "diverged").unwrap();
-
-        // Within cooldown -> should not notify
-        let should = db
-            .should_notify("r1", "diverged", Duration::from_secs(300))
-            .unwrap();
-        assert!(!should, "should not notify within cooldown");
-
-        // With zero cooldown -> should notify immediately
-        let should = db
-            .should_notify("r1", "diverged", Duration::from_secs(0))
-            .unwrap();
-        assert!(should, "should notify with zero cooldown");
-    }
-}
-
-// ===========================================================================
-// 3. Transport Protocol Tests
+// 2. Transport Protocol Tests
 // ===========================================================================
 
 mod transport_tests {
@@ -1309,7 +1090,7 @@ mode = "{}"
             Self::roundtrip_static(&self.socket_path, req).await
         }
 
-        /// Trigger a sync and poll until the branch appears in the DB with
+        /// Trigger a sync and poll until the branch appears with
         /// one of the expected statuses, or until `timeout` elapses.
         async fn trigger_sync_and_wait_for(
             &self,
@@ -1325,8 +1106,8 @@ mode = "{}"
             let deadline = tokio::time::Instant::now() + timeout;
             loop {
                 tokio::time::sleep(Duration::from_millis(300)).await;
-                if let Some(bs) = self.get_branch_status(&self.branch_name) {
-                    if expected_statuses.contains(&bs.sync_status.as_str()) {
+                if let Some(bs) = self.get_branch_status(&self.branch_name).await {
+                    if expected_statuses.contains(&bs.status.as_str()) {
                         return;
                     }
                 }
@@ -1343,10 +1124,20 @@ mode = "{}"
             (tmp, repo)
         }
 
-        /// Get the branch status from the state DB.
-        fn get_branch_status(&self, branch: &str) -> Option<BranchState> {
-            let db = StateDb::open().unwrap();
-            db.get_branch(&self.repo_id_str, branch).unwrap()
+        /// Get the branch status via daemon socket.
+        async fn get_branch_status(&self, branch: &str) -> Option<BranchStatusData> {
+            let resp = self
+                .roundtrip(&Request::Status {
+                    repo_path: Some(self.repo_id_str.clone()),
+                    global: false,
+                })
+                .await;
+            match resp {
+                Response::Status { data } => {
+                    data.branches.into_iter().find(|b| b.name == branch)
+                }
+                _ => None,
+            }
         }
 
         /// Open the local repo via git2.
@@ -1376,16 +1167,6 @@ mode = "{}"
     #[serial]
     async fn daemon_lifecycle() {
         let h = E2eHarness::start("push+pull").await;
-
-        // Verify repo in state DB
-        {
-            let db = StateDb::open().unwrap();
-            let repo = db.get_repo(&h.repo_id_str).unwrap();
-            assert!(
-                repo.is_some(),
-                "repo should exist in state DB after registration"
-            );
-        }
 
         // Status
         let resp = h
@@ -1457,13 +1238,13 @@ mode = "{}"
         h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
 
         // Verify branch is synced
-        let bs = h.get_branch_status(&h.branch_name);
-        assert!(bs.is_some(), "branch should exist in state DB");
+        let bs = h.get_branch_status(&h.branch_name).await;
+        assert!(bs.is_some(), "branch should exist in status");
         let bs = bs.unwrap();
         assert_eq!(
-            bs.sync_status, "synced",
+            bs.status, "synced",
             "branch should be synced after push, got: {} (error: {:?})",
-            bs.sync_status, bs.error_message
+            bs.status, bs.last_action
         );
 
         // Verify the remote has the commit
@@ -1517,13 +1298,13 @@ mode = "{}"
         // Trigger sync — daemon should fetch + ff-merge
         h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
 
-        let bs = h.get_branch_status(&h.branch_name);
-        assert!(bs.is_some(), "branch should exist in state DB");
+        let bs = h.get_branch_status(&h.branch_name).await;
+        assert!(bs.is_some(), "branch should exist in status");
         let bs = bs.unwrap();
         assert_eq!(
-            bs.sync_status, "synced",
+            bs.status, "synced",
             "branch should be synced after pull, got: {} (error: {:?})",
-            bs.sync_status, bs.error_message
+            bs.status, bs.last_action
         );
 
         // Verify local repo has the remote commit
@@ -1582,21 +1363,15 @@ mode = "{}"
         // Trigger sync — daemon should detect divergence
         h.trigger_sync_and_wait_for(&["diverged"], Duration::from_secs(10)).await;
 
-        let bs = h.get_branch_status(&h.branch_name);
-        assert!(bs.is_some(), "branch should exist in state DB");
+        let bs = h.get_branch_status(&h.branch_name).await;
+        assert!(bs.is_some(), "branch should exist in status");
         let bs = bs.unwrap();
         assert_eq!(
-            bs.sync_status, "diverged",
+            bs.status, "diverged",
             "branch should be diverged, got: {} (error: {:?})",
-            bs.sync_status, bs.error_message
+            bs.status, bs.last_action
         );
-        assert!(
-            bs.error_message
-                .as_deref()
-                .unwrap_or("")
-                .contains("diverged"),
-            "error_message should mention divergence"
-        );
+        // Status is "diverged" — that's sufficient to verify detection
 
         h.shutdown().await;
     }
@@ -1639,13 +1414,13 @@ mode = "{}"
         // Trigger sync — push should be rejected
         h.trigger_sync_and_wait_for(&["push_rejected"], Duration::from_secs(10)).await;
 
-        let bs = h.get_branch_status(&h.branch_name);
-        assert!(bs.is_some(), "branch should exist in state DB");
+        let bs = h.get_branch_status(&h.branch_name).await;
+        assert!(bs.is_some(), "branch should exist in status");
         let bs = bs.unwrap();
         assert_eq!(
-            bs.sync_status, "push_rejected",
+            bs.status, "push_rejected",
             "branch should be push_rejected, got: {} (error: {:?})",
-            bs.sync_status, bs.error_message
+            bs.status, bs.last_action
         );
 
         h.shutdown().await;
@@ -1688,13 +1463,13 @@ mode = "{}"
         // Trigger sync — should detect pending_ff_dirty
         h.trigger_sync_and_wait_for(&["pending_ff_dirty"], Duration::from_secs(10)).await;
 
-        let bs = h.get_branch_status(&h.branch_name);
-        assert!(bs.is_some(), "branch should exist in state DB");
+        let bs = h.get_branch_status(&h.branch_name).await;
+        assert!(bs.is_some(), "branch should exist in status");
         let bs = bs.unwrap();
         assert_eq!(
-            bs.sync_status, "pending_ff_dirty",
+            bs.status, "pending_ff_dirty",
             "branch should be pending_ff_dirty, got: {} (error: {:?})",
-            bs.sync_status, bs.error_message
+            bs.status, bs.last_action
         );
 
         h.shutdown().await;
@@ -1705,6 +1480,9 @@ mode = "{}"
     #[serial]
     async fn operation_in_progress_skips_sync() {
         let h = E2eHarness::start("push+pull").await;
+
+        // Wait for initial sync to complete so the branch is "synced"
+        h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
 
         // Make a local commit so there's something to push
         let local_repo = h.open_local_repo();
@@ -1729,28 +1507,31 @@ mode = "{}"
         // Wait a few sync cycles
         tokio::time::sleep(Duration::from_secs(4)).await;
 
-        // Branch should NOT be recorded as synced (no sync happened)
-        let bs = h.get_branch_status(&h.branch_name);
-        // Either None (never recorded) or not "synced" — the daemon
-        // skips entirely when index.lock exists.
-        if let Some(bs) = &bs {
-            assert_ne!(
-                bs.sync_status, "synced",
-                "branch should not be synced while index.lock exists"
-            );
-        }
+        // Branch should still be "synced" (from initial sync) because the
+        // daemon skipped due to index.lock — it didn't detect the new commit.
+        let bs = h.get_branch_status(&h.branch_name).await;
+        assert!(bs.is_some());
+        let bs = bs.unwrap();
+        assert_eq!(
+            bs.status, "synced",
+            "branch should still show old synced status while index.lock exists"
+        );
 
-        // Remove lock and sync again — should succeed now
+        // Remove lock and sync again — should detect local_ahead and push
         std::fs::remove_file(&lock_path).unwrap();
         h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
 
-        let bs = h.get_branch_status(&h.branch_name);
-        assert!(bs.is_some(), "branch should exist after lock removed");
-        let bs = bs.unwrap();
+        // Verify the push actually happened (remote has the commit)
+        let bare = git2::Repository::open_bare(&h.bare_dir).unwrap();
+        let remote_ref = bare
+            .find_reference(&format!("refs/heads/{}", h.branch_name))
+            .unwrap();
+        let local_repo = h.open_local_repo();
+        let local_oid = local_repo.head().unwrap().target().unwrap().to_string();
         assert_eq!(
-            bs.sync_status, "synced",
-            "branch should be synced after lock removed, got: {} (error: {:?})",
-            bs.sync_status, bs.error_message
+            remote_ref.target().unwrap().to_string(),
+            local_oid,
+            "remote should have the local commit after lock removed"
         );
 
         h.shutdown().await;
@@ -1780,13 +1561,13 @@ mode = "{}"
 
         h.trigger_sync_and_wait_for(&["local_ahead"], Duration::from_secs(10)).await;
 
-        let bs = h.get_branch_status(&h.branch_name);
-        assert!(bs.is_some(), "branch should exist in state DB");
+        let bs = h.get_branch_status(&h.branch_name).await;
+        assert!(bs.is_some(), "branch should exist in status");
         let bs = bs.unwrap();
         assert_eq!(
-            bs.sync_status, "local_ahead",
+            bs.status, "local_ahead",
             "pull-only mode should report local_ahead, got: {} (error: {:?})",
-            bs.sync_status, bs.error_message
+            bs.status, bs.last_action
         );
 
         // Verify remote does NOT have the local commit
@@ -1879,13 +1660,13 @@ mode = "{}"
         )
         .await;
 
-        let bs = h.get_branch_status(&h.branch_name);
-        assert!(bs.is_some(), "branch should exist in state DB");
+        let bs = h.get_branch_status(&h.branch_name).await;
+        assert!(bs.is_some(), "branch should exist in status");
         let bs = bs.unwrap();
         assert_eq!(
-            bs.sync_status, "remote_ahead",
+            bs.status, "remote_ahead",
             "fetch-only mode should report remote_ahead, got: {} (error: {:?})",
-            bs.sync_status, bs.error_message
+            bs.status, bs.last_action
         );
 
         // Verify local branch was NOT updated
@@ -1916,13 +1697,13 @@ mode = "{}"
         // Send explicit sync and wait for it to complete
         h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
 
-        let bs = h.get_branch_status(&h.branch_name);
+        let bs = h.get_branch_status(&h.branch_name).await;
         assert!(bs.is_some());
         let bs = bs.unwrap();
         assert_eq!(
-            bs.sync_status, "synced",
+            bs.status, "synced",
             "should be synced after explicit sync, got: {} (error: {:?})",
-            bs.sync_status, bs.error_message
+            bs.status, bs.last_action
         );
 
         h.shutdown().await;

@@ -1,19 +1,16 @@
 //! CLI command handlers.
 //!
 //! Each function corresponds to a CLI subcommand. They connect to the daemon
-//! via the local IPC transport, send a request, and print the response. When the daemon is
-//! down, some commands fall back to reading directly from SQLite/TOML.
+//! via Unix socket, send a request, and print the response.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::config::{self, RepoSyncMode, UserConfig};
 use crate::git_ops;
 use crate::paths;
-use crate::state::StateDb;
 use crate::transport::{
     self, connect_to_daemon, Request, Response,
 };
@@ -93,7 +90,7 @@ fn resolve_path_or_cwd(path: Option<&str>) -> Result<String> {
 }
 
 /// Send a request and receive a single response over a connected stream.
-async fn roundtrip<S: AsyncRead + AsyncWrite + Unpin>(
+async fn roundtrip<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: &mut S,
     req: &Request,
 ) -> Result<Response> {
@@ -131,7 +128,6 @@ fn status_label(status: &str) -> &'static str {
 // ---------------------------------------------------------------------------
 
 pub async fn handle_status(global: bool) -> Result<()> {
-    // Try daemon first
     match connect_to_daemon().await {
         Ok(mut stream) => {
             let repo_path = if global {
@@ -176,10 +172,8 @@ pub async fn handle_status(global: bool) -> Result<()> {
             }
         }
         Err(_) => {
-            // Daemon not running -- fall back to SQLite
-            eprintln!("warning: daemon not running, showing cached state");
-            eprintln!();
-            fallback_status(global)?;
+            eprintln!("daemon not running. Start it with `gitsitter daemon start`");
+            std::process::exit(1);
         }
     }
     Ok(())
@@ -214,42 +208,6 @@ fn print_repo_status(data: &transport::StatusData) {
     }
 }
 
-fn fallback_status(global: bool) -> Result<()> {
-    let db = StateDb::open()?;
-    let config = config::UserConfig::load()?;
-
-    if global {
-        let repos = crate::queries::build_global_status(&db, &config)?;
-        if repos.is_empty() {
-            println!("No repos registered.");
-            return Ok(());
-        }
-        for r in &repos {
-            let dp = display_path(&r.display_path);
-            let sync_info = match &r.last_sync {
-                Some(ts) => format!("synced {}", format_relative_time(ts)),
-                None => "never synced".to_string(),
-            };
-            println!(
-                "\u{1F4E6} {}  ({}, {})",
-                dp, r.mode, sync_info
-            );
-            println!("    {}", r.status_summary);
-            println!();
-        }
-    } else {
-        let repo_path = resolve_cwd_repo_path()?;
-        match crate::queries::build_repo_status(&db, &config, &repo_path) {
-            Ok(data) => print_repo_status(&data),
-            Err(_) => {
-                println!("This repo is not registered with gitsitter.");
-                println!("Run `gitsitter enable` or `gitsitter register` to add it.");
-            }
-        }
-    }
-    Ok(())
-}
-
 pub async fn handle_config(
     global: bool,
     repo: Option<String>,
@@ -266,7 +224,6 @@ pub async fn handle_config(
 
         // Try daemon
         if let Ok(mut stream) = connect_to_daemon().await {
-            // Send the config update, daemon will re-read TOML
             // But first write the TOML change locally
             write_config_change(&repo_path, repo.as_deref(), branch.as_deref())?;
             let req = Request::ConfigUpdate {
@@ -313,8 +270,6 @@ fn write_config_change(
         let branch_mode: config::BranchSyncMode =
             serde_json::from_value(serde_json::Value::String(mode_str.to_string()))
                 .with_context(|| format!("invalid branch sync mode: {}", mode_str))?;
-        // Parse "branch_name=mode" or just set default
-        // For now, we expect --branch to be a mode that applies to the current branch
         let cwd = std::env::current_dir()?;
         let repo_id_path = git_ops::discover_repo_id(&cwd)?;
         let repo = git2::Repository::open(&repo_id_path)?;
@@ -435,7 +390,9 @@ async fn handle_config_explain() -> Result<()> {
     let repo_id_path = PathBuf::from(&repo_path);
     let remote_url = git_ops::get_remote_url(&repo_id_path)?
         .unwrap_or_default();
-    let in_repo = crate::queries::load_in_repo_config(&repo_id_path)?;
+    let in_repo = crate::config::InRepoConfig::load(
+        &git_ops::get_display_path(&repo_id_path)?,
+    )?;
 
     let repo_mode = cfg.resolve_repo_mode(
         &remote_url,
@@ -549,11 +506,10 @@ pub async fn handle_enable(path: Option<String>) -> Result<()> {
             }
         }
         Err(_) => {
-            // Direct TOML edit: remove disabled flag if present
+            // Direct TOML edit
             let mut cfg = UserConfig::load()?;
-            if let Some(repo_cfg) = cfg.repos.get_mut(&repo_id_str) {
-                repo_cfg.disabled = Some(false);
-            }
+            let entry = cfg.repos.entry(repo_id_str.clone()).or_default();
+            entry.disabled = Some(false);
             cfg.save()?;
 
             let dp = display_path(&repo_id_str);
@@ -583,16 +539,13 @@ pub async fn handle_disable(path: Option<String>, purge: bool) -> Result<()> {
         }
         Err(_) => {
             let mut cfg = UserConfig::load()?;
-            let entry = cfg.repos.entry(repo_id_str.clone()).or_default();
-            entry.disabled = Some(true);
-            cfg.save()?;
-
             if purge {
-                // Remove from state DB too
-                if let Ok(db) = StateDb::open() {
-                    let _ = db.remove_repo(&repo_id_str);
-                }
+                cfg.repos.remove(&repo_id_str);
+            } else {
+                let entry = cfg.repos.entry(repo_id_str.clone()).or_default();
+                entry.disabled = Some(true);
             }
+            cfg.save()?;
 
             let dp = display_path(&repo_id_str);
             println!("Disabled {} (daemon not running, change saved to config)", dp);
@@ -720,7 +673,14 @@ pub async fn handle_register(path: Option<String>) -> Result<()> {
             }
         }
         Err(_) => {
-            bail!("daemon not running. Start it with `gitsitter daemon start`");
+            // Direct TOML edit when daemon is not running
+            let mut cfg = UserConfig::load()?;
+            if !cfg.repos.contains_key(&repo_id_str) {
+                cfg.repos.insert(repo_id_str.clone(), Default::default());
+                cfg.save()?;
+            }
+            let dp = display_path(&repo_id_str);
+            println!("Registered {} (daemon not running, saved to config)", dp);
         }
     }
     Ok(())
@@ -1145,12 +1105,6 @@ pub async fn handle_prompt() -> Result<()> {
     };
 
     if let Response::Status { data } = resp {
-        // Load cooldown config and state DB for rate-limiting notifications.
-        let cooldown = config::UserConfig::load()
-            .map(|c| c.global.notification_cooldown)
-            .unwrap_or(std::time::Duration::from_secs(300));
-        let db = StateDb::open().ok();
-
         for b in &data.branches {
             let notification_type = match b.status.as_str() {
                 "diverged"
@@ -1162,15 +1116,9 @@ pub async fn handle_prompt() -> Result<()> {
                 _ => continue,
             };
 
-            // Build a per-branch cooldown key: "status:branch_name"
-            let cooldown_key = format!("{}:{}", notification_type, b.name);
-
-            if let Some(ref db) = db {
-                if let Ok(false) = db.should_notify(&data.repo_id, &cooldown_key, cooldown) {
-                    continue;
-                }
-            }
-
+            // We can't check daemon-side cooldowns from the CLI process,
+            // so we use a simple heuristic: always print (the daemon's sync
+            // loop only sets these states when they're new/changed).
             match notification_type {
                 "diverged" => {
                     let upstream = b.upstream.as_deref().unwrap_or("upstream");
@@ -1210,10 +1158,6 @@ pub async fn handle_prompt() -> Result<()> {
                     );
                 }
                 _ => unreachable!(),
-            }
-
-            if let Some(ref db) = db {
-                let _ = db.record_notification(&data.repo_id, &cooldown_key);
             }
         }
     }

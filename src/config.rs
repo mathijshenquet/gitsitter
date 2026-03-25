@@ -459,10 +459,11 @@ impl From<RawInRepoConfig> for InRepoConfig {
 // ---------------------------------------------------------------------------
 
 impl UserConfig {
-    fn ensure_exists() -> Result<()> {
+    /// Returns `true` if the config file was newly created.
+    fn ensure_exists() -> Result<bool> {
         let path = paths::config_file();
         if path.exists() {
-            return Ok(());
+            return Ok(false);
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -470,13 +471,16 @@ impl UserConfig {
         }
         std::fs::write(&path, DEFAULT_CONFIG_TOML)
             .with_context(|| format!("failed to initialize config file: {}", path.display()))?;
-        Ok(())
+        Ok(true)
     }
 
     /// Load user config from `paths::config_file()`, initializing it from the
     /// embedded default config if it does not exist yet.
     pub fn load() -> Result<Self> {
-        Self::ensure_exists()?;
+        let created = Self::ensure_exists()?;
+        if created {
+            eprintln!("initialized config at {}", paths::config_file().display());
+        }
         let path = paths::config_file();
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read config file: {}", path.display()))?;
