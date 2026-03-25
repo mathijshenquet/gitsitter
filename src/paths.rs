@@ -21,18 +21,15 @@ impl Paths {
     pub fn resolve() -> Self {
         let config_dir = std::env::var_os("GITSITTER_CONFIG_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                dirs::config_dir().expect("cannot determine config directory")
-            })
+            .or_else(dirs::config_dir)
+            .expect("cannot determine config directory")
             .join("gitsitter");
 
         let state_dir = std::env::var_os("GITSITTER_STATE_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                dirs::state_dir()
-                    .or_else(dirs::data_local_dir)
-                    .expect("cannot determine state directory")
-            })
+            .or_else(dirs::state_dir)
+            .or_else(dirs::data_local_dir) // Windows has no state dir, use local app data as fallback
+            .expect("cannot determine state directory")
             .join("gitsitter");
 
         let socket_path = std::env::var_os("GITSITTER_SOCKET_PATH")
@@ -94,7 +91,7 @@ mod tests {
 
     #[test]
     fn resolve_produces_absolute_paths() {
-        let p = Paths::resolve().unwrap();
+        let p = Paths::resolve();
         assert!(p.config_file.is_absolute());
         assert!(p.socket_path.is_absolute());
     }
