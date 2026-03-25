@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use tokio::sync::{Mutex, Notify, RwLock, watch};
+use tokio::sync::{Notify, RwLock, watch};
 use tracing::{error, info, warn};
 
 use crate::config::{
@@ -52,9 +52,6 @@ pub struct Daemon {
     pub repos: RwLock<HashMap<String, TrackedRepo>>,
     pub sync_notify: Notify,
     pub shutdown_tx: watch::Sender<bool>,
-    /// Protects config.toml writes so concurrent register/enable/disable
-    /// don't race.
-    config_write_lock: Mutex<()>,
 }
 
 /// In-memory tracking info for a single repo.
@@ -243,7 +240,6 @@ pub async fn run_daemon() -> Result<()> {
         repos: RwLock::new(repo_states),
         sync_notify: Notify::new(),
         shutdown_tx,
-        config_write_lock: Mutex::new(()),
     });
 
     // 8. Remove stale endpoint if it exists
@@ -356,21 +352,10 @@ async fn process_request(daemon: &SharedDaemon, request: Request) -> Response {
             }
         }
         Request::Sync { repo_path, all } => handle_sync(daemon, repo_path, all).await,
-        Request::Register { repo_path } => handle_register(daemon, &repo_path).await,
-        Request::Enable { repo_path } => handle_enable(daemon, &repo_path).await,
-        Request::Disable { repo_path, purge } => {
-            handle_disable(daemon, &repo_path, purge).await
-        }
         Request::PromptCheck { repo_path } => handle_prompt_check(daemon, &repo_path).await,
-        Request::ConfigUpdate { .. } => handle_config_update(daemon).await,
+        Request::ReloadConfig => handle_reload_config(daemon).await,
         Request::DaemonStatus => handle_daemon_status(daemon).await,
         Request::Shutdown => handle_shutdown(daemon).await,
-        Request::Log {
-            repo_path,
-            global,
-            follow: _,
-            since: _,
-        } => handle_log(daemon, repo_path, global).await,
     }
 }
 
@@ -496,222 +481,103 @@ async fn handle_sync(
     }
 }
 
-async fn handle_register(daemon: &SharedDaemon, repo_path: &str) -> Response {
+/// Combined register + status for the prompt hook.
+///
+/// Ensures the repo is in config.toml (writes if missing), reloads config,
+/// then returns status. All in one RPC round-trip.
+async fn handle_prompt_check(daemon: &SharedDaemon, repo_path: &str) -> Response {
     let path = Path::new(repo_path);
 
     // Discover canonical repo_id
     let repo_id = match git_ops::discover_repo_id(path) {
         Ok(id) => id,
-        Err(e) => {
+        Err(_) => {
+            // Not a git repo — just return error, don't spam logs
             return Response::Error {
-                message: format!("not a git repository: {}", e),
+                message: "not a git repository".into(),
             };
         }
     };
     let repo_id_str = repo_id.to_string_lossy().to_string();
 
-    // Get display path
-    let display_path = git_ops::get_display_path(&repo_id)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| repo_path.to_string());
+    // Check if already tracked — skip config write if so
+    let already_tracked = {
+        let repos = daemon.repos.read().await;
+        repos.contains_key(&repo_id_str)
+    };
 
-    // Get remote URL
-    let remote_url = git_ops::get_remote_url(&repo_id)
-        .ok()
-        .flatten();
-
-    // Write to config.toml if not already present
-    {
-        let _lock = daemon.config_write_lock.lock().await;
+    if !already_tracked {
+        // Write to config.toml and reload
         let mut cfg = match UserConfig::load() {
             Ok(c) => c,
-            Err(e) => {
-                return Response::Error {
-                    message: format!("failed to load config: {}", e),
-                };
-            }
+            Err(_) => return Response::Error { message: "failed to load config".into() },
         };
         if !cfg.repos.contains_key(&repo_id_str) {
             cfg.repos.insert(repo_id_str.clone(), Default::default());
-            if let Err(e) = cfg.save() {
-                return Response::Error {
-                    message: format!("failed to save config: {}", e),
-                };
-            }
+            let _ = cfg.save();
         }
-        // Reload config into daemon
-        let mut config = daemon.config.write().await;
-        *config = cfg;
+        reload_config(daemon).await;
     }
 
-    // Add to in-memory tracking
+    handle_status(daemon, Some(repo_id_str)).await
+}
+
+async fn handle_reload_config(daemon: &SharedDaemon) -> Response {
+    reload_config(daemon).await;
+    Response::Ok {
+        message: "config reloaded".into(),
+    }
+}
+
+/// Reload config.toml from disk and sync in-memory repo tracking.
+///
+/// Called from: ReloadConfig RPC, PromptCheck, and the file watcher.
+pub(crate) async fn reload_config(daemon: &SharedDaemon) {
+    let new_config = match UserConfig::load() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("failed to reload config: {:#}", e);
+            return;
+        }
+    };
+
+    // Sync in-memory repos with new config
     {
         let mut repos = daemon.repos.write().await;
-        repos.entry(repo_id_str.clone()).or_insert_with(|| {
-            TrackedRepo::new(repo_id_str.clone(), display_path.clone(), remote_url)
-        });
-    }
-
-    info!("registered repo: {} ({})", display_path, repo_id_str);
-    Response::Ok {
-        message: format!("registered {}", display_path),
-    }
-}
-
-/// Combined register + status for the prompt hook — avoids a separate process spawn.
-async fn handle_prompt_check(daemon: &SharedDaemon, repo_path: &str) -> Response {
-    // Register (silently — we only care about status output).
-    let _ = handle_register(daemon, repo_path).await;
-    // Return status for this repo.
-    handle_status(daemon, Some(repo_path.to_string())).await
-}
-
-async fn handle_enable(daemon: &SharedDaemon, repo_path: &str) -> Response {
-    match resolve_repo_id_from_path(repo_path) {
-        Ok(repo_id) => {
-            let repo_id_str = repo_id.to_string_lossy().to_string();
-
-            // Update config.toml
-            {
-                let _lock = daemon.config_write_lock.lock().await;
-                let mut cfg = match UserConfig::load() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Response::Error {
-                            message: format!("failed to load config: {}", e),
-                        };
-                    }
-                };
-                let entry = cfg.repos.entry(repo_id_str.clone()).or_default();
-                entry.disabled = Some(false);
-                if let Err(e) = cfg.save() {
-                    return Response::Error {
-                        message: format!("failed to save config: {}", e),
-                    };
-                }
-                let mut config = daemon.config.write().await;
-                *config = cfg;
+        // Add new repos from config
+        for (repo_path, repo_cfg) in &new_config.repos {
+            if repo_cfg.disabled == Some(true) {
+                continue;
             }
-
-            // Add to in-memory tracking if not present
-            {
-                let display_path = git_ops::get_display_path(&repo_id)
+            if !repos.contains_key(repo_path) {
+                let repo_id_path = PathBuf::from(repo_path);
+                let display_path = git_ops::get_display_path(&repo_id_path)
                     .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| repo_path.to_string());
-                let remote_url = git_ops::get_remote_url(&repo_id).ok().flatten();
-                let mut repos = daemon.repos.write().await;
-                repos.entry(repo_id_str.clone()).or_insert_with(|| {
-                    TrackedRepo::new(repo_id_str.clone(), display_path, remote_url)
-                });
-            }
-
-            info!("enabled repo: {}", repo_path);
-            Response::Ok {
-                message: format!("enabled {}", repo_path),
+                    .unwrap_or_else(|_| repo_path.clone());
+                let remote_url = git_ops::get_remote_url(&repo_id_path).ok().flatten();
+                repos.insert(
+                    repo_path.clone(),
+                    TrackedRepo::new(repo_path.clone(), display_path, remote_url),
+                );
+                info!("tracking new repo: {}", repo_path);
             }
         }
-        Err(e) => Response::Error {
-            message: format!("failed to resolve repo: {}", e),
-        },
-    }
-}
-
-async fn handle_disable(daemon: &SharedDaemon, repo_path: &str, purge: bool) -> Response {
-    match resolve_repo_id_from_path(repo_path) {
-        Ok(repo_id) => {
-            let repo_id_str = repo_id.to_string_lossy().to_string();
-
-            // Update config.toml
-            {
-                let _lock = daemon.config_write_lock.lock().await;
-                let mut cfg = match UserConfig::load() {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return Response::Error {
-                            message: format!("failed to load config: {}", e),
-                        };
-                    }
-                };
-                if purge {
-                    cfg.repos.remove(&repo_id_str);
-                } else {
-                    let entry = cfg.repos.entry(repo_id_str.clone()).or_default();
-                    entry.disabled = Some(true);
-                }
-                if let Err(e) = cfg.save() {
-                    return Response::Error {
-                        message: format!("failed to save config: {}", e),
-                    };
-                }
-                let mut config = daemon.config.write().await;
-                *config = cfg;
-            }
-
-            // Remove from in-memory tracking
-            if purge {
-                let mut repos = daemon.repos.write().await;
-                repos.remove(&repo_id_str);
-                info!("purged repo: {}", repo_path);
-                Response::Ok {
-                    message: format!("purged {}", repo_path),
-                }
-            } else {
-                info!("disabled repo: {}", repo_path);
-                Response::Ok {
-                    message: format!("disabled {}", repo_path),
-                }
-            }
+        // Remove repos no longer in config
+        let to_remove: Vec<String> = repos.keys()
+            .filter(|id| !new_config.repos.contains_key(*id))
+            .cloned()
+            .collect();
+        for id in &to_remove {
+            info!("untracking repo: {}", id);
         }
-        Err(e) => Response::Error {
-            message: format!("failed to resolve repo: {}", e),
-        },
-    }
-}
-
-async fn handle_config_update(daemon: &SharedDaemon) -> Response {
-    match UserConfig::load() {
-        Ok(new_config) => {
-            // Sync in-memory repos with new config
-            {
-                let mut repos = daemon.repos.write().await;
-                // Add new repos from config
-                for (repo_path, repo_cfg) in &new_config.repos {
-                    if repo_cfg.disabled == Some(true) {
-                        continue;
-                    }
-                    if !repos.contains_key(repo_path) {
-                        let repo_id_path = PathBuf::from(repo_path);
-                        let display_path = git_ops::get_display_path(&repo_id_path)
-                            .map(|p| p.to_string_lossy().to_string())
-                            .unwrap_or_else(|_| repo_path.clone());
-                        let remote_url = git_ops::get_remote_url(&repo_id_path).ok().flatten();
-                        repos.insert(
-                            repo_path.clone(),
-                            TrackedRepo::new(repo_path.clone(), display_path, remote_url),
-                        );
-                    }
-                }
-                // Remove repos no longer in config
-                let to_remove: Vec<String> = repos.keys()
-                    .filter(|id| !new_config.repos.contains_key(*id))
-                    .cloned()
-                    .collect();
-                for id in to_remove {
-                    repos.remove(&id);
-                }
-            }
-
-            let mut config = daemon.config.write().await;
-            *config = new_config;
-            info!("config reloaded from disk");
-            Response::Ok {
-                message: "config reloaded".into(),
-            }
+        for id in to_remove {
+            repos.remove(&id);
         }
-        Err(e) => Response::Error {
-            message: format!("failed to reload config: {}", e),
-        },
     }
+
+    let mut config = daemon.config.write().await;
+    *config = new_config;
+    info!("config reloaded");
 }
 
 async fn handle_daemon_status(daemon: &SharedDaemon) -> Response {
@@ -729,31 +595,6 @@ async fn handle_shutdown(daemon: &SharedDaemon) -> Response {
     let _ = daemon.shutdown_tx.send(true);
     Response::Ok {
         message: "shutting down".into(),
-    }
-}
-
-async fn handle_log(
-    _daemon: &SharedDaemon,
-    _repo_path: Option<String>,
-    _global: bool,
-) -> Response {
-    // Read recent entries from the log file
-    let log_path = paths::daemon_log();
-    match std::fs::read_to_string(&log_path) {
-        Ok(content) => {
-            // Return the last 100 lines
-            let lines: Vec<&str> = content.lines().collect();
-            let start = if lines.len() > 100 {
-                lines.len() - 100
-            } else {
-                0
-            };
-            let recent = lines[start..].join("\n");
-            Response::Ok { message: recent }
-        }
-        Err(e) => Response::Error {
-            message: format!("failed to read log: {}", e),
-        },
     }
 }
 

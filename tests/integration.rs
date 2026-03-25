@@ -688,9 +688,7 @@ mod transport_tests {
     #[tokio::test]
     async fn request_round_trip() {
         let (mut client, mut server) = duplex(4096);
-        let req = Request::Register {
-            repo_path: "/home/user/repo".into(),
-        };
+        let req = Request::ReloadConfig;
         transport::send_request(&mut client, &req).await.unwrap();
         let got = transport::recv_request(&mut server).await.unwrap();
         assert_eq!(
@@ -732,30 +730,7 @@ mod transport_tests {
                 repo_path: None,
                 all: true,
             },
-            Request::Register {
-                repo_path: "/repo".into(),
-            },
-            Request::ConfigUpdate {
-                repo_path: Some("/repo".into()),
-            },
-            Request::ConfigUpdate { repo_path: None },
-            Request::Enable {
-                repo_path: "/repo".into(),
-            },
-            Request::Disable {
-                repo_path: "/repo".into(),
-                purge: false,
-            },
-            Request::Disable {
-                repo_path: "/repo".into(),
-                purge: true,
-            },
-            Request::Log {
-                repo_path: None,
-                global: true,
-                follow: false,
-                since: None,
-            },
+            Request::ReloadConfig,
             Request::PromptCheck {
                 repo_path: "/repo".into(),
             },
@@ -810,10 +785,6 @@ mod transport_tests {
                 uptime_secs: 3600,
                 repos_watched: 5,
             },
-            Response::LogEntry {
-                entry: "some log".into(),
-            },
-            Response::LogEnd,
         ];
 
         for resp in &variants {
@@ -1052,17 +1023,15 @@ mode = "{}"
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
-            // Register the repo
+            // Ensure daemon has loaded the config
             let resp = Self::roundtrip_static(
                 &socket_path,
-                &Request::Register {
-                    repo_path: repo_id_str.clone(),
-                },
+                &Request::ReloadConfig,
             )
             .await;
             match &resp {
                 Response::Ok { .. } => {}
-                other => panic!("register failed: {:?}", other),
+                other => panic!("reload_config failed: {:?}", other),
             }
 
             Self {
@@ -1199,11 +1168,9 @@ mode = "{}"
             other => panic!("unexpected: {:?}", other),
         }
 
-        // ConfigUpdate
+        // ReloadConfig
         let resp = h
-            .roundtrip(&Request::ConfigUpdate {
-                repo_path: Some(h.repo_id_str.clone()),
-            })
+            .roundtrip(&Request::ReloadConfig)
             .await;
         assert!(matches!(resp, Response::Ok { .. }));
 

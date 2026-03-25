@@ -12,8 +12,25 @@ use crate::config::{self, RepoSyncMode, UserConfig};
 use crate::git_ops;
 use crate::paths;
 use crate::transport::{
-    self, connect_to_daemon, Request, Response,
+    self, connect_to_daemon, DaemonStream, Request, Response,
 };
+
+/// Connect to the daemon, returning a consistent error if it's not running.
+async fn require_daemon() -> Result<DaemonStream> {
+    connect_to_daemon()
+        .await
+        .context("daemon not running. Start it with `gitsitter daemon start`")
+}
+
+/// Write config.toml and tell the daemon to reload (if running).
+async fn save_config_and_notify(cfg: &UserConfig) -> Result<()> {
+    cfg.save()?;
+    // Best-effort notify — if daemon is down, the config is still saved.
+    if let Ok(mut stream) = connect_to_daemon().await {
+        let _ = roundtrip(&mut stream, &Request::ReloadConfig).await;
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -128,52 +145,45 @@ fn status_label(status: &str) -> &'static str {
 // ---------------------------------------------------------------------------
 
 pub async fn handle_status(global: bool) -> Result<()> {
-    match connect_to_daemon().await {
-        Ok(mut stream) => {
-            let repo_path = if global {
-                None
+    let mut stream = require_daemon().await?;
+    let repo_path = if global {
+        None
+    } else {
+        Some(resolve_cwd_repo_path()?)
+    };
+    let req = Request::Status {
+        repo_path,
+        global,
+    };
+    let resp = roundtrip(&mut stream, &req).await?;
+    match resp {
+        Response::Status { data } => {
+            print_repo_status(&data);
+        }
+        Response::GlobalStatus { repos } => {
+            if repos.is_empty() {
+                println!("No repos being watched.");
             } else {
-                Some(resolve_cwd_repo_path()?)
-            };
-            let req = Request::Status {
-                repo_path: repo_path.clone(),
-                global,
-            };
-            let resp = roundtrip(&mut stream, &req).await?;
-            match resp {
-                Response::Status { data } => {
-                    print_repo_status(&data);
-                }
-                Response::GlobalStatus { repos } => {
-                    if repos.is_empty() {
-                        println!("No repos being watched.");
-                    } else {
-                        for r in &repos {
-                            let dp = display_path(&r.display_path);
-                            let sync_info = match &r.last_sync {
-                                Some(ts) => format!("synced {}", format_relative_time(ts)),
-                                None => "never synced".to_string(),
-                            };
-                            println!(
-                                "\u{1F4E6} {}  ({}, {})",
-                                dp, r.mode, sync_info
-                            );
-                            println!("    {}", r.status_summary);
-                            println!();
-                        }
-                    }
-                }
-                Response::Error { message } => {
-                    eprintln!("error: {}", message);
-                }
-                _ => {
-                    eprintln!("unexpected response from daemon");
+                for r in &repos {
+                    let dp = display_path(&r.display_path);
+                    let sync_info = match &r.last_sync {
+                        Some(ts) => format!("synced {}", format_relative_time(ts)),
+                        None => "never synced".to_string(),
+                    };
+                    println!(
+                        "\u{1F4E6} {}  ({}, {})",
+                        dp, r.mode, sync_info
+                    );
+                    println!("    {}", r.status_summary);
+                    println!();
                 }
             }
         }
-        Err(_) => {
-            eprintln!("daemon not running. Start it with `gitsitter daemon start`");
-            std::process::exit(1);
+        Response::Error { message } => {
+            eprintln!("error: {}", message);
+        }
+        _ => {
+            eprintln!("unexpected response from daemon");
         }
     }
     Ok(())
@@ -218,28 +228,9 @@ pub async fn handle_config(
         return handle_config_explain().await;
     }
 
-    // If setting repo or branch mode, try daemon first, fall back to direct TOML edit
     if repo.is_some() || branch.is_some() {
         let repo_path = resolve_cwd_repo_path()?;
-
-        // Try daemon
-        if let Ok(mut stream) = connect_to_daemon().await {
-            // But first write the TOML change locally
-            write_config_change(&repo_path, repo.as_deref(), branch.as_deref())?;
-            let req = Request::ConfigUpdate {
-                repo_path: Some(repo_path),
-            };
-            let resp = roundtrip(&mut stream, &req).await?;
-            match resp {
-                Response::Ok { message } => println!("{}", message),
-                Response::Error { message } => eprintln!("error: {}", message),
-                _ => eprintln!("unexpected response"),
-            }
-        } else {
-            // Direct TOML edit
-            write_config_change(&repo_path, repo.as_deref(), branch.as_deref())?;
-            println!("Config updated (daemon not running, change will take effect on next start).");
-        }
+        write_config_change(&repo_path, repo.as_deref(), branch.as_deref()).await?;
         return Ok(());
     }
 
@@ -252,7 +243,7 @@ pub async fn handle_config(
     Ok(())
 }
 
-fn write_config_change(
+async fn write_config_change(
     repo_path: &str,
     repo_mode: Option<&str>,
     branch_mode: Option<&str>,
@@ -292,7 +283,7 @@ fn write_config_change(
         println!("Set branch '{}' to {:?}", branch_name, branch_mode);
     }
 
-    cfg.save()?;
+    save_config_and_notify(&cfg).await?;
     Ok(())
 }
 
@@ -493,29 +484,12 @@ pub async fn handle_enable(path: Option<String>) -> Result<()> {
     let repo_id = git_ops::discover_repo_id(Path::new(&repo_path))?;
     let repo_id_str = repo_id.to_string_lossy().to_string();
 
-    match connect_to_daemon().await {
-        Ok(mut stream) => {
-            let req = Request::Enable {
-                repo_path: repo_id_str,
-            };
-            let resp = roundtrip(&mut stream, &req).await?;
-            match resp {
-                Response::Ok { message } => println!("{}", message),
-                Response::Error { message } => eprintln!("error: {}", message),
-                _ => eprintln!("unexpected response"),
-            }
-        }
-        Err(_) => {
-            // Direct TOML edit
-            let mut cfg = UserConfig::load()?;
-            let entry = cfg.repos.entry(repo_id_str.clone()).or_default();
-            entry.disabled = Some(false);
-            cfg.save()?;
+    let mut cfg = UserConfig::load()?;
+    let entry = cfg.repos.entry(repo_id_str.clone()).or_default();
+    entry.disabled = Some(false);
+    save_config_and_notify(&cfg).await?;
 
-            let dp = display_path(&repo_id_str);
-            println!("Enabled {} (daemon not running, change saved to config)", dp);
-        }
-    }
+    println!("Enabled {}", display_path(&repo_id_str));
     Ok(())
 }
 
@@ -524,165 +498,79 @@ pub async fn handle_disable(path: Option<String>, purge: bool) -> Result<()> {
     let repo_id = git_ops::discover_repo_id(Path::new(&repo_path))?;
     let repo_id_str = repo_id.to_string_lossy().to_string();
 
-    match connect_to_daemon().await {
-        Ok(mut stream) => {
-            let req = Request::Disable {
-                repo_path: repo_id_str.clone(),
-                purge,
-            };
-            let resp = roundtrip(&mut stream, &req).await?;
-            match resp {
-                Response::Ok { message } => println!("{}", message),
-                Response::Error { message } => eprintln!("error: {}", message),
-                _ => eprintln!("unexpected response"),
-            }
-        }
-        Err(_) => {
-            let mut cfg = UserConfig::load()?;
-            if purge {
-                cfg.repos.remove(&repo_id_str);
-            } else {
-                let entry = cfg.repos.entry(repo_id_str.clone()).or_default();
-                entry.disabled = Some(true);
-            }
-            cfg.save()?;
-
-            let dp = display_path(&repo_id_str);
-            println!("Disabled {} (daemon not running, change saved to config)", dp);
-        }
+    let mut cfg = UserConfig::load()?;
+    if purge {
+        cfg.repos.remove(&repo_id_str);
+    } else {
+        let entry = cfg.repos.entry(repo_id_str.clone()).or_default();
+        entry.disabled = Some(true);
     }
+    save_config_and_notify(&cfg).await?;
+
+    println!("Disabled {}", display_path(&repo_id_str));
     Ok(())
 }
 
-pub async fn handle_log(global: bool, follow: bool, since: Option<String>) -> Result<()> {
-    match connect_to_daemon().await {
-        Ok(mut stream) => {
-            let repo_path = if global {
-                None
-            } else {
-                resolve_cwd_repo_path().ok()
-            };
-            let req = Request::Log {
-                repo_path,
-                global,
-                follow,
-                since,
-            };
-            transport::send_request(&mut stream, &req).await?;
-
-            // Read log entries until LogEnd
-            loop {
-                let resp = transport::recv_response(&mut stream).await?;
-                match resp {
-                    Response::LogEntry { entry } => {
-                        println!("{}", entry);
-                    }
-                    Response::LogEnd => {
-                        break;
-                    }
-                    Response::Error { message } => {
-                        eprintln!("error: {}", message);
-                        break;
-                    }
-                    _ => {
-                        break;
-                    }
-                }
-            }
-        }
-        Err(_) => {
-            // Fallback: read daemon.log directly
-            eprintln!("warning: daemon not running, reading log file directly");
-            eprintln!();
-            let log_path = paths::daemon_log();
-            if log_path.exists() {
-                let content = std::fs::read_to_string(&log_path)
-                    .context("failed to read daemon log")?;
-                // If --since is set, filter lines
-                if let Some(ref since_str) = since {
-                    if let Ok(since_dt) = DateTime::parse_from_rfc3339(since_str) {
-                        for line in content.lines() {
-                            // Try to parse a leading timestamp from each line
-                            if let Some(ts_end) = line.find(' ') {
-                                if let Ok(line_dt) = DateTime::parse_from_rfc3339(&line[..ts_end]) {
-                                    if line_dt >= since_dt {
-                                        println!("{}", line);
-                                    }
-                                    continue;
-                                }
-                            }
-                            // If can't parse timestamp, print the line anyway
+pub async fn handle_log(_global: bool, _follow: bool, since: Option<String>) -> Result<()> {
+    let log_path = paths::daemon_log();
+    if !log_path.exists() {
+        println!("No log file found at {}", log_path.display());
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(&log_path)
+        .context("failed to read daemon log")?;
+    if let Some(ref since_str) = since {
+        if let Ok(since_dt) = DateTime::parse_from_rfc3339(since_str) {
+            for line in content.lines() {
+                if let Some(ts_end) = line.find(' ') {
+                    if let Ok(line_dt) = DateTime::parse_from_rfc3339(&line[..ts_end]) {
+                        if line_dt >= since_dt {
                             println!("{}", line);
                         }
-                    } else {
-                        // Can't parse --since, just print everything
-                        print!("{}", content);
+                        continue;
                     }
-                } else {
-                    print!("{}", content);
                 }
-            } else {
-                println!("No log file found at {}", log_path.display());
+                println!("{}", line);
             }
+        } else {
+            print!("{}", content);
         }
+    } else {
+        print!("{}", content);
     }
     Ok(())
 }
 
 pub async fn handle_sync(all: bool) -> Result<()> {
-    match connect_to_daemon().await {
-        Ok(mut stream) => {
-            let repo_path = if all {
-                None
-            } else {
-                Some(resolve_cwd_repo_path()?)
-            };
-            let req = Request::Sync { repo_path, all };
-            let resp = roundtrip(&mut stream, &req).await?;
-            match resp {
-                Response::Ok { message } => println!("{}", message),
-                Response::Error { message } => eprintln!("error: {}", message),
-                _ => eprintln!("unexpected response"),
-            }
-        }
-        Err(_) => {
-            bail!("daemon not running. Start it with `gitsitter daemon start`");
-        }
+    let mut stream = require_daemon().await?;
+    let repo_path = if all {
+        None
+    } else {
+        Some(resolve_cwd_repo_path()?)
+    };
+    let req = Request::Sync { repo_path, all };
+    let resp = roundtrip(&mut stream, &req).await?;
+    match resp {
+        Response::Ok { message } => println!("{}", message),
+        Response::Error { message } => eprintln!("error: {}", message),
+        _ => eprintln!("unexpected response"),
     }
     Ok(())
 }
 
 pub async fn handle_register(path: Option<String>) -> Result<()> {
     let repo_path = resolve_path_or_cwd(path.as_deref())?;
-
-    // Verify it's a git repo and resolve to repo_id
     let repo_id = git_ops::discover_repo_id(Path::new(&repo_path))
         .context("not a git repository")?;
     let repo_id_str = repo_id.to_string_lossy().to_string();
 
-    match connect_to_daemon().await {
-        Ok(mut stream) => {
-            let req = Request::Register {
-                repo_path: repo_id_str,
-            };
-            let resp = roundtrip(&mut stream, &req).await?;
-            match resp {
-                Response::Ok { message } => println!("{}", message),
-                Response::Error { message } => eprintln!("error: {}", message),
-                _ => eprintln!("unexpected response"),
-            }
-        }
-        Err(_) => {
-            // Direct TOML edit when daemon is not running
-            let mut cfg = UserConfig::load()?;
-            if !cfg.repos.contains_key(&repo_id_str) {
-                cfg.repos.insert(repo_id_str.clone(), Default::default());
-                cfg.save()?;
-            }
-            let dp = display_path(&repo_id_str);
-            println!("Registered {} (daemon not running, saved to config)", dp);
-        }
+    let mut cfg = UserConfig::load()?;
+    if !cfg.repos.contains_key(&repo_id_str) {
+        cfg.repos.insert(repo_id_str.clone(), Default::default());
     }
+    save_config_and_notify(&cfg).await?;
+
+    println!("Registered {}", display_path(&repo_id_str));
     Ok(())
 }
 

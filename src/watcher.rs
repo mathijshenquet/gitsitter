@@ -68,6 +68,18 @@ pub async fn run(
     let mut watched_repos: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let mut pending: HashMap<String, (Instant, String)> = HashMap::new();
 
+    // Watch config.toml for changes.
+    let config_path = crate::paths::config_file();
+    if let Some(config_dir) = config_path.parent() {
+        if config_dir.exists() {
+            if let Err(e) = watcher.watch(config_dir, RecursiveMode::NonRecursive) {
+                warn!("🔍  failed to watch config dir: {:#}", e);
+            } else {
+                info!("👁️  watching config {}", config_path.display());
+            }
+        }
+    }
+
     // Initial setup: watch all currently registered repos.
     {
         let repos = daemon.repos.read().await;
@@ -108,6 +120,15 @@ pub async fn run(
                     if dominated {
                         continue;
                     }
+                }
+
+                // Check if this is a config.toml change
+                if path.file_name().is_some_and(|f| f == "config.toml")
+                    && path.parent().is_some_and(|p| p == config_path.parent().unwrap_or(Path::new("")))
+                {
+                    info!("⚡ config.toml changed, reloading");
+                    crate::daemon::reload_config(&daemon).await;
+                    continue;
                 }
 
                 if let Some(repo_id) = resolve_repo_id_for_path(&path, &watched_repos) {

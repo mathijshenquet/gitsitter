@@ -32,25 +32,8 @@ pub enum Request {
         all: bool,
     },
 
-    #[serde(rename = "register")]
-    Register { repo_path: String },
-
-    #[serde(rename = "config_update")]
-    ConfigUpdate { repo_path: Option<String> },
-
-    #[serde(rename = "enable")]
-    Enable { repo_path: String },
-
-    #[serde(rename = "disable")]
-    Disable { repo_path: String, purge: bool },
-
-    #[serde(rename = "log")]
-    Log {
-        repo_path: Option<String>,
-        global: bool,
-        follow: bool,
-        since: Option<String>,
-    },
+    #[serde(rename = "reload_config")]
+    ReloadConfig,
 
     #[serde(rename = "daemon_status")]
     DaemonStatus,
@@ -84,11 +67,6 @@ pub enum Response {
         repos_watched: usize,
     },
 
-    #[serde(rename = "log_entry")]
-    LogEntry { entry: String },
-
-    #[serde(rename = "log_end")]
-    LogEnd,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -511,11 +489,9 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains(r#""type":"shutdown"#));
 
-        let req2 = Request::Register {
-            repo_path: "/a".into(),
-        };
+        let req2 = Request::ReloadConfig;
         let json2 = serde_json::to_string(&req2).unwrap();
-        assert!(json2.contains(r#""type":"register"#));
+        assert!(json2.contains(r#""type":"reload_config"#));
     }
 
     /// Multiple messages on the same stream.
