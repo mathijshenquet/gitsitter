@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod cli_ui;
 pub mod config;
 pub mod daemon;
 pub mod git_ops;

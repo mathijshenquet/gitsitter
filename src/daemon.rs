@@ -332,12 +332,27 @@ async fn socket_accept_loop(
 }
 
 async fn handle_connection(daemon: SharedDaemon, mut stream: transport::DaemonStream) -> Result<()> {
-    let request = transport::recv_request(&mut stream).await?;
+    let request = match transport::recv_request(&mut stream).await {
+        Ok(req) => req,
+        Err(e) if is_eof(&e) => return Ok(()), // probe or client disconnected
+        Err(e) => return Err(e),
+    };
 
     let response = process_request(&daemon, request).await;
 
     transport::send_response(&mut stream, &response).await?;
     Ok(())
+}
+
+fn is_eof(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
+            if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 async fn process_request(daemon: &SharedDaemon, request: Request) -> Response {

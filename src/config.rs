@@ -106,6 +106,20 @@ impl std::fmt::Display for RepoSyncMode {
     }
 }
 
+impl std::str::FromStr for RepoSyncMode {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(Self::None),
+            "fetch" => Ok(Self::Fetch),
+            "pull" => Ok(Self::Pull),
+            "push" => Ok(Self::Push),
+            "push+pull" => Ok(Self::PushPull),
+            _ => Err(format!("unknown sync mode: {}", s)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BranchSyncMode {
@@ -467,7 +481,7 @@ impl UserConfig {
             }
             std::fs::write(config_file, DEFAULT_CONFIG_TOML)
                 .with_context(|| format!("failed to initialize config file: {}", config_file.display()))?;
-            eprintln!("initialized config at {}", config_file.display());
+            // Config file created silently — CLI commands handle user-facing output.
         }
         let text = std::fs::read_to_string(config_file)
             .with_context(|| format!("failed to read config file: {}", config_file.display()))?;
@@ -716,8 +730,9 @@ impl UserConfig {
         repo_path: &str,
         in_repo_config: Option<&InRepoConfig>,
     ) -> RepoSyncMode {
-        // Step 0: host trust check (local file:// URLs are always trusted)
-        if !remote_url.starts_with("file://") {
+        // Step 0: host trust check (local file:// URLs are always trusted,
+        // repos with no remote skip the check — no remote means no network requests)
+        if !remote_url.is_empty() && !remote_url.starts_with("file://") {
             if let Some(host) = extract_host(remote_url) {
                 if !self.is_host_trusted(&host) {
                     return RepoSyncMode::None;

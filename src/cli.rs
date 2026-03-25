@@ -7,13 +7,29 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
+use comfy_table::{presets, Cell, Color, ContentArrangement, Table};
 
+use crate::cli_ui::{self, DisplayOpts};
 use crate::config::{self, RepoSyncMode, UserConfig};
 use crate::git_ops;
 use crate::paths::Paths;
 use crate::transport::{
     self, DaemonStream, Request, Response,
 };
+
+/// Load display options from user config (best-effort, defaults if config fails).
+fn load_display_opts(paths: &Paths) -> DisplayOpts {
+    match UserConfig::load(&paths.config_file) {
+        Ok(cfg) => DisplayOpts {
+            emoji: cfg.global.emoji,
+            colors: cfg.global.colors,
+        },
+        Err(_) => DisplayOpts {
+            emoji: true,
+            colors: true,
+        },
+    }
+}
 
 /// Connect to the daemon, returning a consistent error if it's not running.
 async fn require_daemon(paths: &Paths) -> Result<DaemonStream> {
@@ -112,68 +128,108 @@ async fn roundtrip<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     transport::recv_response(stream).await
 }
 
-/// Status icon for a branch sync status string.
-fn status_icon(status: &str) -> &'static str {
-    match status {
-        "synced" | "up_to_date" => "\u{2705}", // green check
-        "local_ahead" => "\u{2B06}\u{FE0F}",   // up arrow
-        "fast_forward" | "remote_ahead" => "\u{2B07}\u{FE0F}", // down arrow
-        "diverged" => "\u{26A0}\u{FE0F}",      // warning
-        "error" => "\u{274C}",                  // red X
-        _ => "\u{2753}",                        // question mark
-    }
-}
-
-/// Human-readable label for a branch sync status string.
-fn status_label(status: &str) -> &'static str {
-    match status {
-        "synced" | "up_to_date" => "synced",
-        "local_ahead" => "local ahead",
-        "fast_forward" | "remote_ahead" => "remote ahead",
-        "diverged" => "diverged (ff not possible)",
-        "error" => "error",
-        "unknown" => "unknown",
-        _ => "unknown",
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
 pub async fn handle_status(paths: &Paths, global: bool) -> Result<()> {
+    let opts = load_display_opts(paths);
+    let daemon_running = transport::is_daemon_running(&paths.socket_path);
+
+    if !daemon_running {
+        println!("{}", cli_ui::daemon_warning(opts));
+        println!();
+    }
+
+    if global {
+        return handle_status_global(paths, opts, daemon_running).await;
+    }
+
+    let repo_path = resolve_cwd_repo_path()?;
+
+    if !daemon_running {
+        let dp = display_path(&repo_path);
+        println!("{}", cli_ui::repo_header(&dp, opts));
+        println!();
+        println!("   No sync data available, ensure the daemon is running");
+        // Still show mode info
+        let cfg = UserConfig::load(&paths.config_file)?;
+        let mode = resolve_repo_mode_for_display(&cfg, &repo_path)?;
+        println!();
+        println!("  {}", cli_ui::mode_line(mode, opts));
+        println!();
+        println!("  {}", cli_ui::change_hint());
+        return Ok(());
+    }
+
     let mut stream = require_daemon(paths).await?;
-    let repo_path = if global {
-        None
-    } else {
-        Some(resolve_cwd_repo_path()?)
-    };
     let req = Request::Status {
-        repo_path,
-        global,
+        repo_path: Some(repo_path),
+        global: false,
     };
     let resp = roundtrip(&mut stream, &req).await?;
     match resp {
         Response::Status { data } => {
-            print_repo_status(&data);
+            print_repo_status(&data, opts);
         }
+        Response::Error { message } => {
+            eprintln!("error: {}", message);
+        }
+        _ => {
+            eprintln!("unexpected response from daemon");
+        }
+    }
+    Ok(())
+}
+
+async fn handle_status_global(paths: &Paths, opts: DisplayOpts, daemon_running: bool) -> Result<()> {
+    if !daemon_running {
+        let cfg = UserConfig::load(&paths.config_file)?;
+        if cfg.repos.is_empty() {
+            println!("No repos registered.");
+        } else {
+            println!();
+            println!("  Watched repositories (daemon not running)");
+            println!();
+            let mut table = global_status_table();
+            for (path, repo_cfg) in &cfg.repos {
+                let dp = display_path(path);
+                let mode = repo_cfg.mode.unwrap_or(RepoSyncMode::Pull);
+                let disabled = repo_cfg.disabled == Some(true);
+                let sync = if disabled { "never synced, disabled" } else { "never synced" };
+                table.add_row(global_status_row(&dp, &mode.to_string(), sync, "", opts));
+            }
+            println!("{table}");
+            println!();
+        }
+        return Ok(());
+    }
+
+    let mut stream = require_daemon(paths).await?;
+    let req = Request::Status {
+        repo_path: None,
+        global: true,
+    };
+    let resp = roundtrip(&mut stream, &req).await?;
+    match resp {
         Response::GlobalStatus { repos } => {
             if repos.is_empty() {
                 println!("No repos being watched.");
             } else {
+                println!();
+                println!("  Watched repositories ({} total)", repos.len());
+                println!();
+                let mut table = global_status_table();
                 for r in &repos {
                     let dp = display_path(&r.display_path);
                     let sync_info = match &r.last_sync {
                         Some(ts) => format!("synced {}", format_relative_time(ts)),
                         None => "never synced".to_string(),
                     };
-                    println!(
-                        "\u{1F4E6} {}  ({}, {})",
-                        dp, r.mode, sync_info
-                    );
-                    println!("    {}", r.status_summary);
-                    println!();
+                    table.add_row(global_status_row(&dp, &r.mode, &sync_info, &r.status_summary, opts));
                 }
+                println!("{table}");
+                println!();
             }
         }
         Response::Error { message } => {
@@ -186,33 +242,76 @@ pub async fn handle_status(paths: &Paths, global: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_repo_status(data: &transport::StatusData) {
+fn global_status_table() -> Table {
+    let mut table = Table::new();
+    table
+        .load_preset(presets::NOTHING)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["Repo", "Mode", "Last Sync", "Status"]);
+    table
+}
+
+fn global_status_row(path: &str, mode: &str, sync: &str, status: &str, opts: DisplayOpts) -> Vec<Cell> {
+    if opts.colors {
+        vec![
+            Cell::new(path).fg(Color::Blue),
+            Cell::new(mode).fg(Color::Blue),
+            Cell::new(sync),
+            Cell::new(status),
+        ]
+    } else {
+        vec![
+            Cell::new(path),
+            Cell::new(mode),
+            Cell::new(sync),
+            Cell::new(status),
+        ]
+    }
+}
+
+fn resolve_repo_mode_for_display(cfg: &UserConfig, repo_path: &str) -> Result<RepoSyncMode> {
+    let repo_id_path = PathBuf::from(repo_path);
+    let remote_url = git_ops::get_remote_url(&repo_id_path)?
+        .unwrap_or_default();
+    let display_path = git_ops::get_display_path(&repo_id_path)?;
+    let in_repo = config::InRepoConfig::load(&display_path)?;
+    Ok(cfg.resolve_repo_mode(&remote_url, repo_path, in_repo.as_ref()))
+}
+
+fn print_repo_status(data: &transport::StatusData, opts: DisplayOpts) {
     let dp = display_path(&data.display_path);
     let sync_info = match &data.last_sync {
         Some(ts) => format!("synced {}", format_relative_time(ts)),
         None => "never synced".to_string(),
     };
-    println!(
-        "\u{1F4E6} {}  ({}, {})",
-        dp, data.mode, sync_info
-    );
+    println!("{}  {}", cli_ui::repo_header(&dp, opts), sync_info);
     println!();
     for b in &data.branches {
         let upstream = match &b.upstream {
             Some(u) => format!("\u{2190} {}", u),
             None => "(no upstream)".to_string(),
         };
-        let icon = status_icon(&b.status);
-        let label = status_label(&b.status);
+        let icon = cli_ui::branch_status_icon(&b.status, opts);
+        let label = cli_ui::branch_status_styled(&b.status, opts);
         let action = match &b.last_action {
-            Some(a) => format!(" ({})", a),
+            Some(a) => format!(", {}", a),
             None => String::new(),
         };
         println!(
-            "  {:<16} {:<28} {} {}{}",
+            "  {:<16} {:<28} {}  {}{}",
             b.name, upstream, icon, label, action
         );
     }
+    println!();
+    println!(
+        "  {}",
+        cli_ui::mode_line(
+            data.mode.parse::<RepoSyncMode>().unwrap_or(RepoSyncMode::Pull),
+            opts
+        )
+    );
+    println!();
+    println!("  {}", cli_ui::change_hint());
 }
 
 pub async fn handle_config(paths: &Paths,
@@ -344,6 +443,7 @@ fn print_global_config(paths: &Paths) -> Result<()> {
 }
 
 fn print_repo_config(paths: &Paths) -> Result<()> {
+    let opts = load_display_opts(paths);
     let cfg = UserConfig::load(&paths.config_file)?;
     let repo_path = match resolve_cwd_repo_path() {
         Ok(p) => p,
@@ -353,28 +453,26 @@ fn print_repo_config(paths: &Paths) -> Result<()> {
         }
     };
     let dp = display_path(&repo_path);
-    println!("Config for {}:", dp);
+    println!("Config for {}", cli_ui::repo_header(&dp, opts));
+    println!();
+
+    let mode = resolve_repo_mode_for_display(&cfg, &repo_path)?;
+    println!("  {}", cli_ui::mode_line(mode, opts));
+    println!();
+
+    let refresh = cfg.effective_refresh_interval(
+        &repo_path,
+        config::InRepoConfig::load(&git_ops::get_display_path(&PathBuf::from(&repo_path))?)?.as_ref(),
+    );
+    println!("  Refresh interval: {}s", refresh.as_secs());
 
     if let Some(repo_cfg) = cfg.repos.get(&repo_path) {
-        if let Some(mode) = repo_cfg.mode {
-            println!("  mode: {:?}", mode);
-        } else {
-            println!("  mode: (inherited default)");
-        }
-        if repo_cfg.disabled == Some(true) {
-            println!("  disabled: true");
-        }
-        if let Some(ri) = repo_cfg.refresh_interval {
-            println!("  refresh_interval: {:?}", ri);
-        }
         if !repo_cfg.branches.is_empty() {
-            println!("  branches:");
+            println!("  Branches:");
             for (pat, mode) in &repo_cfg.branches {
-                println!("    {}: {:?}", pat, mode);
+                println!("    {:<12} {:?}", pat, mode);
             }
         }
-    } else {
-        println!("  (no per-repo overrides, using defaults)");
     }
     Ok(())
 }
@@ -479,6 +577,7 @@ async fn handle_config_explain(paths: &Paths) -> Result<()> {
 }
 
 pub async fn handle_enable(paths: &Paths, path: Option<String>) -> Result<()> {
+    let opts = load_display_opts(paths);
     let repo_path = resolve_path_or_cwd(path.as_deref())?;
 
     // Verify it's a git repo
@@ -496,11 +595,20 @@ pub async fn handle_enable(paths: &Paths, path: Option<String>) -> Result<()> {
     })?;
     notify_daemon_reload(paths).await;
 
-    println!("Enabled {}", display_path(&repo_id_str));
+    let dp = display_path(&repo_id_str);
+    let icon = cli_ui::success_icon(opts);
+    println!("{} Enabled {}", icon, cli_ui::repo_header(&dp, opts));
+
+    let cfg = UserConfig::load(&paths.config_file)?;
+    let mode = resolve_repo_mode_for_display(&cfg, &repo_id_str)?;
+    let daemon_running = transport::is_daemon_running(&paths.socket_path);
+    cli_ui::print_repo_info_block(mode, daemon_running, opts);
+
     Ok(())
 }
 
 pub async fn handle_disable(paths: &Paths, path: Option<String>, purge: bool) -> Result<()> {
+    let opts = load_display_opts(paths);
     let repo_path = resolve_path_or_cwd(path.as_deref())?;
     let repo_id = git_ops::discover_repo_id(Path::new(&repo_path))?;
     let repo_id_str = repo_id.to_string_lossy().to_string();
@@ -518,7 +626,9 @@ pub async fn handle_disable(paths: &Paths, path: Option<String>, purge: bool) ->
     })?;
     notify_daemon_reload(paths).await;
 
-    println!("Disabled {}", display_path(&repo_id_str));
+    let dp = display_path(&repo_id_str);
+    let icon = cli_ui::pause_icon(opts);
+    println!("{} Disabled {}", icon, cli_ui::repo_header(&dp, opts));
     Ok(())
 }
 
@@ -553,16 +663,25 @@ pub async fn handle_log(paths: &Paths, _global: bool, _follow: bool, since: Opti
 }
 
 pub async fn handle_sync(paths: &Paths, all: bool) -> Result<()> {
+    let opts = load_display_opts(paths);
     let mut stream = require_daemon(paths).await?;
     let repo_path = if all {
         None
     } else {
         Some(resolve_cwd_repo_path()?)
     };
+    let display = repo_path.as_ref().map(|p| display_path(p));
     let req = Request::Sync { repo_path, all };
     let resp = roundtrip(&mut stream, &req).await?;
     match resp {
-        Response::Ok { message } => println!("{}", message),
+        Response::Ok { .. } => {
+            let icon = cli_ui::success_icon(opts);
+            if let Some(dp) = display {
+                println!("{} Synced {}", icon, cli_ui::repo_header(&dp, opts));
+            } else {
+                println!("{} Synced all repos", icon);
+            }
+        }
         Response::Error { message } => eprintln!("error: {}", message),
         _ => eprintln!("unexpected response"),
     }
@@ -570,6 +689,7 @@ pub async fn handle_sync(paths: &Paths, all: bool) -> Result<()> {
 }
 
 pub async fn handle_register(paths: &Paths, path: Option<String>) -> Result<()> {
+    let opts = load_display_opts(paths);
     let repo_path = resolve_path_or_cwd(path.as_deref())?;
     let repo_id = git_ops::discover_repo_id(Path::new(&repo_path))
         .context("not a git repository")?;
@@ -583,11 +703,20 @@ pub async fn handle_register(paths: &Paths, path: Option<String>) -> Result<()> 
     })?;
     notify_daemon_reload(paths).await;
 
-    println!("Registered {}", display_path(&repo_id_str));
+    let dp = display_path(&repo_id_str);
+    let icon = cli_ui::celebrate_icon(opts);
+    println!("{} Registered {}", icon, cli_ui::repo_header(&dp, opts));
+
+    let cfg = UserConfig::load(&paths.config_file)?;
+    let mode = resolve_repo_mode_for_display(&cfg, &repo_id_str)?;
+    let daemon_running = transport::is_daemon_running(&paths.socket_path);
+    cli_ui::print_repo_info_block(mode, daemon_running, opts);
+
     Ok(())
 }
 
 pub async fn handle_daemon_status(paths: &Paths) -> Result<()> {
+    let opts = load_display_opts(paths);
     match transport::connect_to_daemon(&paths.socket_path).await {
         Ok(mut stream) => {
             let req = Request::DaemonStatus;
@@ -598,7 +727,8 @@ pub async fn handle_daemon_status(paths: &Paths) -> Result<()> {
                     uptime_secs,
                     repos_watched,
                 } => {
-                    println!("gitsitter daemon is running");
+                    let icon = cli_ui::success_icon(opts);
+                    println!("{} Daemon is running", icon);
                     println!("  PID:           {}", pid);
                     println!("  Uptime:        {}", format_uptime(uptime_secs));
                     println!("  Repos watched: {}", repos_watched);
@@ -612,7 +742,7 @@ pub async fn handle_daemon_status(paths: &Paths) -> Result<()> {
             }
         }
         Err(_) => {
-            println!("gitsitter daemon is not running");
+            println!("\u{00B7} Daemon is not running");
         }
     }
     Ok(())
@@ -660,7 +790,7 @@ async fn sc_command(args: &[&str]) -> Result<std::process::Output> {
 pub async fn handle_daemon_start(paths: &Paths) -> Result<()> {
     // Check if already running
     if transport::is_daemon_running(&paths.socket_path) {
-        println!("gitsitter daemon is already running");
+        println!("\u{00B7} Daemon is already running");
         return Ok(());
     }
 
@@ -681,7 +811,7 @@ pub async fn handle_daemon_start(paths: &Paths) -> Result<()> {
                 if let Ok(status) = result {
                     if status.success() {
                         if wait_for_daemon_ready(paths, std::time::Duration::from_secs(3)).await {
-                            println!("gitsitter daemon started via launchd");
+                            println!("\u{2713} Daemon started via launchd");
                             return Ok(());
                         }
                         bail!("launchd accepted the job, but the daemon socket did not appear");
@@ -703,7 +833,7 @@ pub async fn handle_daemon_start(paths: &Paths) -> Result<()> {
         match systemd_result {
             Ok(status) if status.success() => {
                 if wait_for_daemon_ready(paths, std::time::Duration::from_secs(3)).await {
-                    println!("gitsitter daemon started via systemd");
+                    println!("\u{2713} Daemon started via systemd");
                     return Ok(());
                 }
                 bail!("systemd accepted the job, but the daemon socket did not appear");
@@ -724,7 +854,7 @@ pub async fn handle_daemon_start(paths: &Paths) -> Result<()> {
         let service_result = sc_command(&["start", crate::service::SERVICE_NAME]).await;
         match service_result {
             Ok(output) if output.status.success() => {
-                println!("gitsitter daemon started via Windows Service Control Manager");
+                println!("\u{2713} Daemon started via Windows Service Control Manager");
                 return Ok(());
             }
             Ok(_) | Err(_) => {
@@ -750,7 +880,7 @@ pub async fn handle_daemon_start(paths: &Paths) -> Result<()> {
         .context("failed to spawn daemon process")?;
 
     if wait_for_daemon_ready(paths, std::time::Duration::from_secs(3)).await {
-        println!("gitsitter daemon started (PID: {})", child.id());
+        println!("\u{2713} Daemon started, PID: {}", child.id());
         return Ok(());
     }
 
@@ -767,7 +897,7 @@ pub async fn handle_daemon_stop(paths: &Paths) -> Result<()> {
         let service_result = sc_command(&["stop", crate::service::SERVICE_NAME]).await;
         if let Ok(output) = service_result {
             if output.status.success() {
-                println!("gitsitter daemon stop requested via Windows Service Control Manager");
+                println!("\u{2713} Daemon stopped");
                 return Ok(());
             }
         }
@@ -778,15 +908,13 @@ pub async fn handle_daemon_stop(paths: &Paths) -> Result<()> {
             let req = Request::Shutdown;
             let resp = roundtrip(&mut stream, &req).await;
             match resp {
-                Ok(Response::Ok { message }) => println!("{}", message),
+                Ok(Response::Ok { .. }) | Err(_) => println!("\u{2713} Daemon stopped"),
                 Ok(Response::Error { message }) => eprintln!("error: {}", message),
-                // Connection may close before we get a response during shutdown
-                Err(_) => println!("gitsitter daemon stopped"),
-                _ => println!("gitsitter daemon stopped"),
+                _ => println!("\u{2713} Daemon stopped"),
             }
         }
         Err(_) => {
-            println!("gitsitter daemon is not running");
+            println!("\u{00B7} Daemon is not running");
         }
     }
     Ok(())
