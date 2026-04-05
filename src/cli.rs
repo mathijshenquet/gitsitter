@@ -512,6 +512,207 @@ pub async fn handle_enable(paths: &Paths, path: Option<String>) -> Result<()> {
     Ok(())
 }
 
+pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
+    let opts = load_display_opts(paths);
+    let mut stream = require_daemon(paths).await?;
+
+    // Get status (current repo or global)
+    let req = if global {
+        Request::Status { repo_path: None, global: true }
+    } else {
+        let repo_path = resolve_cwd_repo_path()?;
+        Request::Status { repo_path: Some(repo_path), global: false }
+    };
+    let resp = roundtrip(&mut stream, &req).await?;
+
+    // Collect issues from one or many repos
+    let status_list: Vec<transport::StatusData> = match resp {
+        Response::Status { data } => vec![data],
+        Response::GlobalStatus { repos } => {
+            // For global, we need to fetch per-repo status for branch details
+            let mut all = Vec::new();
+            for repo in &repos {
+                let req = Request::Status {
+                    repo_path: Some(repo.display_path.clone()),
+                    global: false,
+                };
+                if let Ok(resp) = roundtrip(&mut stream, &req).await {
+                    if let Response::Status { data } = resp {
+                        all.push(data);
+                    }
+                }
+            }
+            all
+        }
+        _ => {
+            println!("No sync data available.");
+            return Ok(());
+        }
+    };
+
+    let mut any_issues = false;
+
+    for data in &status_list {
+        let dp = display_path(&data.display_path);
+        let repo_id_path = PathBuf::from(&data.repo_id);
+
+        for b in &data.branches {
+            let upstream = b.upstream.as_deref().unwrap_or("upstream");
+            let action = match b.status.as_str() {
+                "local_ahead" => "unpushed commits (last remote commit by someone else)",
+                "diverged" => "diverged (last remote commit by someone else)",
+                "diverged_yours" => "diverged (last remote commit by you, auto-push failed)",
+                _ => continue,
+            };
+
+            any_issues = true;
+            println!();
+            println!("{}: {} \u{2192} {} — {}", cli_ui::repo_header(&dp, opts), b.name, upstream, action);
+
+            match b.status.as_str() {
+                "local_ahead" => {
+                    println!("  [1] Force push (take ownership)");
+                    println!("  [2] Create a new branch from your commits");
+                    println!("  [3] Skip");
+                    match prompt_choice(3) {
+                        1 => {
+                            // Force push
+                            let branch_remote = upstream.split('/').next().unwrap_or("origin");
+                            match git_ops::git_push_force_with_lease(
+                                &repo_id_path,
+                                branch_remote,
+                                &b.name,
+                                None,
+                                30,
+                            ).await {
+                                Ok(git_ops::PushResult::Success) => {
+                                    println!("  {} Force-pushed {}", cli_ui::success_icon(opts), b.name);
+                                }
+                                _ => {
+                                    println!("  Force push failed. Resolve manually.");
+                                }
+                            }
+                        }
+                        2 => {
+                            // Create new branch
+                            let new_name = prompt_string("  Branch name: ");
+                            if !new_name.is_empty() {
+                                // Create branch at current HEAD, then reset original to upstream
+                                let result = std::process::Command::new("git")
+                                    .arg("-C").arg(&data.repo_id)
+                                    .args(["branch", &new_name])
+                                    .output();
+                                match result {
+                                    Ok(o) if o.status.success() => {
+                                        println!("  {} Created branch {}", cli_ui::success_icon(opts), new_name);
+                                        // Reset original branch to upstream
+                                        if let Some(remote_oid) = &b.upstream {
+                                            let _ = std::process::Command::new("git")
+                                                .arg("-C").arg(&data.repo_id)
+                                                .args(["update-ref", &format!("refs/heads/{}", b.name)])
+                                                .arg(remote_oid.split('/').last().unwrap_or("HEAD"))
+                                                .output();
+                                        }
+                                    }
+                                    _ => {
+                                        println!("  Failed to create branch.");
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            println!("  Skipped.");
+                        }
+                    }
+                }
+                "diverged" | "diverged_yours" => {
+                    println!("  [1] Force push (overwrite remote)");
+                    println!("  [2] Create a new branch from your commits");
+                    println!("  [3] Skip");
+                    match prompt_choice(3) {
+                        1 => {
+                            let branch_remote = upstream.split('/').next().unwrap_or("origin");
+                            match git_ops::git_push_force_with_lease(
+                                &repo_id_path,
+                                branch_remote,
+                                &b.name,
+                                None,
+                                30,
+                            ).await {
+                                Ok(git_ops::PushResult::Success) => {
+                                    println!("  {} Force-pushed {}", cli_ui::success_icon(opts), b.name);
+                                }
+                                _ => {
+                                    println!("  Force push failed. The remote may have changed. Resolve manually.");
+                                }
+                            }
+                        }
+                        2 => {
+                            let new_name = prompt_string("  Branch name: ");
+                            if !new_name.is_empty() {
+                                let result = std::process::Command::new("git")
+                                    .arg("-C").arg(&data.repo_id)
+                                    .args(["branch", &new_name])
+                                    .output();
+                                match result {
+                                    Ok(o) if o.status.success() => {
+                                        println!("  {} Created branch {}", cli_ui::success_icon(opts), new_name);
+                                    }
+                                    _ => {
+                                        println!("  Failed to create branch.");
+                                    }
+                                }
+                            }
+                        }
+                        _ => {
+                            println!("  Skipped.");
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if !any_issues {
+        println!("No issues to resolve. All branches are in sync.");
+    }
+
+    // Trigger a sync after resolving
+    if any_issues {
+        let _ = notify_daemon_reload(paths).await;
+    }
+
+    Ok(())
+}
+
+fn prompt_choice(max: usize) -> usize {
+    use std::io::{self, Write};
+    loop {
+        print!("  > ");
+        io::stdout().flush().ok();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            return max; // default to skip on error
+        }
+        if let Ok(n) = input.trim().parse::<usize>() {
+            if n >= 1 && n <= max {
+                return n;
+            }
+        }
+        println!("  Please enter a number between 1 and {}", max);
+    }
+}
+
+fn prompt_string(prompt: &str) -> String {
+    use std::io::{self, Write};
+    print!("{}", prompt);
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).ok();
+    input.trim().to_string()
+}
+
 pub async fn handle_disable(paths: &Paths, path: Option<String>, purge: bool) -> Result<()> {
     let opts = load_display_opts(paths);
     let repo_path = resolve_path_or_cwd(path.as_deref())?;
@@ -1152,60 +1353,45 @@ pub async fn handle_prompt(paths: &Paths) -> Result<()> {
     };
 
     if let Response::Status { data } = resp {
-        for b in &data.branches {
-            let notification_type = match b.status.as_str() {
-                "diverged"
-                | "upstream_gone"
-                | "push_rejected"
-                | "auth_failed"
-                | "network_error"
-                | "push_blocked_hook_timeout" => b.status.as_str(),
-                _ => continue,
-            };
+        let dp = display_path(&data.display_path);
+        let mut issues = Vec::new();
 
-            // We can't check daemon-side cooldowns from the CLI process,
-            // so we use a simple heuristic: always print (the daemon's sync
-            // loop only sets these states when they're new/changed).
-            match notification_type {
+        for b in &data.branches {
+            let upstream = b.upstream.as_deref().unwrap_or("upstream");
+            match b.status.as_str() {
+                "local_ahead" => {
+                    issues.push(format!(
+                        "gitsitter: \u{1F4E6} {} {} \u{2192} {} has unpushed changes (last remote commit by someone else)",
+                        dp, b.name, upstream
+                    ));
+                }
                 "diverged" => {
-                    let upstream = b.upstream.as_deref().unwrap_or("upstream");
-                    println!(
-                        "\u{26A0}\u{FE0F}  gitsitter: {} has diverged from {} (ff not possible)",
-                        b.name, upstream
-                    );
+                    issues.push(format!(
+                        "gitsitter: \u{1F4E6} {} {} \u{2192} {} has diverged (last remote commit by someone else)",
+                        dp, b.name, upstream
+                    ));
                 }
-                "upstream_gone" => {
-                    println!(
-                        "\u{26A0}\u{FE0F}  gitsitter: {}'s upstream has been deleted",
-                        b.name
-                    );
+                "diverged_yours" => {
+                    issues.push(format!(
+                        "gitsitter: \u{1F4E6} {} {} \u{2192} {} has diverged (last remote commit by you, auto-push failed)",
+                        dp, b.name, upstream
+                    ));
                 }
-                "push_rejected" => {
-                    println!(
-                        "\u{26A0}\u{FE0F}  gitsitter: push rejected for {}",
-                        b.name
-                    );
+                "push_rejected" | "auth_failed" | "network_error" | "push_blocked_hook_timeout" => {
+                    issues.push(format!(
+                        "gitsitter: \u{1F4E6} {} {} \u{2192} {} sync error ({})",
+                        dp, b.name, upstream, b.status.replace('_', " ")
+                    ));
                 }
-                "auth_failed" => {
-                    println!(
-                        "\u{26A0}\u{FE0F}  gitsitter: auth failed while syncing {}",
-                        b.name
-                    );
-                }
-                "network_error" => {
-                    println!(
-                        "\u{26A0}\u{FE0F}  gitsitter: network error while syncing {}",
-                        b.name
-                    );
-                }
-                "push_blocked_hook_timeout" => {
-                    println!(
-                        "\u{26A0}\u{FE0F}  gitsitter: push blocked by hook timeout for {}",
-                        b.name
-                    );
-                }
-                _ => unreachable!(),
+                _ => continue,
             }
+        }
+
+        if !issues.is_empty() {
+            for issue in &issues {
+                println!("{}", issue);
+            }
+            println!("gitsitter: Run `gitsitter resolve` to resolve issues");
         }
     }
     Ok(())

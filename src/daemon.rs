@@ -1202,19 +1202,73 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 }
             }
 
-            // 5f. Diverged
+            // 5f. Diverged — check if we own the remote tip
             MergeAnalysis::Diverged => {
-                warn!("diverged: {}:{}", repo_label, branch.name);
-                let mut repos = daemon.repos.write().await;
-                if let Some(tr) = repos.get_mut(repo_id) {
-                    tr.set_branch(&branch.name, BranchRuntimeState {
-                        sync_status: "diverged".into(),
-                        last_pull_at: None,
-                        last_push_at: None,
-                        local_oid: Some(branch.local_oid.clone()),
-                        remote_oid: branch.remote_oid.clone(),
-                        error_message: Some("branch has diverged, ff not possible".into()),
-                    });
+                let is_owner = git_ops::is_branch_owned_by_user(&repo_path, &branch.name)
+                    .unwrap_or(false);
+
+                if is_owner {
+                    // We own the remote tip (likely a rebase/amend) — try force-with-lease
+                    let push_path = worktrees
+                        .first()
+                        .map(|wt| PathBuf::from(&wt.path))
+                        .unwrap_or_else(|| repo_path.clone());
+
+                    match git_ops::git_push_force_with_lease(
+                        &push_path,
+                        &branch.remote,
+                        &branch.name,
+                        git_path_ref,
+                        GIT_TIMEOUT_SECS,
+                    )
+                    .await
+                    {
+                        Ok(PushResult::Success) => {
+                            had_activity = true;
+                            info!("force-pushed (lease) {}:{}", repo_label, branch.name);
+                            let now = chrono::Utc::now().to_rfc3339();
+                            let mut repos = daemon.repos.write().await;
+                            if let Some(tr) = repos.get_mut(repo_id) {
+                                tr.backoff.reset_push_backoff(&ref_name);
+                                tr.set_branch(&branch.name, BranchRuntimeState {
+                                    sync_status: "synced".into(),
+                                    last_pull_at: None,
+                                    last_push_at: Some(now),
+                                    local_oid: Some(branch.local_oid.clone()),
+                                    remote_oid: Some(branch.local_oid.clone()),
+                                    error_message: None,
+                                });
+                            }
+                        }
+                        _ => {
+                            // Force-with-lease failed — someone else pushed in between
+                            warn!("force-push (lease) failed for {}:{}", repo_label, branch.name);
+                            let mut repos = daemon.repos.write().await;
+                            if let Some(tr) = repos.get_mut(repo_id) {
+                                tr.set_branch(&branch.name, BranchRuntimeState {
+                                    sync_status: "diverged_yours".into(),
+                                    last_pull_at: None,
+                                    last_push_at: None,
+                                    local_oid: Some(branch.local_oid.clone()),
+                                    remote_oid: branch.remote_oid.clone(),
+                                    error_message: Some("diverged (last remote commit by you), force-push failed".into()),
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    warn!("diverged: {}:{}", repo_label, branch.name);
+                    let mut repos = daemon.repos.write().await;
+                    if let Some(tr) = repos.get_mut(repo_id) {
+                        tr.set_branch(&branch.name, BranchRuntimeState {
+                            sync_status: "diverged".into(),
+                            last_pull_at: None,
+                            last_push_at: None,
+                            local_oid: Some(branch.local_oid.clone()),
+                            remote_oid: branch.remote_oid.clone(),
+                            error_message: Some("diverged (last remote commit by someone else)".into()),
+                        });
+                    }
                 }
             }
         }

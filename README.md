@@ -5,14 +5,15 @@ A git utility that keeps your local branches in sync with their tracking remotes
 - **Remote ahead** → fast-forward merge into local
 - **Local ahead + you own the branch** → push to remote
 - **Local ahead + not your branch** → notify the user
-- **Diverged** → notify the user
+- **Diverged + you own the remote tip** → force-push with lease (safe rebase workflow)
+- **Diverged + not your remote tip** → notify the user
 
 ## Philosophy
 
 - **Zero configuration.** Behavior is derived from git's own tracking branches and commit authorship. No modes, no rules, no globs.
 - **Silent by default.** Invisible when everything is working.
 - **Notify on problems.** Diverged branches, unpushed commits on branches you don't own, failed pushes — surfaced to the user via shell prompt.
-- **Never destructive.** No force-push, no rebase, no reset. If ff is not possible, stop and tell the user.
+- **Safe by default.** Uses `--force-with-lease` only when you own the remote tip (rebase/amend workflow). Never overwrites someone else's work.
 
 ### Ownership Rule
 
@@ -55,6 +56,8 @@ gitsitter sync --all               # trigger immediate sync for all repos
 gitsitter config                   # show config for current repo
 gitsitter config --global          # show global config
 gitsitter config --explain         # show trust, disabled, and ownership diagnostics
+gitsitter resolve                  # interactively resolve sync issues
+gitsitter resolve --global         # resolve issues across all repos
 gitsitter enable                   # enable current repo
 gitsitter disable                  # disable current repo
 gitsitter trust <host>             # trust a remote host
@@ -124,7 +127,21 @@ Per repo, per refresh interval:
    - Fast-forward possible → ff-merge (checked out) or update-ref (not checked out)
    - Local ahead + owned → push
    - Local ahead + not owned → record as actionable issue
-   - Diverged → record as actionable issue
+   - Diverged + owned → force-push with lease (safe rebase workflow)
+   - Diverged + not owned → record as actionable issue
+
+### Shell Notifications
+
+The shell hooks call `gitsitter _prompt` on every prompt. When there are unresolved issues (unowned branches with local commits, diverged branches), warnings are printed directly in the terminal:
+
+```
+gitsitter: 📦 ~/project main → origin/main has unpushed changes (last remote commit by someone else)
+gitsitter: Run `gitsitter resolve` to resolve issues
+```
+
+`gitsitter resolve` walks through each issue interactively, offering to force-push (take ownership) or create a new branch from your commits.
+
+### Branch Updates
 
 Non-checked-out branches are updated via `git update-ref` (no checkout needed) — when you `git checkout feature-x`, it's already up to date.
 

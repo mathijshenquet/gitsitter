@@ -530,6 +530,53 @@ pub fn is_branch_owned_by_user(repo_id: &Path, branch_name: &str) -> Result<bool
     Ok(author_email.eq_ignore_ascii_case(&user_email))
 }
 
+/// Force-push a branch with --force-with-lease (safe force-push).
+pub async fn git_push_force_with_lease(
+    repo_path: &Path,
+    remote: &str,
+    branch: &str,
+    git_path: Option<&str>,
+    timeout_secs: u64,
+) -> Result<PushResult> {
+    let mut cmd = git_command(repo_path, git_path);
+    cmd.arg("push")
+        .arg("--force-with-lease")
+        .arg(remote)
+        .arg(branch);
+
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return Err(e).context("failed to spawn git push --force-with-lease"),
+        Err(_) => return Ok(PushResult::HookTimeout),
+    };
+
+    if output.status.success() {
+        return Ok(PushResult::Success);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stderr_lower = stderr.to_lowercase();
+
+    if stderr_lower.contains("rejected")
+        || stderr_lower.contains("stale info")
+        || stderr_lower.contains("[remote rejected]")
+    {
+        Ok(PushResult::Rejected(stderr))
+    } else if stderr_lower.contains("authentication")
+        || stderr_lower.contains("permission denied")
+        || stderr_lower.contains("could not read from remote")
+    {
+        Ok(PushResult::AuthFailed(stderr))
+    } else {
+        Ok(PushResult::Rejected(stderr))
+    }
+}
+
 /// Update a ref to a new OID, with expected-old-OID for safety.
 pub async fn git_update_ref(
     repo_path: &Path,

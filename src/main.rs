@@ -68,6 +68,12 @@ enum Commands {
     Register {
         path: Option<String>,
     },
+    /// Interactively resolve sync issues (diverged/unowned branches)
+    Resolve {
+        /// Resolve issues for all repos (default: current repo only)
+        #[arg(short, long)]
+        global: bool,
+    },
     /// Install daemon and shell hooks
     Install {
         component: Option<String>,
@@ -133,6 +139,7 @@ async fn main() {
             since,
         }) => cli::handle_log(&paths, global, follow, since).await,
         Some(Commands::Sync { all }) => cli::handle_sync(&paths, all).await,
+        Some(Commands::Resolve { global }) => cli::handle_resolve(&paths, global).await,
         Some(Commands::Register { path }) => cli::handle_register(&paths, path).await,
         Some(Commands::Install { component, shell_name }) => {
             cli::handle_install(component, shell_name).await
