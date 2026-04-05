@@ -487,7 +487,6 @@ mod transport_tests {
                 data: transport::StatusData {
                     repo_id: "id".into(),
                     display_path: "/path".into(),
-                    mode: "auto".into(),
                     last_sync: None,
                     branches: vec![transport::BranchStatusData {
                         name: "main".into(),
@@ -503,7 +502,6 @@ mod transport_tests {
             Response::GlobalStatus {
                 repos: vec![transport::RepoStatusData {
                     display_path: "/path".into(),
-                    mode: "auto".into(),
                     status_summary: "1 synced".into(),
                     last_sync: None,
                 }],

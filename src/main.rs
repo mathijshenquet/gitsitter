@@ -17,28 +17,24 @@ enum Commands {
         #[arg(short, long)]
         global: bool,
     },
-    /// Configure gitsitter
-    Config {
-        #[arg(short, long)]
-        global: bool,
-        #[arg(long)]
-        explain: bool,
-    },
-    /// Enable a repo or a specific remote
+    /// Show configuration
+    Config,
+    /// Enable syncing for a remote (or all remotes with --all)
     Enable {
-        /// Path to repo, or remote name if --remote is set
-        target: Option<String>,
-        /// Treat target as a remote name in the current repo
+        /// Remote name to enable
+        remote: Option<String>,
+        /// Enable all remotes / the whole repo
         #[arg(long)]
-        remote: bool,
+        all: bool,
     },
-    /// Disable a repo or a specific remote
+    /// Disable syncing for a remote (or all remotes with --all)
     Disable {
-        /// Path to repo, or remote name if --remote is set
-        target: Option<String>,
-        /// Treat target as a remote name in the current repo
+        /// Remote name to disable
+        remote: Option<String>,
+        /// Disable all remotes / the whole repo
         #[arg(long)]
-        remote: bool,
+        all: bool,
+        /// Remove repo from config entirely
         #[arg(long)]
         purge: bool,
     },
@@ -113,23 +109,12 @@ async fn main() {
     let result = match args.command {
         None => cli::handle_status(&paths, false).await,
         Some(Commands::Status { global }) => cli::handle_status(&paths, global).await,
-        Some(Commands::Config {
-            global,
-            explain,
-        }) => cli::handle_config(&paths, global, explain).await,
-        Some(Commands::Enable { target, remote }) => {
-            if remote {
-                cli::handle_remote_enable(&paths, target.as_deref()).await
-            } else {
-                cli::handle_enable(&paths, target).await
-            }
+        Some(Commands::Config) => cli::handle_config(&paths).await,
+        Some(Commands::Enable { remote, all }) => {
+            cli::handle_enable(&paths, remote, all).await
         }
-        Some(Commands::Disable { target, remote, purge }) => {
-            if remote {
-                cli::handle_remote_disable(&paths, target.as_deref()).await
-            } else {
-                cli::handle_disable(&paths, target, purge).await
-            }
+        Some(Commands::Disable { remote, all, purge }) => {
+            cli::handle_disable(&paths, remote, all, purge).await
         }
         Some(Commands::Trust { host }) => cli::handle_trust(&paths, &host).await,
         Some(Commands::Untrust { host }) => cli::handle_untrust(&paths, &host).await,

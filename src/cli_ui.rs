@@ -1,7 +1,7 @@
 //! Shared CLI display helpers.
 //!
-//! Provides consistent formatting for repo headers, mode indicators,
-//! daemon warnings, and change hints across all CLI commands.
+//! Provides consistent formatting for repo headers, status icons,
+//! and daemon warnings across all CLI commands.
 
 use crossterm::style::Stylize;
 
@@ -26,16 +26,6 @@ pub fn repo_header(path: &str, opts: DisplayOpts) -> String {
     }
 }
 
-/// Format the sync mode summary line.
-pub fn mode_line(opts: DisplayOpts) -> String {
-    let label = "Sync: auto (fetch + pull always, push if owner)";
-    if opts.colors {
-        format!("{}", label.blue())
-    } else {
-        label.to_string()
-    }
-}
-
 /// Format the daemon warning line.
 pub fn daemon_warning(opts: DisplayOpts) -> String {
     let icon = if opts.emoji { "\u{26A0}" } else { "!" };
@@ -45,11 +35,6 @@ pub fn daemon_warning(opts: DisplayOpts) -> String {
     } else {
         msg
     }
-}
-
-/// Format the change hint line.
-pub fn change_hint() -> String {
-    "Manage with: gitsitter enable/disable".to_string()
 }
 
 /// Format a success prefix icon.
@@ -123,14 +108,9 @@ pub fn branch_status_styled(status: &str, opts: DisplayOpts) -> String {
     }
 }
 
-/// Print the standard repo info block used by register and enable.
-/// Includes optional daemon warning and change hint.
-pub fn print_repo_info_block(daemon_running: bool, opts: DisplayOpts) {
+/// Print daemon warning if not running (used by register and enable).
+pub fn print_daemon_warning(daemon_running: bool, opts: DisplayOpts) {
     if !daemon_running {
-        println!("   {}", daemon_warning(opts));
+        println!("  {}", daemon_warning(opts));
     }
-    println!();
-    println!("   {}", mode_line(opts));
-    println!();
-    println!("   {}", change_hint());
 }

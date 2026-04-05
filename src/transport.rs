@@ -73,7 +73,6 @@ pub enum Response {
 pub struct StatusData {
     pub repo_id: String,
     pub display_path: String,
-    pub mode: String,
     pub last_sync: Option<String>,
     pub branches: Vec<BranchStatusData>,
     /// Remote names that are not trusted (host not in trusted_hosts).
@@ -100,7 +99,6 @@ pub struct BranchStatusData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoStatusData {
     pub display_path: String,
-    pub mode: String,
     /// e.g. "10 synced", "1/9 diverged"
     pub status_summary: String,
     pub last_sync: Option<String>,
