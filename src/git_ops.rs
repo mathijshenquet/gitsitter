@@ -551,27 +551,78 @@ pub fn is_branch_owned_by_user(repo_id: &Path, branch_name: &str) -> Result<bool
         None => return Ok(false),
     };
 
+    let committer_email = get_upstream_committer_email(&repo, branch_name)?;
+    let committer_email = match committer_email {
+        Some(e) => e,
+        None => return Ok(false),
+    };
+
+    Ok(committer_email.eq_ignore_ascii_case(&user_email))
+}
+
+/// Like `is_branch_owned_by_user` but with forge fallbacks:
+/// 1. Local committer email match (same as above)
+/// 2. Committer email matches any verified email of the forge user
+/// 3. Authenticated user is creator/assignee of a PR for this branch
+pub async fn is_branch_owned_by_user_with_forge(
+    repo_id: &Path,
+    branch_name: &str,
+    remote_url: Option<&str>,
+    forge_cache: &crate::forge::ForgeCache,
+) -> Result<bool> {
+    // 1. Local committer email match
+    if is_branch_owned_by_user(repo_id, branch_name)? {
+        return Ok(true);
+    }
+
+    let gh_repo = remote_url.and_then(crate::forge::parse_github_remote);
+
+    // 2. Check committer email against forge emails
+    if gh_repo.is_some() {
+        let repo = git2::Repository::open(repo_id)?;
+        if let Some(committer_email) = get_upstream_committer_email(&repo, branch_name)? {
+            if forge_cache.email_matches_user(&committer_email).await {
+                return Ok(true);
+            }
+        }
+    }
+
+    // 3. Check PR ownership
+    if let Some(ref gh_repo) = gh_repo {
+        if forge_cache.user_owns_pr(gh_repo, branch_name).await {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Get the committer email of the upstream tip for a branch.
+fn get_upstream_committer_email(
+    repo: &git2::Repository,
+    branch_name: &str,
+) -> Result<Option<String>> {
     let branch = repo
         .find_branch(branch_name, git2::BranchType::Local)
         .with_context(|| format!("branch '{}' not found", branch_name))?;
 
     let upstream = match branch.upstream() {
         Ok(u) => u,
-        Err(_) => return Ok(false),
+        Err(_) => return Ok(None),
     };
 
     let upstream_oid = match upstream.get().target() {
         Some(oid) => oid,
-        None => return Ok(false),
+        None => return Ok(None),
     };
 
     let commit = repo
         .find_commit(upstream_oid)
         .with_context(|| format!("failed to find upstream commit {}", upstream_oid))?;
 
-    let committer_email = commit.committer().email().unwrap_or("").to_string();
-
-    Ok(committer_email.eq_ignore_ascii_case(&user_email))
+    Ok(Some(
+        commit.committer().email().unwrap_or("").to_string(),
+    ))
 }
 
 /// Force-push a branch with --force-with-lease (safe force-push).

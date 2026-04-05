@@ -17,6 +17,7 @@ use tokio::sync::{Notify, RwLock, watch};
 use tracing::{error, info, warn};
 
 use crate::config::UserConfig;
+use crate::forge::ForgeCache;
 use crate::git_ops::{
     self, MergeAnalysis, PushResult,
 };
@@ -51,6 +52,7 @@ pub struct Daemon {
     pub repos: RwLock<HashMap<String, TrackedRepo>>,
     pub sync_notify: Notify,
     pub shutdown_tx: watch::Sender<bool>,
+    pub forge_cache: ForgeCache,
 }
 
 /// In-memory tracking info for a single repo.
@@ -249,6 +251,7 @@ pub async fn run_daemon(paths: &Paths) -> Result<()> {
         repos: RwLock::new(repo_states),
         sync_notify: Notify::new(),
         shutdown_tx,
+        forge_cache: ForgeCache::new(),
     });
 
     // 8. Remove stale endpoint if it exists
@@ -1071,8 +1074,15 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
 
             // 5e. Local ahead — push if user owns the branch
             MergeAnalysis::LocalAhead => {
-                let is_owner = git_ops::is_branch_owned_by_user(&repo_path, &branch.name)
-                    .unwrap_or(false);
+                let branch_remote_url = remote_urls.get(&branch.remote).map(|s| s.as_str());
+                let is_owner = git_ops::is_branch_owned_by_user_with_forge(
+                    &repo_path,
+                    &branch.name,
+                    branch_remote_url,
+                    &daemon.forge_cache,
+                )
+                .await
+                .unwrap_or(false);
                 let is_merge_of_remote = !is_owner
                     && git_ops::is_local_merge_of_remote(&repo_path, &branch.name)
                         .unwrap_or(false);
@@ -1205,8 +1215,15 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
 
             // 5f. Diverged — check if we own the remote tip
             MergeAnalysis::Diverged => {
-                let is_owner = git_ops::is_branch_owned_by_user(&repo_path, &branch.name)
-                    .unwrap_or(false);
+                let branch_remote_url = remote_urls.get(&branch.remote).map(|s| s.as_str());
+                let is_owner = git_ops::is_branch_owned_by_user_with_forge(
+                    &repo_path,
+                    &branch.name,
+                    branch_remote_url,
+                    &daemon.forge_cache,
+                )
+                .await
+                .unwrap_or(false);
 
                 if is_owner {
                     // We own the remote tip (likely a rebase/amend) — try force-with-lease

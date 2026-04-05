@@ -2,6 +2,7 @@ pub mod cli;
 pub mod cli_ui;
 pub mod config;
 pub mod daemon;
+pub mod forge;
 pub mod git_ops;
 pub mod paths;
 pub mod service;
