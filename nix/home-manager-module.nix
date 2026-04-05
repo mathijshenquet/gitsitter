@@ -41,6 +41,12 @@ in
       default = pkgs.stdenv.isLinux;
       description = "Whether to run gitsitter as a user systemd service.";
     };
+
+    launchd.enable = lib.mkOption {
+      type = lib.types.bool;
+      default = pkgs.stdenv.isDarwin;
+      description = "Whether to run gitsitter as a launchd user agent.";
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -50,6 +56,7 @@ in
       source = tomlFormat.generate "gitsitter-config.toml" renderedSettings;
     };
 
+    # Keep in sync with src/embed/gitsitter.service
     systemd.user.services.gitsitter = lib.mkIf cfg.systemd.enable {
       Unit = {
         Description = "gitsitter daemon";
@@ -62,6 +69,21 @@ in
       };
       Install = {
         WantedBy = [ "default.target" ];
+      };
+    };
+
+    # Keep in sync with src/embed/com.gitsitter.daemon.plist
+    launchd.agents.gitsitter = lib.mkIf cfg.launchd.enable {
+      enable = true;
+      config = {
+        Label = "com.gitsitter.daemon";
+        ProgramArguments = [ "${cfg.package}/bin/gitsitter" "daemon" "run" ];
+        RunAtLoad = true;
+        KeepAlive = {
+          SuccessfulExit = false;
+        };
+        StandardOutPath = "${config.xdg.stateHome}/gitsitter/gitsitter.out.log";
+        StandardErrorPath = "${config.xdg.stateHome}/gitsitter/gitsitter.err.log";
       };
     };
 

@@ -1,3 +1,4 @@
+# Keep in sync with nix/home-manager-module.nix (systemd.user.services.gitsitter)
 [Unit]
 Description=gitsitter daemon
 
