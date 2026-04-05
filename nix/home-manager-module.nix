@@ -9,6 +9,8 @@ let
   fishHook = builtins.readFile ../src/embed/fish_hook.fish;
   defaultSettings = builtins.fromTOML (builtins.readFile ../config/default-config.toml);
   renderedSettings = lib.recursiveUpdate defaultSettings cfg.settings;
+  daemonPathPackages = [ pkgs.git ] ++ lib.optional cfg.githubIntegration.enable pkgs.gh;
+  daemonPath = lib.makeBinPath daemonPathPackages;
 in
 {
   options.services.gitsitter = {
@@ -47,6 +49,8 @@ in
       default = pkgs.stdenv.isDarwin;
       description = "Whether to run gitsitter as a launchd user agent.";
     };
+
+    githubIntegration.enable = lib.mkEnableOption "GitHub integration (relaxed ownership via gh CLI)";
   };
 
   config = lib.mkIf cfg.enable {
@@ -66,6 +70,9 @@ in
         ExecStart = "${cfg.package}/bin/gitsitter daemon run";
         Restart = "on-failure";
         RestartSec = 5;
+        Environment = [
+          "PATH=${daemonPath}"
+        ];
       };
       Install = {
         WantedBy = [ "default.target" ];
@@ -84,6 +91,9 @@ in
         };
         StandardOutPath = "${config.xdg.stateHome}/gitsitter/gitsitter.out.log";
         StandardErrorPath = "${config.xdg.stateHome}/gitsitter/gitsitter.err.log";
+        EnvironmentVariables = {
+          PATH = daemonPath;
+        };
       };
     };
 
