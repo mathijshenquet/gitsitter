@@ -442,7 +442,6 @@ async fn handle_global_status(daemon: &SharedDaemon) -> Response {
 
         result.push(RepoStatusData {
             display_path: tr.display_path.clone(),
-            mode: "auto".to_string(),
             status_summary,
             last_sync: tr.last_sync_wall.clone(),
         });
@@ -660,7 +659,6 @@ fn build_status_data(tr: &TrackedRepo, config: &UserConfig) -> StatusData {
     StatusData {
         repo_id: tr.repo_id.clone(),
         display_path: tr.display_path.clone(),
-        mode: "auto".to_string(),
         last_sync: tr.last_sync_wall.clone(),
         branches,
         untrusted_remotes,
@@ -1075,8 +1073,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
             MergeAnalysis::LocalAhead => {
                 let is_owner = git_ops::is_branch_owned_by_user(&repo_path, &branch.name)
                     .unwrap_or(false);
+                let is_merge_of_remote = !is_owner
+                    && git_ops::is_local_merge_of_remote(&repo_path, &branch.name)
+                        .unwrap_or(false);
 
-                if !is_owner {
+                if !is_owner && !is_merge_of_remote {
                     // User doesn't own this branch — nag, don't push
                     let mut repos = daemon.repos.write().await;
                     if let Some(tr) = repos.get_mut(repo_id) {

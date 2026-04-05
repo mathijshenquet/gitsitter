@@ -493,6 +493,50 @@ pub fn get_current_user_email(repo_id: &Path) -> Result<Option<String>> {
     }
 }
 
+/// Check if the local tip is a merge commit that has the upstream tip as a
+/// direct parent. In that case, pushing is safe even if we don't "own" the
+/// remote branch, because the merge incorporates all remote changes.
+pub fn is_local_merge_of_remote(repo_id: &Path, branch_name: &str) -> Result<bool> {
+    let repo = git2::Repository::open(repo_id)
+        .with_context(|| format!("failed to open repo at {}", repo_id.display()))?;
+
+    let branch = repo
+        .find_branch(branch_name, git2::BranchType::Local)
+        .with_context(|| format!("branch '{}' not found", branch_name))?;
+
+    let local_oid = match branch.get().target() {
+        Some(oid) => oid,
+        None => return Ok(false),
+    };
+
+    let upstream = match branch.upstream() {
+        Ok(u) => u,
+        Err(_) => return Ok(false),
+    };
+
+    let upstream_oid = match upstream.get().target() {
+        Some(oid) => oid,
+        None => return Ok(false),
+    };
+
+    let local_commit = repo
+        .find_commit(local_oid)
+        .with_context(|| format!("failed to find local commit {}", local_oid))?;
+
+    // Must be a merge commit (>1 parent) with the upstream tip as a direct parent
+    if local_commit.parent_count() < 2 {
+        return Ok(false);
+    }
+
+    for i in 0..local_commit.parent_count() {
+        if local_commit.parent_id(i) == Ok(upstream_oid) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 /// Check if the current user "owns" a branch by comparing the tip commit
 /// of the upstream ref to the current user's email (case-insensitive).
 ///

@@ -4,7 +4,8 @@ A git utility that keeps your local branches in sync with their tracking remotes
 
 - **Remote ahead** → fast-forward merge into local
 - **Local ahead + you own the branch** → push to remote
-- **Local ahead + not your branch** → notify the user
+- **Local ahead + not your branch** → notify the user (unless local tip is a merge of the remote tip)
+
 - **Diverged + you own the remote tip** → force-push with lease (safe rebase workflow)
 - **Diverged + not your remote tip** → notify the user
 
@@ -22,6 +23,7 @@ gitsitter decides whether to auto-push based on a simple heuristic: **if the tip
 - Your feature branches get pushed automatically.
 - Someone else's branch that you checked out won't get pushed, even if you commit on it.
 - If someone else pushes to your branch, gitsitter stops auto-pushing until you push manually (reclaiming ownership).
+- **Exception:** if your local tip is a merge commit that includes the remote tip as a parent, gitsitter pushes anyway — merging someone else's work is an explicit integration, not an overwrite.
 
 ## Quick Start
 
@@ -53,17 +55,17 @@ gitsitter                          # show status for current repo
 gitsitter status --global          # show status for all tracked repos
 gitsitter sync                     # trigger immediate sync for current repo
 gitsitter sync --all               # trigger immediate sync for all repos
-gitsitter config                   # show config for current repo
-gitsitter config --global          # show global config
-gitsitter config --explain         # show trust, disabled, and ownership diagnostics
+gitsitter config                   # show global config (highlights current repo)
 gitsitter resolve                  # interactively resolve sync issues
 gitsitter resolve --global         # resolve issues across all repos
-gitsitter enable                   # enable current repo
-gitsitter disable                  # disable current repo
+gitsitter enable                   # enable syncing (single-remote repos)
+gitsitter enable <remote>          # enable a specific remote
+gitsitter enable --all             # enable all remotes
+gitsitter disable                  # disable syncing (single-remote repos)
+gitsitter disable <remote>         # disable a specific remote
+gitsitter disable --all            # disable all remotes
 gitsitter trust <host>             # trust a remote host
 gitsitter untrust <host>           # untrust a remote host
-gitsitter enable --remote <name>   # enable a specific remote
-gitsitter disable --remote <name>  # disable a specific remote
 gitsitter log                      # show daemon log for current repo
 gitsitter log --global             # show global daemon log
 gitsitter daemon status            # check if daemon is running
@@ -126,7 +128,7 @@ Per repo, per refresh interval:
 5. For each tracked branch: analyze merge status
    - Fast-forward possible → ff-merge (checked out) or update-ref (not checked out)
    - Local ahead + owned → push
-   - Local ahead + not owned → record as actionable issue
+   - Local ahead + not owned → record as actionable issue (unless local tip merges the remote tip → push)
    - Diverged + owned → force-push with lease (safe rebase workflow)
    - Diverged + not owned → record as actionable issue
 
