@@ -5,8 +5,6 @@
 
 use crossterm::style::Stylize;
 
-use crate::config::RepoSyncMode;
-
 /// Display settings extracted from config.
 #[derive(Debug, Clone, Copy)]
 pub struct DisplayOpts {
@@ -28,55 +26,14 @@ pub fn repo_header(path: &str, opts: DisplayOpts) -> String {
     }
 }
 
-/// Format the mode indicator line: `Mode: pull   Fetch ✓  Pull ✓  Push ·`
-pub fn mode_line(mode: RepoSyncMode, opts: DisplayOpts) -> String {
-    let (fetch, pull, push) = match mode {
-        RepoSyncMode::None => (false, false, false),
-        RepoSyncMode::Fetch => (true, false, false),
-        RepoSyncMode::Pull => (true, true, false),
-        RepoSyncMode::Push => (true, false, true),
-        RepoSyncMode::PushPull => (true, true, true),
-    };
-
-    let mode_name = if opts.colors {
-        format!("{}", mode.to_string().blue())
+/// Format the sync mode summary line.
+pub fn mode_line(opts: DisplayOpts) -> String {
+    let label = "Sync: auto (fetch + pull always, push if owner)";
+    if opts.colors {
+        format!("{}", label.blue())
     } else {
-        mode.to_string()
-    };
-
-    let fmt_flag = |name: &str, active: bool| -> String {
-        if opts.emoji {
-            if active {
-                if opts.colors {
-                    format!("{} {}", name.green(), "\u{2713}".green())
-                } else {
-                    format!("{} \u{2713}", name)
-                }
-            } else if opts.colors {
-                format!("{} {}", name.dark_grey(), "\u{00B7}".dark_grey())
-            } else {
-                format!("{} \u{00B7}", name)
-            }
-        } else if active {
-            if opts.colors {
-                format!("{} {}", name.green(), "[on]".green())
-            } else {
-                format!("{} [on]", name)
-            }
-        } else if opts.colors {
-            format!("{} {}", name.dark_grey(), "[off]".dark_grey())
-        } else {
-            format!("{} [off]", name)
-        }
-    };
-
-    format!(
-        "Mode: {}   {}  {}  {}",
-        mode_name,
-        fmt_flag("Fetch", fetch),
-        fmt_flag("Pull", pull),
-        fmt_flag("Push", push),
-    )
+        label.to_string()
+    }
 }
 
 /// Format the daemon warning line.
@@ -92,7 +49,7 @@ pub fn daemon_warning(opts: DisplayOpts) -> String {
 
 /// Format the change hint line.
 pub fn change_hint() -> String {
-    "Change with: gitsitter config --repo <mode>".to_string()
+    "Manage with: gitsitter enable/disable".to_string()
 }
 
 /// Format a success prefix icon.
@@ -166,14 +123,14 @@ pub fn branch_status_styled(status: &str, opts: DisplayOpts) -> String {
     }
 }
 
-/// Print the standard repo info block used by register, enable, and status.
-/// Includes mode line, optional daemon warning, and change hint.
-pub fn print_repo_info_block(mode: RepoSyncMode, daemon_running: bool, opts: DisplayOpts) {
+/// Print the standard repo info block used by register and enable.
+/// Includes optional daemon warning and change hint.
+pub fn print_repo_info_block(daemon_running: bool, opts: DisplayOpts) {
     if !daemon_running {
         println!("   {}", daemon_warning(opts));
     }
     println!();
-    println!("   {}", mode_line(mode, opts));
+    println!("   {}", mode_line(opts));
     println!();
     println!("   {}", change_hint());
 }

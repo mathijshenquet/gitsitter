@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use comfy_table::{presets, Cell, Color, ContentArrangement, Table};
 
 use crate::cli_ui::{self, DisplayOpts};
-use crate::config::{self, RepoSyncMode, UserConfig};
+use crate::config::{self, UserConfig};
 use crate::git_ops;
 use crate::paths::Paths;
 use crate::transport::{
@@ -153,11 +153,8 @@ pub async fn handle_status(paths: &Paths, global: bool) -> Result<()> {
         println!("{}", cli_ui::repo_header(&dp, opts));
         println!();
         println!("   No sync data available, ensure the daemon is running");
-        // Still show mode info
-        let cfg = UserConfig::load(&paths.config_file)?;
-        let mode = resolve_repo_mode_for_display(&cfg, &repo_path)?;
         println!();
-        println!("  {}", cli_ui::mode_line(mode, opts));
+        println!("  {}", cli_ui::mode_line(opts));
         println!("  {}", cli_ui::change_hint());
         println!();
         return Ok(());
@@ -195,10 +192,9 @@ async fn handle_status_global(paths: &Paths, opts: DisplayOpts, daemon_running: 
             let mut table = global_status_table();
             for (path, repo_cfg) in &cfg.repos {
                 let dp = display_path(path);
-                let mode = repo_cfg.mode.unwrap_or(RepoSyncMode::Pull);
                 let disabled = repo_cfg.disabled.as_ref().map_or(false, |d| d.is_repo_disabled());
                 let sync = if disabled { "never synced, disabled" } else { "never synced" };
-                table.add_row(global_status_row(&dp, &mode.to_string(), sync, "", opts));
+                table.add_row(global_status_row(&dp, "auto", sync, "", opts));
             }
             println!("{table}");
             println!();
@@ -289,15 +285,6 @@ fn print_untrusted_remote_warnings(repo_id: &Path, cfg: &UserConfig, opts: Displ
     }
 }
 
-fn resolve_repo_mode_for_display(cfg: &UserConfig, repo_path: &str) -> Result<RepoSyncMode> {
-    let repo_id_path = PathBuf::from(repo_path);
-    let remote_url = git_ops::get_remote_url(&repo_id_path)?
-        .unwrap_or_default();
-    let display_path = git_ops::get_display_path(&repo_id_path)?;
-    let in_repo = config::InRepoConfig::load(&display_path)?;
-    Ok(cfg.resolve_repo_mode(&remote_url, repo_path, in_repo.as_ref()))
-}
-
 fn print_repo_status(data: &transport::StatusData, opts: DisplayOpts) {
     println!();
 
@@ -325,13 +312,7 @@ fn print_repo_status(data: &transport::StatusData, opts: DisplayOpts) {
         );
     }
     println!();
-    println!(
-        "  {}",
-        cli_ui::mode_line(
-            data.mode.parse::<RepoSyncMode>().unwrap_or(RepoSyncMode::Pull),
-            opts
-        )
-    );
+    println!("  {}", cli_ui::mode_line(opts));
     // Show remote warnings
     if !data.untrusted_remotes.is_empty() {
         for r in &data.untrusted_remotes {
@@ -356,79 +337,17 @@ fn print_repo_status(data: &transport::StatusData, opts: DisplayOpts) {
 
 pub async fn handle_config(paths: &Paths,
     global: bool,
-    repo: Option<String>,
-    branch: Option<String>,
     explain: bool,
 ) -> Result<()> {
     if explain {
         return handle_config_explain(paths).await;
     }
 
-    if repo.is_some() || branch.is_some() {
-        let repo_path = resolve_cwd_repo_path()?;
-        write_config_change(paths, &repo_path, repo.as_deref(), branch.as_deref()).await?;
-        return Ok(());
-    }
-
-    // No flags: just print current config summary
     if global {
         print_global_config(paths)?;
     } else {
         print_repo_config(paths)?;
     }
-    Ok(())
-}
-
-async fn write_config_change(paths: &Paths,
-    repo_path: &str,
-    repo_mode: Option<&str>,
-    branch_mode: Option<&str>,
-) -> Result<()> {
-    // Parse modes before taking the lock
-    let parsed_repo_mode = repo_mode
-        .map(|s| {
-            serde_json::from_value::<RepoSyncMode>(serde_json::Value::String(s.to_string()))
-                .with_context(|| format!("invalid repo sync mode: {}", s))
-        })
-        .transpose()?;
-
-    let parsed_branch = if let Some(mode_str) = branch_mode {
-        let mode: config::BranchSyncMode =
-            serde_json::from_value(serde_json::Value::String(mode_str.to_string()))
-                .with_context(|| format!("invalid branch sync mode: {}", mode_str))?;
-        let cwd = std::env::current_dir()?;
-        let repo_id_path = git_ops::discover_repo_id(&cwd)?;
-        let repo = git2::Repository::open(&repo_id_path)?;
-        let head = repo.head()?;
-        let branch_name = head.shorthand().unwrap_or("HEAD").to_string();
-        println!("Set branch '{}' to {:?}", branch_name, mode);
-        Some((branch_name, mode))
-    } else {
-        None
-    };
-
-    let repo_path = repo_path.to_string();
-    UserConfig::modify(&paths.config_file, move |cfg: &mut UserConfig| {
-        if let Some(mode) = parsed_repo_mode {
-            let entry = cfg.repos.entry(repo_path.clone()).or_default();
-            entry.mode = Some(mode);
-        }
-        if let Some((branch_name, branch_mode)) = parsed_branch {
-            let entry = cfg.repos.entry(repo_path.clone()).or_default();
-            let mut found = false;
-            for (name, mode) in &mut entry.branches {
-                if name == &branch_name {
-                    *mode = branch_mode;
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                entry.branches.push((branch_name, branch_mode));
-            }
-        }
-    })?;
-    notify_daemon_reload(paths).await;
     Ok(())
 }
 
@@ -462,9 +381,6 @@ fn print_global_config(paths: &Paths) -> Result<()> {
         for (path, repo_cfg) in &cfg.repos {
             let dp = display_path(path);
             println!("  {}:", dp);
-            if let Some(mode) = repo_cfg.mode {
-                println!("    mode: {:?}", mode);
-            }
             if let Some(d) = &repo_cfg.disabled {
                 match d {
                     config::Disabled::All(true) => println!("    disabled: true"),
@@ -474,12 +390,6 @@ fn print_global_config(paths: &Paths) -> Result<()> {
             }
             if let Some(ri) = repo_cfg.refresh_interval {
                 println!("    refresh_interval: {:?}", ri);
-            }
-            if !repo_cfg.branches.is_empty() {
-                println!("    branches:");
-                for (pat, mode) in &repo_cfg.branches {
-                    println!("      {}: {:?}", pat, mode);
-                }
             }
         }
     }
@@ -500,8 +410,7 @@ fn print_repo_config(paths: &Paths) -> Result<()> {
     println!("Config for {}", cli_ui::repo_header(&dp, opts));
     println!();
 
-    let mode = resolve_repo_mode_for_display(&cfg, &repo_path)?;
-    println!("  {}", cli_ui::mode_line(mode, opts));
+    println!("  {}", cli_ui::mode_line(opts));
     println!();
 
     let refresh = cfg.effective_refresh_interval(
@@ -509,15 +418,6 @@ fn print_repo_config(paths: &Paths) -> Result<()> {
         config::InRepoConfig::load(&git_ops::get_display_path(&PathBuf::from(&repo_path))?)?.as_ref(),
     );
     println!("  Refresh interval: {}s", refresh.as_secs());
-
-    if let Some(repo_cfg) = cfg.repos.get(&repo_path) {
-        if !repo_cfg.branches.is_empty() {
-            println!("  Branches:");
-            for (pat, mode) in &repo_cfg.branches {
-                println!("    {:<12} {:?}", pat, mode);
-            }
-        }
-    }
     Ok(())
 }
 
@@ -525,95 +425,56 @@ async fn handle_config_explain(paths: &Paths) -> Result<()> {
     let cfg = UserConfig::load(&paths.config_file)?;
     let repo_path = resolve_cwd_repo_path()?;
     let dp = display_path(&repo_path);
-
     let repo_id_path = PathBuf::from(&repo_path);
-    let remote_url = git_ops::get_remote_url(&repo_id_path)?
-        .unwrap_or_default();
-    let in_repo = crate::config::InRepoConfig::load(
-        &git_ops::get_display_path(&repo_id_path)?,
-    )?;
 
-    let repo_mode = cfg.resolve_repo_mode(
-        &remote_url,
-        &repo_path,
-        in_repo.as_ref(),
-    );
-
-    println!("Config resolution for {}:", dp);
-    println!();
-    println!("  Remote URL: {}", if remote_url.is_empty() { "(none)" } else { &remote_url });
+    println!("Config diagnostics for {}:", dp);
     println!();
 
-    // Show resolution chain for repo mode
-    println!("  Repo sync mode: {:?}", repo_mode);
-    println!("  Resolution chain:");
-
-    // Check host trust
-    if let Some(host) = config::extract_host(&remote_url) {
-        let trusted = cfg.is_host_trusted(&host);
-        println!("    1. Host trust ({host}): {}", if trusted { "trusted" } else { "UNTRUSTED -> None" });
-        if !trusted {
-            return Ok(());
-        }
+    // Repo disabled?
+    if cfg.is_repo_disabled(&repo_path) {
+        println!("  Status: DISABLED");
+        println!("  Enable with: gitsitter enable");
+        return Ok(());
     }
+    println!("  Status: enabled");
+    println!();
 
-    // Check per-repo
-    if let Some(repo_cfg) = cfg.repos.get(&repo_path) {
-        if repo_cfg.disabled.as_ref().map_or(false, |d| d.is_repo_disabled()) {
-            println!("    2. User config per-repo: disabled");
-            return Ok(());
-        }
-        if let Some(mode) = repo_cfg.mode {
-            println!("    2. User config per-repo: {:?} <-- winner", mode);
-        } else {
-            println!("    2. User config per-repo: (not set)");
-        }
+    // Show remote trust status
+    let remote_urls = git_ops::get_all_remote_urls(&repo_id_path)?;
+    if remote_urls.is_empty() {
+        println!("  No remotes configured.");
     } else {
-        println!("    2. User config per-repo: (not set)");
-    }
-
-    // Check in-repo
-    match &in_repo {
-        Some(irc) => {
-            if let Some(mode) = irc.mode {
-                println!("    3. .gitsitter.toml: {:?}", mode);
+        println!("  Remotes:");
+        for (name, url) in &remote_urls {
+            let trusted = cfg.is_remote_trusted(url);
+            let disabled = cfg.is_remote_disabled(&repo_path, name);
+            let status = if disabled {
+                "disabled"
+            } else if trusted {
+                "trusted"
             } else {
-                println!("    3. .gitsitter.toml: (not set)");
-            }
-        }
-        None => {
-            println!("    3. .gitsitter.toml: (not present)");
+                "UNTRUSTED"
+            };
+            println!("    {} ({}) — {}", name, url, status);
         }
     }
-
-    // Check defaults.remotes
-    let mut matched_default = false;
-    for (pattern, mode) in &cfg.defaults.remotes {
-        if config::matches_remote_glob(&remote_url, pattern) {
-            println!("    4. defaults.remotes[\"{}\"]: {:?}", pattern, mode);
-            matched_default = true;
-            break;
-        }
-    }
-    if !matched_default {
-        println!("    4. defaults.remotes: (no match)");
-    }
-
-    println!("    5. Fallback: Pull");
-
-    // Show branch resolution for current branch
     println!();
+
+    // Refresh interval
+    let in_repo = config::InRepoConfig::load(&git_ops::get_display_path(&repo_id_path)?)?;
+    let refresh = cfg.effective_refresh_interval(&repo_path, in_repo.as_ref());
+    println!("  Refresh interval: {}s", refresh.as_secs());
+    println!();
+
+    // Show current branch ownership
     let cwd = std::env::current_dir()?;
     let repo = git2::Repository::discover(&cwd)?;
     if let Ok(head) = repo.head() {
         if let Some(branch_name) = head.shorthand() {
-            let branch_mode = cfg.resolve_branch_mode(
-                &repo_path,
-                branch_name,
-                in_repo.as_ref(),
-                repo_mode,
-            );
-            println!("  Branch '{}' mode: {:?}", branch_name, branch_mode);
+            let owned = git_ops::is_branch_owned_by_user(&repo_id_path, branch_name)
+                .unwrap_or(false);
+            println!("  Branch '{}': auto-push {}", branch_name,
+                if owned { "YES (you own it)" } else { "NO (not your branch)" });
         }
     }
 
@@ -644,9 +505,8 @@ pub async fn handle_enable(paths: &Paths, path: Option<String>) -> Result<()> {
     println!("{} Enabled {}", icon, cli_ui::repo_header(&dp, opts));
 
     let cfg = UserConfig::load(&paths.config_file)?;
-    let mode = resolve_repo_mode_for_display(&cfg, &repo_id_str)?;
     let daemon_running = transport::is_daemon_running(&paths.socket_path);
-    cli_ui::print_repo_info_block(mode, daemon_running, opts);
+    cli_ui::print_repo_info_block(daemon_running, opts);
     print_untrusted_remote_warnings(&repo_id, &cfg, opts);
 
     Ok(())
@@ -866,9 +726,8 @@ pub async fn handle_register(paths: &Paths, path: Option<String>) -> Result<()> 
     println!("{} Registered {}", icon, cli_ui::repo_header(&dp, opts));
 
     let cfg = UserConfig::load(&paths.config_file)?;
-    let mode = resolve_repo_mode_for_display(&cfg, &repo_id_str)?;
     let daemon_running = transport::is_daemon_running(&paths.socket_path);
-    cli_ui::print_repo_info_block(mode, daemon_running, opts);
+    cli_ui::print_repo_info_block(daemon_running, opts);
     print_untrusted_remote_warnings(&repo_id, &cfg, opts);
 
     Ok(())

@@ -16,9 +16,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{Notify, RwLock, watch};
 use tracing::{error, info, warn};
 
-use crate::config::{
-    BranchSyncMode, RepoSyncMode, UserConfig,
-};
+use crate::config::UserConfig;
 use crate::git_ops::{
     self, MergeAnalysis, PushResult,
 };
@@ -164,6 +162,7 @@ impl TrackedRepo {
     }
 
     /// Get the URL for the "origin" remote, or the first available remote URL.
+    #[allow(dead_code)]
     fn primary_remote_url(&self) -> &str {
         self.remote_urls
             .get("origin")
@@ -176,6 +175,7 @@ impl TrackedRepo {
         self.branches.insert(name.to_string(), state);
     }
 
+    #[allow(dead_code)]
     fn should_notify(&self, key: &str, cooldown: Duration) -> bool {
         match self.notification_cooldowns.get(key) {
             None => true,
@@ -183,6 +183,7 @@ impl TrackedRepo {
         }
     }
 
+    #[allow(dead_code)]
     fn record_notification(&mut self, key: &str) {
         self.notification_cooldowns.insert(key.to_string(), Instant::now());
     }
@@ -422,13 +423,6 @@ async fn handle_global_status(daemon: &SharedDaemon) -> Response {
 
     let mut result = Vec::with_capacity(repos.len());
     for tr in repos.values() {
-        let in_repo = load_in_repo_config_for(tr).ok().flatten();
-        let mode = config.resolve_repo_mode(
-            tr.primary_remote_url(),
-            &tr.repo_id,
-            in_repo.as_ref(),
-        );
-
         let total = tr.branches.len();
         let synced = tr.branches.values()
             .filter(|b| b.sync_status == "synced" || b.sync_status == "up_to_date")
@@ -448,7 +442,7 @@ async fn handle_global_status(daemon: &SharedDaemon) -> Response {
 
         result.push(RepoStatusData {
             display_path: tr.display_path.clone(),
-            mode: mode.to_string(),
+            mode: "auto".to_string(),
             status_summary,
             last_sync: tr.last_sync_wall.clone(),
         });
@@ -626,12 +620,6 @@ async fn handle_shutdown(daemon: &SharedDaemon) -> Response {
 
 fn build_status_data(tr: &TrackedRepo, config: &UserConfig) -> StatusData {
     let repo_id_path = PathBuf::from(&tr.repo_id);
-    let in_repo = load_in_repo_config_for(tr).ok().flatten();
-    let mode = config.resolve_repo_mode(
-        tr.primary_remote_url(),
-        &tr.repo_id,
-        in_repo.as_ref(),
-    );
 
     // Collect untrusted and disabled remote names for status warnings
     let mut untrusted_remotes = Vec::new();
@@ -672,7 +660,7 @@ fn build_status_data(tr: &TrackedRepo, config: &UserConfig) -> StatusData {
     StatusData {
         repo_id: tr.repo_id.clone(),
         display_path: tr.display_path.clone(),
-        mode: mode.to_string(),
+        mode: "auto".to_string(),
         last_sync: tr.last_sync_wall.clone(),
         branches,
         untrusted_remotes,
@@ -681,11 +669,6 @@ fn build_status_data(tr: &TrackedRepo, config: &UserConfig) -> StatusData {
     }
 }
 
-fn load_in_repo_config_for(tr: &TrackedRepo) -> Result<Option<crate::config::InRepoConfig>> {
-    let repo_id_path = PathBuf::from(&tr.repo_id);
-    let display_path = git_ops::get_display_path(&repo_id_path)?;
-    crate::config::InRepoConfig::load(&display_path)
-}
 
 // ---------------------------------------------------------------------------
 // Sync loop
@@ -827,35 +810,13 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         return Ok(());
     }
 
-    let (remote_urls, primary_remote_url) = {
+    let remote_urls = {
         let repos = daemon.repos.read().await;
         match repos.get(repo_id) {
-            Some(tr) => (tr.remote_urls.clone(), tr.primary_remote_url().to_string()),
-            None => (HashMap::new(), String::new()),
+            Some(tr) => tr.remote_urls.clone(),
+            None => HashMap::new(),
         }
     };
-
-    let in_repo_config = {
-        let repo_id_path = PathBuf::from(repo_id);
-        let display_path = git_ops::get_display_path(&repo_id_path)?;
-        crate::config::InRepoConfig::load(&display_path).ok().flatten()
-    };
-    let repo_mode = config.resolve_repo_mode(
-        &primary_remote_url,
-        repo_id,
-        in_repo_config.as_ref(),
-    );
-
-    // If mode is None, skip entirely
-    if repo_mode == RepoSyncMode::None {
-        let mut repos = daemon.repos.write().await;
-        if let Some(tr) = repos.get_mut(repo_id) {
-            tr.last_sync = Some(Instant::now());
-        }
-        drop(repos);
-        drop(config);
-        return Ok(());
-    }
 
     let git_path = config.global.git_path.clone();
     let git_path_ref = git_path.as_deref();
@@ -869,13 +830,8 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
     // 4. List branches (needed to determine remotes for fetch)
     let branches = git_ops::list_branches(&repo_path).unwrap_or_default();
 
-    // 5. Fetch all unique remotes (if mode includes fetch capability)
-    let should_fetch = matches!(
-        repo_mode,
-        RepoSyncMode::Fetch | RepoSyncMode::Pull | RepoSyncMode::Push | RepoSyncMode::PushPull
-    );
-
-    if should_fetch {
+    // 5. Fetch all trusted, non-disabled remotes
+    {
         let skip_fetch = {
             let repos = daemon.repos.read().await;
             repos
@@ -956,27 +912,6 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
             None => continue,
         };
 
-        // Resolve branch mode
-        let branch_mode = config.resolve_branch_mode(
-            repo_id,
-            &branch.name,
-            in_repo_config.as_ref(),
-            repo_mode,
-        );
-
-        if branch_mode == BranchSyncMode::None {
-            continue;
-        }
-
-        let allows_pull = matches!(
-            branch_mode,
-            BranchSyncMode::Pull | BranchSyncMode::PushPull
-        );
-        let allows_push = matches!(
-            branch_mode,
-            BranchSyncMode::Push | BranchSyncMode::PushPull
-        );
-
         // 5a. Analyze merge status
         let analysis = match git_ops::analyze_merge(&repo_path, &branch.name) {
             Ok(a) => a,
@@ -1023,24 +958,8 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 }
             }
 
-            // 5d. Remote ahead (fast-forward possible)
+            // 5d. Remote ahead (fast-forward possible) — always pull
             MergeAnalysis::FastForward => {
-                if !allows_pull {
-                    // Mode doesn't allow pulling — just record state
-                    let mut repos = daemon.repos.write().await;
-                    if let Some(tr) = repos.get_mut(repo_id) {
-                        tr.set_branch(&branch.name, BranchRuntimeState {
-                            sync_status: "remote_ahead".into(),
-                            last_pull_at: None,
-                            last_push_at: None,
-                            local_oid: Some(branch.local_oid.clone()),
-                            remote_oid: branch.remote_oid.clone(),
-                            error_message: None,
-                        });
-                    }
-                    continue;
-                }
-
                 let remote_oid = match &branch.remote_oid {
                     Some(oid) => oid.clone(),
                     None => continue,
@@ -1152,9 +1071,13 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 }
             }
 
-            // 5e. Local ahead — push
+            // 5e. Local ahead — push if user owns the branch
             MergeAnalysis::LocalAhead => {
-                if !allows_push {
+                let is_owner = git_ops::is_branch_owned_by_user(&repo_path, &branch.name)
+                    .unwrap_or(false);
+
+                if !is_owner {
+                    // User doesn't own this branch — nag, don't push
                     let mut repos = daemon.repos.write().await;
                     if let Some(tr) = repos.get_mut(repo_id) {
                         tr.set_branch(&branch.name, BranchRuntimeState {
@@ -1163,7 +1086,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                             last_push_at: None,
                             local_oid: Some(branch.local_oid.clone()),
                             remote_oid: branch.remote_oid.clone(),
-                            error_message: None,
+                            error_message: Some("local commits on non-owned branch — push manually or create a new branch".into()),
                         });
                     }
                     continue;

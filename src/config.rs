@@ -1,4 +1,4 @@
-//! Configuration parsing and hierarchical resolution for gitsitter.
+//! Configuration parsing for gitsitter.
 //!
 //! Handles TOML config files at two levels:
 //! - User config: `~/.config/gitsitter/config.toml`
@@ -117,59 +117,6 @@ fn serialize_opt_duration<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S
 }
 
 // ---------------------------------------------------------------------------
-// Sync modes
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RepoSyncMode {
-    None,
-    Fetch,
-    Pull,
-    Push,
-    #[serde(rename = "push+pull")]
-    PushPull,
-}
-
-impl std::fmt::Display for RepoSyncMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RepoSyncMode::None => write!(f, "none"),
-            RepoSyncMode::Fetch => write!(f, "fetch"),
-            RepoSyncMode::Pull => write!(f, "pull"),
-            RepoSyncMode::Push => write!(f, "push"),
-            RepoSyncMode::PushPull => write!(f, "push+pull"),
-        }
-    }
-}
-
-impl std::str::FromStr for RepoSyncMode {
-    type Err = String;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "none" => Ok(Self::None),
-            "fetch" => Ok(Self::Fetch),
-            "pull" => Ok(Self::Pull),
-            "push" => Ok(Self::Push),
-            "push+pull" => Ok(Self::PushPull),
-            _ => Err(format!("unknown sync mode: {}", s)),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BranchSyncMode {
-    Inherit,
-    None,
-    Fetch,
-    Pull,
-    Push,
-    #[serde(rename = "push+pull")]
-    PushPull,
-}
-
-// ---------------------------------------------------------------------------
 // Raw serde structs (what the TOML file looks like on disk)
 // ---------------------------------------------------------------------------
 
@@ -180,8 +127,6 @@ struct RawUserConfig {
     global: Option<RawGlobalSettings>,
     #[serde(default)]
     trusted_hosts: Option<IndexMap<String, bool>>,
-    #[serde(default)]
-    defaults: Option<RawDefaultsConfig>,
     #[serde(default)]
     repos: Option<IndexMap<String, RawRepoConfig>>,
 }
@@ -218,29 +163,7 @@ struct RawGlobalSettings {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct RawDefaultsConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    remotes: Option<Vec<RawRemoteRule>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    branches: Option<Vec<RawBranchRule>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RawRemoteRule {
-    pattern: String,
-    mode: RepoSyncMode,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RawBranchRule {
-    pattern: String,
-    mode: BranchSyncMode,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 struct RawRepoConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    mode: Option<RepoSyncMode>,
     #[serde(
         default,
         deserialize_with = "deserialize_opt_duration",
@@ -250,14 +173,10 @@ struct RawRepoConfig {
     refresh_interval: Option<Duration>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     disabled: Option<Disabled>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    branches: Option<Vec<RawBranchRule>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RawInRepoConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    mode: Option<RepoSyncMode>,
     #[serde(
         default,
         deserialize_with = "deserialize_opt_duration",
@@ -265,8 +184,6 @@ struct RawInRepoConfig {
         skip_serializing_if = "Option::is_none"
     )]
     refresh_interval: Option<Duration>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    branches: Option<Vec<RawBranchRule>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -277,7 +194,6 @@ struct RawInRepoConfig {
 pub struct UserConfig {
     pub global: GlobalSettings,
     pub trusted_hosts: HashMap<String, bool>,
-    pub defaults: DefaultsConfig,
     pub repos: HashMap<String, RepoConfig>,
 }
 
@@ -292,27 +208,14 @@ pub struct GlobalSettings {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct DefaultsConfig {
-    /// Ordered list of (glob_pattern, mode). First match wins.
-    pub remotes: Vec<(String, RepoSyncMode)>,
-    /// Ordered list of (pattern, mode). Evaluated by specificity.
-    pub branches: Vec<(String, BranchSyncMode)>,
-}
-
-#[derive(Debug, Clone, Default)]
 pub struct RepoConfig {
-    pub mode: Option<RepoSyncMode>,
     pub refresh_interval: Option<Duration>,
     pub disabled: Option<Disabled>,
-    /// Ordered list of (pattern, mode).
-    pub branches: Vec<(String, BranchSyncMode)>,
 }
 
 #[derive(Debug, Clone)]
 pub struct InRepoConfig {
-    pub mode: Option<RepoSyncMode>,
     pub refresh_interval: Option<Duration>,
-    pub branches: Vec<(String, BranchSyncMode)>,
 }
 
 const DEFAULT_CONFIG_TOML: &str = include_str!("../config/default-config.toml");
@@ -346,40 +249,6 @@ impl Default for UserConfig {
 // Conversions raw <-> public
 // ---------------------------------------------------------------------------
 
-fn remote_rules_to_vec(rules: Option<Vec<RawRemoteRule>>) -> Vec<(String, RepoSyncMode)> {
-    rules
-        .unwrap_or_default()
-        .into_iter()
-        .map(|rule| (rule.pattern, rule.mode))
-        .collect()
-}
-
-fn branch_rules_to_vec(rules: Option<Vec<RawBranchRule>>) -> Vec<(String, BranchSyncMode)> {
-    rules
-        .unwrap_or_default()
-        .into_iter()
-        .map(|rule| (rule.pattern, rule.mode))
-        .collect()
-}
-
-fn vec_to_remote_rules(v: &[(String, RepoSyncMode)]) -> Vec<RawRemoteRule> {
-    v.iter()
-        .map(|(pattern, mode)| RawRemoteRule {
-            pattern: pattern.clone(),
-            mode: *mode,
-        })
-        .collect()
-}
-
-fn vec_to_branch_rules(v: &[(String, BranchSyncMode)]) -> Vec<RawBranchRule> {
-    v.iter()
-        .map(|(pattern, mode)| RawBranchRule {
-            pattern: pattern.clone(),
-            mode: *mode,
-        })
-        .collect()
-}
-
 impl From<RawUserConfig> for UserConfig {
     fn from(raw: RawUserConfig) -> Self {
         let global = match raw.global {
@@ -394,13 +263,6 @@ impl From<RawUserConfig> for UserConfig {
             None => GlobalSettings::default(),
         };
         let trusted_hosts = raw.trusted_hosts.map(|m| m.into_iter().collect()).unwrap_or_default();
-        let defaults = match raw.defaults {
-            Some(d) => DefaultsConfig {
-                remotes: remote_rules_to_vec(d.remotes),
-                branches: branch_rules_to_vec(d.branches),
-            },
-            None => DefaultsConfig::default(),
-        };
         let repos = match raw.repos {
             Some(m) => m
                 .into_iter()
@@ -408,10 +270,8 @@ impl From<RawUserConfig> for UserConfig {
                     (
                         k,
                         RepoConfig {
-                            mode: v.mode,
                             refresh_interval: v.refresh_interval,
                             disabled: v.disabled,
-                            branches: branch_rules_to_vec(v.branches),
                         },
                     )
                 })
@@ -421,7 +281,6 @@ impl From<RawUserConfig> for UserConfig {
         Self {
             global,
             trusted_hosts,
-            defaults,
             repos,
         }
     }
@@ -442,25 +301,6 @@ impl From<&UserConfig> for RawUserConfig {
         } else {
             Some(cfg.trusted_hosts.iter().map(|(k, v)| (k.clone(), *v)).collect())
         };
-        let defaults = {
-            let d = &cfg.defaults;
-            if d.remotes.is_empty() && d.branches.is_empty() {
-                None
-            } else {
-                Some(RawDefaultsConfig {
-                    remotes: if d.remotes.is_empty() {
-                        None
-                    } else {
-                        Some(vec_to_remote_rules(&d.remotes))
-                    },
-                    branches: if d.branches.is_empty() {
-                        None
-                    } else {
-                        Some(vec_to_branch_rules(&d.branches))
-                    },
-                })
-            }
-        };
         let repos = if cfg.repos.is_empty() {
             None
         } else {
@@ -471,14 +311,8 @@ impl From<&UserConfig> for RawUserConfig {
                         (
                             k.clone(),
                             RawRepoConfig {
-                                mode: v.mode,
                                 refresh_interval: v.refresh_interval,
                                 disabled: v.disabled.clone(),
-                                branches: if v.branches.is_empty() {
-                                    None
-                                } else {
-                                    Some(vec_to_branch_rules(&v.branches))
-                                },
                             },
                         )
                     })
@@ -488,7 +322,6 @@ impl From<&UserConfig> for RawUserConfig {
         RawUserConfig {
             global,
             trusted_hosts,
-            defaults,
             repos,
         }
     }
@@ -497,9 +330,7 @@ impl From<&UserConfig> for RawUserConfig {
 impl From<RawInRepoConfig> for InRepoConfig {
     fn from(raw: RawInRepoConfig) -> Self {
         Self {
-            mode: raw.mode,
             refresh_interval: raw.refresh_interval,
-            branches: branch_rules_to_vec(raw.branches),
         }
     }
 }
@@ -631,10 +462,60 @@ impl UserConfig {
     pub fn is_host_trusted(&self, host: &str) -> bool {
         self.trusted_hosts.get(host).copied().unwrap_or(false)
     }
+
+    /// Check whether a remote URL is trusted.
+    ///
+    /// Local `file://` URLs are always trusted. Empty URLs (no remote) are trusted.
+    /// For everything else, the host must appear in `trusted_hosts`.
+    pub fn is_remote_trusted(&self, remote_url: &str) -> bool {
+        if remote_url.is_empty() || remote_url.starts_with("file://") {
+            return true;
+        }
+        match extract_host(remote_url) {
+            Some(host) => self.is_host_trusted(&host),
+            None => false, // can't determine host — not trusted
+        }
+    }
+
+    /// Check whether a specific remote is disabled in per-repo config.
+    pub fn is_remote_disabled(&self, repo_path: &str, remote_name: &str) -> bool {
+        self.repos
+            .get(repo_path)
+            .and_then(|r| r.disabled.as_ref())
+            .map_or(false, |d| d.is_remote_disabled(remote_name))
+    }
+
+    /// Check if a repo is explicitly disabled in user config.
+    pub fn is_repo_disabled(&self, repo_path: &str) -> bool {
+        self.repos
+            .get(repo_path)
+            .and_then(|r| r.disabled.as_ref())
+            .map_or(false, |d| d.is_repo_disabled())
+    }
+
+    /// Get the effective refresh interval for a repo.
+    /// User per-repo > in-repo > global.
+    pub fn effective_refresh_interval(
+        &self,
+        repo_path: &str,
+        in_repo_config: Option<&InRepoConfig>,
+    ) -> Duration {
+        if let Some(repo_cfg) = self.repos.get(repo_path) {
+            if let Some(d) = repo_cfg.refresh_interval {
+                return d;
+            }
+        }
+        if let Some(irc) = in_repo_config {
+            if let Some(d) = irc.refresh_interval {
+                return d;
+            }
+        }
+        self.global.refresh_interval
+    }
 }
 
 // ---------------------------------------------------------------------------
-// URL / glob helpers
+// URL helpers
 // ---------------------------------------------------------------------------
 
 /// Extract the hostname from a git remote URL.
@@ -691,248 +572,4 @@ pub fn extract_host(remote_url: &str) -> Option<String> {
     }
 
     None
-}
-
-/// Check if a remote URL matches a glob pattern using simple prefix/wildcard matching.
-///
-/// The pattern uses `*` as a wildcard that matches any sequence of characters.
-/// This is a simple glob, not a full regex.
-pub fn matches_remote_glob(url: &str, pattern: &str) -> bool {
-    simple_glob_match(url, pattern)
-}
-
-/// Check if a branch name matches a pattern. Supports `*` wildcard.
-pub fn matches_branch_glob(branch: &str, pattern: &str) -> bool {
-    simple_glob_match(branch, pattern)
-}
-
-/// Simple glob matching with `*` wildcard.
-fn simple_glob_match(text: &str, pattern: &str) -> bool {
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        // No wildcard — exact match
-        return text == pattern;
-    }
-
-    let mut pos = 0;
-    for (i, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if i == 0 {
-            // First segment must be a prefix
-            if !text[pos..].starts_with(part) {
-                return false;
-            }
-            pos += part.len();
-        } else if i == parts.len() - 1 {
-            // Last segment must be a suffix
-            if !text[pos..].ends_with(part) {
-                return false;
-            }
-            pos = text.len();
-        } else {
-            // Middle segment must appear somewhere after pos
-            match text[pos..].find(part) {
-                Some(found) => pos += found + part.len(),
-                None => return false,
-            }
-        }
-    }
-    true
-}
-
-/// Returns true if the pattern is an exact name (no wildcards).
-fn is_exact_pattern(pattern: &str) -> bool {
-    !pattern.contains('*')
-}
-
-// ---------------------------------------------------------------------------
-// Config resolution
-// ---------------------------------------------------------------------------
-
-impl UserConfig {
-    /// Resolve the effective repo sync mode.
-    ///
-    /// Resolution order (first match wins):
-    /// 1. User per-repo disabled=true -> None (caller should treat as disabled)
-    /// 2. User per-repo mode
-    /// 3. In-repo .gitsitter.toml mode
-    /// 4. First matching defaults.remotes glob
-    /// 5. Fallback: Pull
-    ///
-    /// Note: trust checking is done per-remote at sync time, not here.
-    pub fn resolve_repo_mode(
-        &self,
-        remote_url: &str,
-        repo_path: &str,
-        in_repo_config: Option<&InRepoConfig>,
-    ) -> RepoSyncMode {
-        // Step 1 & 2: user per-repo config
-        if let Some(repo_cfg) = self.repos.get(repo_path) {
-            if repo_cfg.disabled.as_ref().map_or(false, |d| d.is_repo_disabled()) {
-                return RepoSyncMode::None;
-            }
-            if let Some(mode) = repo_cfg.mode {
-                return mode;
-            }
-        }
-
-        // Step 3: in-repo config
-        if let Some(irc) = in_repo_config {
-            if let Some(mode) = irc.mode {
-                return mode;
-            }
-        }
-
-        // Step 4: defaults.remotes globs (first match wins)
-        for (pattern, mode) in &self.defaults.remotes {
-            if matches_remote_glob(remote_url, pattern) {
-                return *mode;
-            }
-        }
-
-        // Step 5: fallback
-        RepoSyncMode::Pull
-    }
-
-    /// Check whether a remote URL is trusted.
-    ///
-    /// Local `file://` URLs are always trusted. Empty URLs (no remote) are trusted.
-    /// For everything else, the host must appear in `trusted_hosts`.
-    pub fn is_remote_trusted(&self, remote_url: &str) -> bool {
-        if remote_url.is_empty() || remote_url.starts_with("file://") {
-            return true;
-        }
-        match extract_host(remote_url) {
-            Some(host) => self.is_host_trusted(&host),
-            None => false, // can't determine host — not trusted
-        }
-    }
-
-    /// Check whether a specific remote is disabled in per-repo config.
-    pub fn is_remote_disabled(&self, repo_path: &str, remote_name: &str) -> bool {
-        self.repos
-            .get(repo_path)
-            .and_then(|r| r.disabled.as_ref())
-            .map_or(false, |d| d.is_remote_disabled(remote_name))
-    }
-
-    /// Resolve the effective branch sync mode.
-    ///
-    /// Resolution order:
-    /// 1. Exact user per-repo branch rule
-    /// 2. Longest matching user per-repo branch glob
-    /// 3. Exact in-repo branch rule
-    /// 4. Longest matching in-repo branch glob
-    /// 5. Exact defaults.branches rule
-    /// 6. Longest matching defaults.branches glob
-    /// 7. Inherit (from repo effective mode)
-    ///
-    /// Within any layer: exact name beats glob, longer glob beats shorter,
-    /// declaration order breaks ties.
-    pub fn resolve_branch_mode(
-        &self,
-        repo_path: &str,
-        branch_name: &str,
-        in_repo_config: Option<&InRepoConfig>,
-        repo_effective_mode: RepoSyncMode,
-    ) -> BranchSyncMode {
-        // Helper: search a branch list for the best match.
-        // Returns Some(mode) if an exact match or glob match is found.
-        fn find_best_match(
-            branches: &[(String, BranchSyncMode)],
-            branch_name: &str,
-        ) -> Option<BranchSyncMode> {
-            // First pass: look for exact match (first one wins)
-            for (pattern, mode) in branches {
-                if is_exact_pattern(pattern) && pattern == branch_name {
-                    return Some(*mode);
-                }
-            }
-            // Second pass: longest matching glob (declaration order breaks ties)
-            let mut best: Option<(usize, BranchSyncMode)> = None;
-            for (pattern, mode) in branches {
-                if !is_exact_pattern(pattern) && matches_branch_glob(branch_name, pattern) {
-                    let len = pattern.len();
-                    if best.is_none() || len > best.unwrap().0 {
-                        best = Some((len, *mode));
-                    }
-                }
-            }
-            best.map(|(_, m)| m)
-        }
-
-        // Layer 1-2: user per-repo branch rules
-        if let Some(repo_cfg) = self.repos.get(repo_path) {
-            if let Some(mode) = find_best_match(&repo_cfg.branches, branch_name) {
-                if mode != BranchSyncMode::Inherit {
-                    return mode;
-                }
-                // Explicit inherit in user config means fall through to repo mode
-                return branch_mode_from_repo(repo_effective_mode);
-            }
-        }
-
-        // Layer 3-4: in-repo config branch rules
-        if let Some(irc) = in_repo_config {
-            if let Some(mode) = find_best_match(&irc.branches, branch_name) {
-                if mode != BranchSyncMode::Inherit {
-                    return mode;
-                }
-                return branch_mode_from_repo(repo_effective_mode);
-            }
-        }
-
-        // Layer 5-6: defaults.branches
-        if let Some(mode) = find_best_match(&self.defaults.branches, branch_name) {
-            if mode != BranchSyncMode::Inherit {
-                return mode;
-            }
-            return branch_mode_from_repo(repo_effective_mode);
-        }
-
-        // Layer 7: inherit from repo
-        branch_mode_from_repo(repo_effective_mode)
-    }
-
-    /// Check if a repo is explicitly disabled in user config.
-    pub fn is_repo_disabled(&self, repo_path: &str) -> bool {
-        self.repos
-            .get(repo_path)
-            .and_then(|r| r.disabled.as_ref())
-            .map_or(false, |d| d.is_repo_disabled())
-    }
-
-    /// Get the effective refresh interval for a repo.
-    /// User per-repo > in-repo > global.
-    pub fn effective_refresh_interval(
-        &self,
-        repo_path: &str,
-        in_repo_config: Option<&InRepoConfig>,
-    ) -> Duration {
-        if let Some(repo_cfg) = self.repos.get(repo_path) {
-            if let Some(d) = repo_cfg.refresh_interval {
-                return d;
-            }
-        }
-        if let Some(irc) = in_repo_config {
-            if let Some(d) = irc.refresh_interval {
-                return d;
-            }
-        }
-        self.global.refresh_interval
-    }
-}
-
-/// Convert a repo-level sync mode to the equivalent branch-level mode
-/// (used when a branch inherits from its repo).
-fn branch_mode_from_repo(repo_mode: RepoSyncMode) -> BranchSyncMode {
-    match repo_mode {
-        RepoSyncMode::None => BranchSyncMode::None,
-        RepoSyncMode::Fetch => BranchSyncMode::Fetch,
-        RepoSyncMode::Pull => BranchSyncMode::Pull,
-        RepoSyncMode::Push => BranchSyncMode::Push,
-        RepoSyncMode::PushPull => BranchSyncMode::PushPull,
-    }
 }

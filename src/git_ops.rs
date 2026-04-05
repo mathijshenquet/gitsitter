@@ -482,6 +482,54 @@ pub async fn git_push(
     }
 }
 
+/// Get the current user's email from git config.
+pub fn get_current_user_email(repo_id: &Path) -> Result<Option<String>> {
+    let repo = git2::Repository::open(repo_id)
+        .with_context(|| format!("failed to open repo at {}", repo_id.display()))?;
+    let config = repo.config().context("failed to read git config")?;
+    match config.get_string("user.email") {
+        Ok(email) => Ok(Some(email)),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Check if the current user "owns" a branch by comparing the tip commit
+/// of the upstream ref to the current user's email (case-insensitive).
+///
+/// Returns true if the upstream tip was authored by the current user,
+/// meaning auto-push is allowed.
+pub fn is_branch_owned_by_user(repo_id: &Path, branch_name: &str) -> Result<bool> {
+    let repo = git2::Repository::open(repo_id)
+        .with_context(|| format!("failed to open repo at {}", repo_id.display()))?;
+
+    let user_email = match repo.config().ok().and_then(|c| c.get_string("user.email").ok()) {
+        Some(e) => e,
+        None => return Ok(false),
+    };
+
+    let branch = repo
+        .find_branch(branch_name, git2::BranchType::Local)
+        .with_context(|| format!("branch '{}' not found", branch_name))?;
+
+    let upstream = match branch.upstream() {
+        Ok(u) => u,
+        Err(_) => return Ok(false),
+    };
+
+    let upstream_oid = match upstream.get().target() {
+        Some(oid) => oid,
+        None => return Ok(false),
+    };
+
+    let commit = repo
+        .find_commit(upstream_oid)
+        .with_context(|| format!("failed to find upstream commit {}", upstream_oid))?;
+
+    let author_email = commit.author().email().unwrap_or("").to_string();
+
+    Ok(author_email.eq_ignore_ascii_case(&user_email))
+}
+
 /// Update a ref to a new OID, with expected-old-OID for safety.
 pub async fn git_update_ref(
     repo_path: &Path,

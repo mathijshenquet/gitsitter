@@ -4,8 +4,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use gitsitter::config::{
-    self, BranchSyncMode, InRepoConfig, RepoConfig,
-    RepoSyncMode, UserConfig,
+    self, InRepoConfig, RepoConfig, UserConfig,
 };
 use gitsitter::paths::Paths;
 use gitsitter::transport::{self, BranchStatusData, Request, Response};
@@ -59,7 +58,26 @@ fn make_commit(repo: &git2::Repository, filename: &str, content: &str, message: 
         .unwrap();
 }
 
-/// Set up env overrides pointing to a temp directory structure.
+fn make_commit_as(repo: &git2::Repository, filename: &str, content: &str, message: &str, name: &str, email: &str) {
+    let workdir = repo.workdir().expect("not a bare repo");
+    let file_path = workdir.join(filename);
+    std::fs::write(&file_path, content).unwrap();
+
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new(filename)).unwrap();
+    index.write().unwrap();
+
+    let tree_oid = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let sig = git2::Signature::now(name, email).unwrap();
+
+    let parent_commit = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
+
+    repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
+        .unwrap();
+}
+
 /// Build test Paths from a temp base directory.
 #[cfg(unix)]
 fn test_paths(base: &Path) -> Paths {
@@ -88,39 +106,8 @@ mod config_tests {
 
     #[test]
     fn parse_complete_user_config() {
-        // Test complete config parsing via in-repo config features
-        // and a UserConfig constructed from defaults + manual assertions.
-        // We test the TOML parsing through InRepoConfig (which doesn't need env vars)
-        // and test the UserConfig fields directly.
-
-        // First, verify InRepoConfig parsing covers most TOML features
         let tmp = temp_dir();
-        let toml_str = r#"
-mode = "push"
-refresh_interval = "120s"
-
-[[branches]]
-pattern = "main"
-mode = "push+pull"
-
-[[branches]]
-pattern = "release/*"
-mode = "none"
-"#;
-        std::fs::write(tmp.path().join(".gitsitter.toml"), toml_str).unwrap();
-        let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
-        assert_eq!(irc.mode, Some(RepoSyncMode::Push));
-        assert_eq!(irc.refresh_interval, Some(Duration::from_secs(120)));
-        assert_eq!(irc.branches.len(), 2);
-        assert_eq!(irc.branches[0].0, "main");
-        assert_eq!(irc.branches[0].1, BranchSyncMode::PushPull);
-        assert_eq!(irc.branches[1].0, "release/*");
-        assert_eq!(irc.branches[1].1, BranchSyncMode::None);
-
-        // Now test a full UserConfig by loading from a temp env dir.
-        // We set+use+unset the env var as quickly as possible.
-        let tmp2 = temp_dir();
-        let config_dir = tmp2.path().join("cfg");
+        let config_dir = tmp.path().join("cfg");
         std::fs::create_dir_all(&config_dir).unwrap();
 
         let full_toml = r#"
@@ -135,38 +122,9 @@ git_path = "/usr/bin/git"
 "github.com" = true
 "evil.example.com" = false
 
-[[defaults.remotes]]
-pattern = "github.com/*"
-mode = "push+pull"
-
-[[defaults.remotes]]
-pattern = "gitlab.com/*"
-mode = "fetch"
-
-[[defaults.branches]]
-pattern = "main"
-mode = "push+pull"
-
-[[defaults.branches]]
-pattern = "develop"
-mode = "pull"
-
-[[defaults.branches]]
-pattern = "feature/*"
-mode = "push"
-
 [repos."/home/user/project"]
-mode = "push"
 refresh_interval = "30s"
 disabled = false
-
-[[repos."/home/user/project".branches]]
-pattern = "main"
-mode = "push+pull"
-
-[[repos."/home/user/project".branches]]
-pattern = "release/*"
-mode = "none"
 "#;
         std::fs::write(config_dir.join("config.toml"), full_toml).unwrap();
 
@@ -181,19 +139,9 @@ mode = "none"
         assert_eq!(cfg.trusted_hosts.get("github.com"), Some(&true));
         assert_eq!(cfg.trusted_hosts.get("evil.example.com"), Some(&false));
 
-        assert_eq!(cfg.defaults.remotes.len(), 2);
-        assert_eq!(cfg.defaults.remotes[0].0, "github.com/*");
-        assert_eq!(cfg.defaults.remotes[0].1, RepoSyncMode::PushPull);
-        assert_eq!(cfg.defaults.remotes[1].0, "gitlab.com/*");
-        assert_eq!(cfg.defaults.remotes[1].1, RepoSyncMode::Fetch);
-
-        assert_eq!(cfg.defaults.branches.len(), 3);
-
         let repo_cfg = cfg.repos.get("/home/user/project").unwrap();
-        assert_eq!(repo_cfg.mode, Some(RepoSyncMode::Push));
         assert_eq!(repo_cfg.refresh_interval, Some(Duration::from_secs(30)));
         assert_eq!(repo_cfg.disabled, Some(config::Disabled::All(false)));
-        assert_eq!(repo_cfg.branches.len(), 2);
     }
 
     #[test]
@@ -201,36 +149,20 @@ mode = "none"
         let tmp = temp_dir();
         let repo_root = tmp.path();
         let toml_str = r#"
-mode = "fetch"
 refresh_interval = "5m"
-
-[[branches]]
-pattern = "main"
-mode = "push+pull"
-
-[[branches]]
-pattern = "staging"
-mode = "pull"
 "#;
         std::fs::write(repo_root.join(".gitsitter.toml"), toml_str).unwrap();
 
         let irc = InRepoConfig::load(repo_root).unwrap().unwrap();
-        assert_eq!(irc.mode, Some(RepoSyncMode::Fetch));
         assert_eq!(irc.refresh_interval, Some(Duration::from_secs(300)));
-        assert_eq!(irc.branches.len(), 2);
-        assert_eq!(irc.branches[0].0, "main");
-        assert_eq!(irc.branches[0].1, BranchSyncMode::PushPull);
     }
 
     #[test]
     fn parse_empty_config() {
-        // Empty in-repo config should parse to None for all optional fields
         let tmp = temp_dir();
         std::fs::write(tmp.path().join(".gitsitter.toml"), "").unwrap();
         let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
-        assert!(irc.mode.is_none());
         assert!(irc.refresh_interval.is_none());
-        assert!(irc.branches.is_empty());
 
         // Also test UserConfig defaults
         let cfg = UserConfig::default();
@@ -240,18 +172,15 @@ mode = "pull"
         assert_eq!(cfg.global.notification_cooldown, Duration::from_secs(300));
         assert!(cfg.global.git_path.is_none());
         assert_eq!(cfg.trusted_hosts.get("github.com"), Some(&true));
-        assert!(cfg.defaults.remotes.is_empty());
         assert!(cfg.repos.is_empty());
     }
 
     #[test]
     fn parse_missing_config_returns_defaults() {
-        // InRepoConfig returns None when file doesn't exist
         let tmp = temp_dir();
         let irc = InRepoConfig::load(tmp.path()).unwrap();
         assert!(irc.is_none());
 
-        // UserConfig::default() provides sensible defaults
         let cfg = UserConfig::default();
         assert_eq!(cfg.global.refresh_interval, Duration::from_secs(60));
         assert!(cfg.global.colors);
@@ -259,7 +188,6 @@ mode = "pull"
 
     #[test]
     fn duration_parsing_60s() {
-        // Test duration parsing via in-repo config (no env vars needed)
         let tmp = temp_dir();
         std::fs::write(tmp.path().join(".gitsitter.toml"), "refresh_interval = \"60s\"").unwrap();
         let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
@@ -290,26 +218,6 @@ mode = "pull"
         assert_eq!(irc.refresh_interval, Some(Duration::from_millis(500)));
     }
 
-    #[test]
-    fn sync_mode_deserialization() {
-        // Test via in-repo config parsing (no env vars needed)
-        let cases = vec![
-            ("none", RepoSyncMode::None),
-            ("fetch", RepoSyncMode::Fetch),
-            ("pull", RepoSyncMode::Pull),
-            ("push", RepoSyncMode::Push),
-            ("push+pull", RepoSyncMode::PushPull),
-        ];
-
-        for (input, expected) in cases {
-            let tmp = temp_dir();
-            let toml_str = format!("mode = \"{}\"", input);
-            std::fs::write(tmp.path().join(".gitsitter.toml"), &toml_str).unwrap();
-            let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
-            assert_eq!(irc.mode, Some(expected), "failed for input: {}", input);
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Config resolution: host trust
     // -----------------------------------------------------------------------
@@ -336,25 +244,7 @@ mode = "pull"
         let mut cfg = UserConfig::default();
         cfg.trusted_hosts.insert("github.com".to_string(), false);
         assert!(!cfg.is_host_trusted("github.com"));
-        // Other builtins still trusted
         assert!(cfg.is_host_trusted("gitlab.com"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Config resolution: repo mode
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn repo_mode_untrusted_host_still_resolves_mode() {
-        // Trust is now checked per-remote at sync time, not in resolve_repo_mode
-        let cfg = UserConfig::default();
-        let mode = cfg.resolve_repo_mode(
-            "git@evil.example.com:user/repo.git",
-            "/home/user/repo",
-            None,
-        );
-        // Falls through to default (Pull), not None
-        assert_eq!(mode, RepoSyncMode::Pull);
     }
 
     #[test]
@@ -367,76 +257,7 @@ mode = "pull"
     }
 
     #[test]
-    fn repo_mode_user_per_repo_wins_over_in_repo() {
-        let mut cfg = UserConfig::default();
-        cfg.repos.insert(
-            "/home/user/repo".to_string(),
-            RepoConfig {
-                mode: Some(RepoSyncMode::Push),
-                ..Default::default()
-            },
-        );
-        let in_repo = InRepoConfig {
-            mode: Some(RepoSyncMode::Pull),
-            refresh_interval: None,
-            branches: vec![],
-        };
-        let mode = cfg.resolve_repo_mode(
-            "git@github.com:user/repo.git",
-            "/home/user/repo",
-            Some(&in_repo),
-        );
-        assert_eq!(mode, RepoSyncMode::Push);
-    }
-
-    #[test]
-    fn repo_mode_in_repo_wins_over_defaults_glob() {
-        let mut cfg = UserConfig::default();
-        cfg.defaults.remotes.push((
-            "github.com/*".to_string(),
-            RepoSyncMode::Fetch,
-        ));
-        let in_repo = InRepoConfig {
-            mode: Some(RepoSyncMode::PushPull),
-            refresh_interval: None,
-            branches: vec![],
-        };
-        let mode = cfg.resolve_repo_mode(
-            "https://github.com/user/repo.git",
-            "/home/user/repo",
-            Some(&in_repo),
-        );
-        assert_eq!(mode, RepoSyncMode::PushPull);
-    }
-
-    #[test]
-    fn repo_mode_defaults_remotes_glob_match() {
-        let mut cfg = UserConfig::default();
-        cfg.defaults.remotes.push((
-            "*github.com*".to_string(),
-            RepoSyncMode::Fetch,
-        ));
-        let mode = cfg.resolve_repo_mode(
-            "https://github.com/user/repo.git",
-            "/home/user/repo",
-            None,
-        );
-        assert_eq!(mode, RepoSyncMode::Fetch);
-    }
-
-    #[test]
-    fn repo_mode_fallback_to_pull() {
-        let cfg = UserConfig::default();
-        let mode = cfg.resolve_repo_mode(
-            "git@github.com:user/repo.git",
-            "/home/user/repo",
-            None,
-        );
-        assert_eq!(mode, RepoSyncMode::Pull);
-    }
-
-    #[test]
-    fn repo_mode_disabled_returns_none() {
+    fn repo_disabled() {
         let mut cfg = UserConfig::default();
         cfg.repos.insert(
             "/home/user/repo".to_string(),
@@ -445,96 +266,23 @@ mode = "pull"
                 ..Default::default()
             },
         );
-        let mode = cfg.resolve_repo_mode(
-            "git@github.com:user/repo.git",
-            "/home/user/repo",
-            None,
-        );
-        assert_eq!(mode, RepoSyncMode::None);
+        assert!(cfg.is_repo_disabled("/home/user/repo"));
+        assert!(!cfg.is_repo_disabled("/home/user/other"));
     }
 
-    // -----------------------------------------------------------------------
-    // Config resolution: branch mode
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn branch_mode_exact_match_beats_glob() {
+    fn remote_disabled() {
         let mut cfg = UserConfig::default();
         cfg.repos.insert(
-            "/repo".to_string(),
+            "/home/user/repo".to_string(),
             RepoConfig {
-                branches: vec![
-                    ("feature/*".to_string(), BranchSyncMode::Pull),
-                    ("feature/special".to_string(), BranchSyncMode::Push),
-                ],
+                disabled: Some(config::Disabled::Remotes(vec!["upstream".to_string()])),
                 ..Default::default()
             },
         );
-        let mode = cfg.resolve_branch_mode(
-            "/repo",
-            "feature/special",
-            None,
-            RepoSyncMode::Pull,
-        );
-        assert_eq!(mode, BranchSyncMode::Push);
-    }
-
-    #[test]
-    fn branch_mode_longer_glob_beats_shorter() {
-        let mut cfg = UserConfig::default();
-        cfg.repos.insert(
-            "/repo".to_string(),
-            RepoConfig {
-                branches: vec![
-                    ("f*".to_string(), BranchSyncMode::Pull),
-                    ("feature/*".to_string(), BranchSyncMode::Push),
-                ],
-                ..Default::default()
-            },
-        );
-        let mode = cfg.resolve_branch_mode(
-            "/repo",
-            "feature/foo",
-            None,
-            RepoSyncMode::Pull,
-        );
-        assert_eq!(mode, BranchSyncMode::Push);
-    }
-
-    #[test]
-    fn branch_mode_user_config_beats_in_repo() {
-        let mut cfg = UserConfig::default();
-        cfg.repos.insert(
-            "/repo".to_string(),
-            RepoConfig {
-                branches: vec![("main".to_string(), BranchSyncMode::Push)],
-                ..Default::default()
-            },
-        );
-        let in_repo = InRepoConfig {
-            mode: None,
-            refresh_interval: None,
-            branches: vec![("main".to_string(), BranchSyncMode::Pull)],
-        };
-        let mode = cfg.resolve_branch_mode(
-            "/repo",
-            "main",
-            Some(&in_repo),
-            RepoSyncMode::Pull,
-        );
-        assert_eq!(mode, BranchSyncMode::Push);
-    }
-
-    #[test]
-    fn branch_mode_inherits_from_repo_when_no_match() {
-        let cfg = UserConfig::default();
-        let mode = cfg.resolve_branch_mode(
-            "/repo",
-            "some-branch",
-            None,
-            RepoSyncMode::PushPull,
-        );
-        assert_eq!(mode, BranchSyncMode::PushPull);
+        assert!(cfg.is_remote_disabled("/home/user/repo", "upstream"));
+        assert!(!cfg.is_remote_disabled("/home/user/repo", "origin"));
+        assert!(!cfg.is_repo_disabled("/home/user/repo"));
     }
 
     // -----------------------------------------------------------------------
@@ -559,41 +307,12 @@ mode = "pull"
         assert_eq!(host.as_deref(), Some("github.com"));
     }
 
-    #[test]
-    fn matches_remote_glob_exact() {
-        assert!(config::matches_remote_glob(
-            "https://github.com/user/repo.git",
-            "https://github.com/user/repo.git"
-        ));
-    }
-
-    #[test]
-    fn matches_remote_glob_wildcard() {
-        assert!(config::matches_remote_glob(
-            "https://github.com/user/repo.git",
-            "*github.com*"
-        ));
-        assert!(!config::matches_remote_glob(
-            "https://gitlab.com/user/repo.git",
-            "*github.com*"
-        ));
-    }
-
-    #[test]
-    fn matches_branch_glob_feature() {
-        assert!(config::matches_branch_glob("feature/foo", "feature/*"));
-        assert!(!config::matches_branch_glob("bugfix/foo", "feature/*"));
-    }
-
     // -----------------------------------------------------------------------
     // Config round-trip
     // -----------------------------------------------------------------------
 
     #[test]
     fn config_save_and_load_round_trip() {
-        // This test verifies that saving a UserConfig and loading it back
-        // produces the same values. We use env vars to redirect config paths,
-        // and do save+load atomically (back-to-back).
         let tmp = temp_dir();
         let config_dir = tmp.path().join("config_rt");
         std::fs::create_dir_all(&config_dir).unwrap();
@@ -607,52 +326,79 @@ mode = "pull"
             cfg.global.notification_cooldown = Duration::from_secs(600);
             cfg.global.git_path = Some("/usr/bin/git".to_string());
             cfg.trusted_hosts.insert("myhost.com".to_string(), true);
-            cfg.defaults.remotes.push(("*github.com*".to_string(), RepoSyncMode::PushPull));
-            cfg.defaults.branches.push(("main".to_string(), BranchSyncMode::PushPull));
             cfg.repos.insert(
                 "/home/user/project".to_string(),
                 RepoConfig {
-                    mode: Some(RepoSyncMode::Push),
                     refresh_interval: Some(Duration::from_secs(30)),
                     disabled: Some(config::Disabled::All(false)),
-                    branches: vec![("dev".to_string(), BranchSyncMode::Pull)],
                 },
             );
         }).unwrap();
         let loaded = UserConfig::load(&config_file).unwrap();
 
-        // Verify the loaded config matches what we saved
         assert_eq!(loaded.global.refresh_interval, Duration::from_secs(120));
         assert!(!loaded.global.colors);
         assert!(!loaded.global.emoji);
         assert_eq!(loaded.global.notification_cooldown, Duration::from_secs(600));
         assert_eq!(loaded.global.git_path.as_deref(), Some("/usr/bin/git"));
         assert_eq!(loaded.trusted_hosts.get("myhost.com"), Some(&true));
-        assert_eq!(loaded.defaults.remotes.len(), 1);
-        assert_eq!(loaded.defaults.branches.len(), 1);
         let repo = loaded.repos.get("/home/user/project").unwrap();
-        assert_eq!(repo.mode, Some(RepoSyncMode::Push));
         assert_eq!(repo.refresh_interval, Some(Duration::from_secs(30)));
-        assert_eq!(repo.branches.len(), 1);
-        assert_eq!(repo.branches[0].0, "dev");
-        assert_eq!(repo.branches[0].1, BranchSyncMode::Pull);
     }
 
     #[test]
-    fn load_creates_default_config_file_with_examples() {
+    fn load_creates_default_config_file() {
         let tmp = TempDir::new().unwrap();
         let config_dir = tmp.path().join("config_bootstrap");
         std::fs::create_dir_all(&config_dir).unwrap();
         let config_path = config_dir.join("config.toml");
 
         let cfg = UserConfig::load(&config_path).unwrap();
-        let written = std::fs::read_to_string(&config_path).unwrap();
 
         assert!(config_path.exists());
         assert_eq!(cfg.global.refresh_interval, Duration::from_secs(60));
         assert_eq!(cfg.trusted_hosts.get("github.com"), Some(&true));
-        assert!(written.contains("# Example remote defaults."));
-        assert!(written.contains("# [[defaults.branches]]"));
+    }
+
+    #[test]
+    fn old_config_with_mode_fields_parses_ok() {
+        // Backward compatibility: configs with now-removed mode/defaults fields
+        // should parse without error (serde ignores unknown fields by default).
+        let tmp = temp_dir();
+        let config_dir = tmp.path().join("cfg");
+        std::fs::create_dir_all(&config_dir).unwrap();
+
+        let old_toml = r#"
+[global]
+refresh_interval = "60s"
+
+[trusted_hosts]
+"github.com" = true
+
+[[defaults.remotes]]
+pattern = "github.com/*"
+mode = "push+pull"
+
+[[defaults.branches]]
+pattern = "main"
+mode = "pull"
+
+[repos."/home/user/project"]
+mode = "push"
+refresh_interval = "30s"
+
+[[repos."/home/user/project".branches]]
+pattern = "main"
+mode = "push+pull"
+"#;
+        std::fs::write(config_dir.join("config.toml"), old_toml).unwrap();
+
+        let cfg = UserConfig::load(&config_dir.join("config.toml")).unwrap();
+        assert_eq!(cfg.global.refresh_interval, Duration::from_secs(60));
+        assert_eq!(cfg.trusted_hosts.get("github.com"), Some(&true));
+        // Old mode/defaults/branches fields are silently ignored
+        let repo = cfg.repos.get("/home/user/project").unwrap();
+        assert_eq!(repo.refresh_interval, Some(Duration::from_secs(30)));
     }
 }
 
@@ -741,7 +487,7 @@ mod transport_tests {
                 data: transport::StatusData {
                     repo_id: "id".into(),
                     display_path: "/path".into(),
-                    mode: "pull".into(),
+                    mode: "auto".into(),
                     last_sync: None,
                     branches: vec![transport::BranchStatusData {
                         name: "main".into(),
@@ -757,7 +503,7 @@ mod transport_tests {
             Response::GlobalStatus {
                 repos: vec![transport::RepoStatusData {
                     display_path: "/path".into(),
-                    mode: "pull".into(),
+                    mode: "auto".into(),
                     status_summary: "1 synced".into(),
                     last_sync: None,
                 }],
@@ -782,7 +528,7 @@ mod transport_tests {
 }
 
 // ===========================================================================
-// 4. Git Operations Tests
+// 3. Git Operations Tests
 // ===========================================================================
 
 mod git_ops_tests {
@@ -793,11 +539,9 @@ mod git_ops_tests {
     fn discover_repo_id_finds_git_dir() {
         let tmp = temp_dir();
         let repo = git2::Repository::init(tmp.path()).unwrap();
-        // Make an initial commit so HEAD is valid
         make_commit(&repo, "README.md", "hello", "Initial commit");
 
         let repo_id = git_ops::discover_repo_id(tmp.path()).unwrap();
-        // The repo_id should be the canonicalized .git directory
         assert!(repo_id.exists());
         assert!(repo_id.is_dir());
     }
@@ -810,7 +554,6 @@ mod git_ops_tests {
 
         let repo_id = git_ops::discover_repo_id(tmp.path()).unwrap();
         let display = git_ops::get_display_path(&repo_id).unwrap();
-        // The display path should match the working directory
         assert_eq!(
             display.canonicalize().unwrap(),
             tmp.path().canonicalize().unwrap()
@@ -826,9 +569,7 @@ mod git_ops_tests {
         let repo_id = git_ops::discover_repo_id(tmp.path()).unwrap();
         let branches = git_ops::list_branches(&repo_id).unwrap();
         assert!(!branches.is_empty());
-        // There should be at least one branch (the default one)
         let names: Vec<&str> = branches.iter().map(|b| b.name.as_str()).collect();
-        // Default branch could be "main" or "master" depending on git config
         assert!(
             names.contains(&"main") || names.contains(&"master"),
             "expected 'main' or 'master', got: {:?}",
@@ -866,14 +607,11 @@ mod git_ops_tests {
         make_commit(&repo, "README.md", "hello", "Initial commit");
 
         let repo_id = git_ops::discover_repo_id(tmp.path()).unwrap();
-
-        // Create an index.lock file to simulate an in-progress operation
         let lock_path = repo_id.join("index.lock");
         std::fs::write(&lock_path, "").unwrap();
 
         assert!(git_ops::is_operation_in_progress(&repo_id));
 
-        // Clean up
         std::fs::remove_file(&lock_path).unwrap();
     }
 
@@ -893,779 +631,61 @@ mod git_ops_tests {
         let repo = git2::Repository::init(tmp.path()).unwrap();
         make_commit(&repo, "README.md", "hello", "Initial commit");
 
-        // Modify the tracked file
         std::fs::write(tmp.path().join("README.md"), "modified content").unwrap();
-
         let dirty = git_ops::is_worktree_dirty(tmp.path()).unwrap();
         assert!(dirty);
     }
-}
 
-// ===========================================================================
-// 5. End-to-End Integration Tests
-// ===========================================================================
+    #[test]
+    fn get_current_user_email_reads_config() {
+        let tmp = temp_dir();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        repo.config().unwrap().set_str("user.email", "me@example.com").unwrap();
 
-// TODO: add a Windows E2E harness for named-pipe/service coverage.
-#[cfg(unix)]
-mod e2e_tests {
-    use super::*;
-    use std::path::PathBuf;
-    use tokio::net::UnixStream;
-    use tokio::task::JoinHandle;
-
-    // -----------------------------------------------------------------------
-    // Shared harness
-    // -----------------------------------------------------------------------
-
-    struct E2eHarness {
-        _tmp: TempDir,
-        paths: Paths,
-        repo_id_str: String,
-        local_dir: PathBuf,
-        bare_dir: PathBuf,
-        branch_name: String,
-        daemon_handle: JoinHandle<()>,
+        let repo_id = git_ops::discover_repo_id(tmp.path()).unwrap();
+        let email = git_ops::get_current_user_email(&repo_id).unwrap();
+        assert_eq!(email.as_deref(), Some("me@example.com"));
     }
 
-    impl E2eHarness {
-        /// Boot a daemon with a bare remote + local clone already registered.
-        /// `repo_mode` controls the sync mode written to config (e.g. "push+pull").
-        async fn start(repo_mode: &str) -> Self {
-            let tmp = temp_dir();
-            let base = tmp.path().to_path_buf();
-            let paths = test_paths(&base);
+    #[cfg(unix)]
+    #[test]
+    fn is_branch_owned_by_user() {
+        // Set up bare + clone to have a proper upstream
+        let tmp = temp_dir();
+        let bare_dir = tmp.path().join("bare");
+        let work_dir = tmp.path().join("work");
 
-            // Create bare remote via a temp working copy
-            let bare_dir = base.join("remote.git");
-            let init_dir = base.join("init_tmp");
-            let init_repo = git2::Repository::init(&init_dir).unwrap();
-            make_commit(&init_repo, "README.md", "initial", "Initial commit");
-            create_bare_repo(&bare_dir);
+        let bare = create_bare_repo(&bare_dir);
+        let work = clone_repo(&bare_dir, &work_dir);
 
-            let branch_name = init_repo
-                .head()
-                .unwrap()
-                .shorthand()
-                .unwrap()
-                .to_string();
+        // Configure user email in the working repo
+        work.config().unwrap().set_str("user.email", "me@example.com").unwrap();
 
-            let mut remote = init_repo
-                .remote("origin", &format!("file://{}", bare_dir.display()))
-                .unwrap();
-            remote
-                .push(
-                    &[&format!(
-                        "refs/heads/{}:refs/heads/{}",
-                        branch_name, branch_name
-                    )],
-                    None,
-                )
-                .unwrap();
-            drop(remote);
-            drop(init_repo);
-
-            // Clone
-            let local_dir = base.join("local");
-            let _local_repo = clone_repo(&bare_dir, &local_dir);
-
-            let repo_id =
-                gitsitter::git_ops::discover_repo_id(&local_dir).unwrap();
-            let repo_id_str = repo_id.to_string_lossy().to_string();
-
-            // Write config with explicit per-repo mode.
-            let config_toml = format!(
-                r#"
-[global]
-refresh_interval = "1s"
-
-[repos."{}"]
-mode = "{}"
-"#,
-                repo_id_str, repo_mode
-            );
-            std::fs::write(&paths.config_file, &config_toml).unwrap();
-
-            // Start daemon
-            let daemon_paths = paths.clone();
-            let daemon_handle = tokio::spawn(async move {
-                let _ = gitsitter::daemon::run_daemon(&daemon_paths).await;
-            });
-
-            // Wait for socket
-            let deadline =
-                tokio::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                if paths.socket_path.exists() {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    break;
-                }
-                if tokio::time::Instant::now() > deadline {
-                    panic!("daemon socket did not appear within 5 seconds");
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-
-            // Ensure daemon has loaded the config
-            let resp = Self::roundtrip_static(
-                &paths.socket_path,
-                &Request::ReloadConfig,
-            )
-            .await;
-            match &resp {
-                Response::Ok { .. } => {}
-                other => panic!("reload_config failed: {:?}", other),
-            }
-
-            Self {
-                _tmp: tmp,
-                paths,
-                repo_id_str,
-                local_dir,
-                bare_dir,
-                branch_name,
-                daemon_handle,
-            }
-        }
-
-        async fn roundtrip_static(
-            socket: &std::path::Path,
-            req: &Request,
-        ) -> Response {
-            let mut stream = UnixStream::connect(socket).await.unwrap();
-            let (mut reader, mut writer) = stream.split();
-            transport::send_request(&mut writer, req).await.unwrap();
-            transport::recv_response(&mut reader).await.unwrap()
-        }
-
-        async fn roundtrip(&self, req: &Request) -> Response {
-            Self::roundtrip_static(&self.paths.socket_path, req).await
-        }
-
-        /// Trigger a sync and poll until the branch appears with
-        /// one of the expected statuses, or until `timeout` elapses.
-        async fn trigger_sync_and_wait_for(
-            &self,
-            expected_statuses: &[&str],
-            timeout: Duration,
-        ) {
-            self.roundtrip(&Request::Sync {
-                repo_path: Some(self.repo_id_str.clone()),
-                all: false,
-            })
-            .await;
-
-            let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                if let Some(bs) = self.get_branch_status(&self.branch_name).await {
-                    if expected_statuses.contains(&bs.status.as_str()) {
-                        return;
-                    }
-                }
-                if tokio::time::Instant::now() > deadline {
-                    return; // let the caller's assert produce the error
-                }
-            }
-        }
-
-        /// Open a second clone of the same bare repo ("another user").
-        fn open_second_clone(&self) -> (TempDir, git2::Repository) {
-            let tmp = temp_dir();
-            let repo = clone_repo(&self.bare_dir, tmp.path());
-            (tmp, repo)
-        }
-
-        /// Get the branch status via daemon socket.
-        async fn get_branch_status(&self, branch: &str) -> Option<BranchStatusData> {
-            let resp = self
-                .roundtrip(&Request::Status {
-                    repo_path: Some(self.repo_id_str.clone()),
-                    global: false,
-                })
-                .await;
-            match resp {
-                Response::Status { data } => {
-                    data.branches.into_iter().find(|b| b.name == branch)
-                }
-                _ => None,
-            }
-        }
-
-        /// Open the local repo via git2.
-        fn open_local_repo(&self) -> git2::Repository {
-            git2::Repository::open(&self.local_dir).unwrap()
-        }
-
-        async fn shutdown(self) {
-            let _ = self
-                .roundtrip(&Request::Shutdown)
-                .await;
-            let _ = tokio::time::timeout(
-                Duration::from_secs(5),
-                self.daemon_handle,
-            )
-            .await;
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Tests
-    // -----------------------------------------------------------------------
-
-    /// Basic lifecycle: register, status, daemon-status, config-update, shutdown.
-    #[tokio::test]
-async fn daemon_lifecycle() {
-        let h = E2eHarness::start("push+pull").await;
-
-        // Status
-        let resp = h
-            .roundtrip(&Request::Status {
-                repo_path: Some(h.repo_id_str.clone()),
-                global: false,
-            })
-            .await;
-        match &resp {
-            Response::Status { data } => {
-                assert_eq!(data.repo_id, h.repo_id_str);
-            }
-            Response::Error { message } => {
-                eprintln!("status error (may be expected): {}", message);
-            }
-            other => panic!("unexpected: {:?}", other),
-        }
-
-        // DaemonStatus
-        let resp = h.roundtrip(&Request::DaemonStatus).await;
-        match &resp {
-            Response::DaemonStatus {
-                pid,
-                repos_watched,
-                ..
-            } => {
-                assert!(*pid > 0);
-                assert!(*repos_watched >= 1);
-            }
-            other => panic!("unexpected: {:?}", other),
-        }
-
-        // ReloadConfig
-        let resp = h
-            .roundtrip(&Request::ReloadConfig)
-            .await;
-        assert!(matches!(resp, Response::Ok { .. }));
-
-        // Shutdown cleans up socket
-        let socket = h.paths.socket_path.clone();
-        h.shutdown().await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !socket.exists(),
-            "socket should be removed after shutdown"
-        );
-    }
-
-    /// A local commit is auto-pushed to the remote.
-    #[tokio::test]
-async fn local_commit_is_pushed() {
-        let h = E2eHarness::start("push+pull").await;
-
-        // Make a local commit
-        let local_repo = h.open_local_repo();
-        make_commit(&local_repo, "new.txt", "hello", "Add new file");
-        let local_oid = local_repo
-            .head()
-            .unwrap()
-            .target()
-            .unwrap()
-            .to_string();
-        drop(local_repo);
-
-        // Trigger sync and wait for push to complete
-        h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
-
-        // Verify branch is synced
-        let bs = h.get_branch_status(&h.branch_name).await;
-        assert!(bs.is_some(), "branch should exist in status");
-        let bs = bs.unwrap();
-        assert_eq!(
-            bs.status, "synced",
-            "branch should be synced after push, got: {} (error: {:?})",
-            bs.status, bs.last_action
-        );
-
-        // Verify the remote has the commit
-        let bare = git2::Repository::open_bare(&h.bare_dir).unwrap();
-        let remote_ref = bare
-            .find_reference(&format!("refs/heads/{}", h.branch_name))
-            .unwrap();
-        assert_eq!(
-            remote_ref.target().unwrap().to_string(),
-            local_oid,
-            "remote should have the local commit"
-        );
-
-        h.shutdown().await;
-    }
-
-    /// A remote update is fast-forward merged into the local branch.
-    #[tokio::test]
-async fn remote_update_is_pulled() {
-        let h = E2eHarness::start("push+pull").await;
-
-        // Simulate another user pushing to the remote
-        let (_tmp2, other_clone) = h.open_second_clone();
-        make_commit(
-            &other_clone,
-            "remote_file.txt",
-            "from remote",
-            "Remote commit",
-        );
-        let expected_oid = other_clone
-            .head()
-            .unwrap()
-            .target()
-            .unwrap()
-            .to_string();
-        // Push to bare
-        let mut remote = other_clone.find_remote("origin").unwrap();
-        remote
-            .push(
-                &[&format!(
-                    "refs/heads/{}:refs/heads/{}",
-                    h.branch_name, h.branch_name
-                )],
-                None,
-            )
-            .unwrap();
+        // Make a commit as "me" and push
+        make_commit_as(&work, "file.txt", "content", "my commit", "Me", "me@example.com");
+        // Push to origin
+        let mut remote = work.find_remote("origin").unwrap();
+        let branch = work.head().unwrap().shorthand().unwrap().to_string();
+        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
         drop(remote);
-        drop(other_clone);
 
-        // Trigger sync — daemon should fetch + ff-merge
-        h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
+        // Fetch to update remote tracking refs
+        let mut remote = work.find_remote("origin").unwrap();
+        remote.fetch::<&str>(&[], None, None).unwrap();
 
-        let bs = h.get_branch_status(&h.branch_name).await;
-        assert!(bs.is_some(), "branch should exist in status");
-        let bs = bs.unwrap();
-        assert_eq!(
-            bs.status, "synced",
-            "branch should be synced after pull, got: {} (error: {:?})",
-            bs.status, bs.last_action
-        );
+        let repo_id = git_ops::discover_repo_id(work_dir.as_path()).unwrap();
+        assert!(git_ops::is_branch_owned_by_user(&repo_id, &branch).unwrap());
 
-        // Verify local repo has the remote commit
-        let local_repo = h.open_local_repo();
-        let local_oid = local_repo
-            .head()
-            .unwrap()
-            .target()
-            .unwrap()
-            .to_string();
-        assert_eq!(
-            local_oid, expected_oid,
-            "local should have been fast-forwarded to the remote commit"
-        );
-
-        h.shutdown().await;
-    }
-
-    /// Diverged branches: local and remote both have independent commits.
-    #[tokio::test]
-async fn diverged_branches_detected() {
-        let h = E2eHarness::start("pull").await;
-
-        // Make a local commit (won't be pushed because mode is "pull")
-        let local_repo = h.open_local_repo();
-        make_commit(
-            &local_repo,
-            "local_only.txt",
-            "local",
-            "Local-only commit",
-        );
-        drop(local_repo);
-
-        // Push an independent commit to the remote via second clone
-        let (_tmp2, other_clone) = h.open_second_clone();
-        make_commit(
-            &other_clone,
-            "remote_only.txt",
-            "remote",
-            "Remote-only commit",
-        );
-        let mut remote = other_clone.find_remote("origin").unwrap();
-        remote
-            .push(
-                &[&format!(
-                    "refs/heads/{}:refs/heads/{}",
-                    h.branch_name, h.branch_name
-                )],
-                None,
-            )
-            .unwrap();
+        // Now push a commit from a different user
+        make_commit_as(&work, "file2.txt", "other", "their commit", "Other", "other@example.com");
+        let mut remote = work.find_remote("origin").unwrap();
+        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
         drop(remote);
-        drop(other_clone);
 
-        // Trigger sync — daemon should detect divergence
-        h.trigger_sync_and_wait_for(&["diverged"], Duration::from_secs(10)).await;
+        let mut remote = work.find_remote("origin").unwrap();
+        remote.fetch::<&str>(&[], None, None).unwrap();
 
-        let bs = h.get_branch_status(&h.branch_name).await;
-        assert!(bs.is_some(), "branch should exist in status");
-        let bs = bs.unwrap();
-        assert_eq!(
-            bs.status, "diverged",
-            "branch should be diverged, got: {} (error: {:?})",
-            bs.status, bs.last_action
-        );
-        // Status is "diverged" — that's sufficient to verify detection
-
-        h.shutdown().await;
-    }
-
-    /// Push rejected by a server-side pre-receive hook.
-    #[tokio::test]
-async fn push_rejected_by_hook() {
-        let h = E2eHarness::start("push+pull").await;
-
-        // Install a pre-receive hook that rejects all pushes
-        let hooks_dir = h.bare_dir.join("hooks");
-        std::fs::create_dir_all(&hooks_dir).unwrap();
-        let hook_path = hooks_dir.join("pre-receive");
-        std::fs::write(
-            &hook_path,
-            "#!/bin/sh\necho 'rejected by policy'\nexit 1\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                &hook_path,
-                std::fs::Permissions::from_mode(0o755),
-            )
-            .unwrap();
-        }
-
-        // Make a local commit
-        let local_repo = h.open_local_repo();
-        make_commit(
-            &local_repo,
-            "blocked.txt",
-            "should not arrive",
-            "Blocked commit",
-        );
-        drop(local_repo);
-
-        // Trigger sync — push should be rejected
-        h.trigger_sync_and_wait_for(&["push_rejected"], Duration::from_secs(10)).await;
-
-        let bs = h.get_branch_status(&h.branch_name).await;
-        assert!(bs.is_some(), "branch should exist in status");
-        let bs = bs.unwrap();
-        assert_eq!(
-            bs.status, "push_rejected",
-            "branch should be push_rejected, got: {} (error: {:?})",
-            bs.status, bs.last_action
-        );
-
-        h.shutdown().await;
-    }
-
-    /// Dirty worktree prevents fast-forward pull.
-    #[tokio::test]
-async fn dirty_worktree_blocks_ff() {
-        let h = E2eHarness::start("push+pull").await;
-
-        // Push a commit to the remote via second clone
-        let (_tmp2, other_clone) = h.open_second_clone();
-        make_commit(
-            &other_clone,
-            "remote_new.txt",
-            "from remote",
-            "Remote commit",
-        );
-        let mut remote = other_clone.find_remote("origin").unwrap();
-        remote
-            .push(
-                &[&format!(
-                    "refs/heads/{}:refs/heads/{}",
-                    h.branch_name, h.branch_name
-                )],
-                None,
-            )
-            .unwrap();
-        drop(remote);
-        drop(other_clone);
-
-        // Make the local worktree dirty (modify tracked file without committing)
-        std::fs::write(
-            h.local_dir.join("README.md"),
-            "uncommitted changes",
-        )
-        .unwrap();
-
-        // Trigger sync — should detect pending_ff_dirty
-        h.trigger_sync_and_wait_for(&["pending_ff_dirty"], Duration::from_secs(10)).await;
-
-        let bs = h.get_branch_status(&h.branch_name).await;
-        assert!(bs.is_some(), "branch should exist in status");
-        let bs = bs.unwrap();
-        assert_eq!(
-            bs.status, "pending_ff_dirty",
-            "branch should be pending_ff_dirty, got: {} (error: {:?})",
-            bs.status, bs.last_action
-        );
-
-        h.shutdown().await;
-    }
-
-    /// Operation in progress (index.lock) causes daemon to skip sync.
-    #[tokio::test]
-async fn operation_in_progress_skips_sync() {
-        let h = E2eHarness::start("push+pull").await;
-
-        // Wait for initial sync to complete so the branch is "synced"
-        h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
-
-        // Make a local commit so there's something to push
-        let local_repo = h.open_local_repo();
-        make_commit(
-            &local_repo,
-            "will_push.txt",
-            "data",
-            "Commit to push",
-        );
-        drop(local_repo);
-
-        // Place an index.lock to simulate an in-progress operation
-        let lock_path = h.local_dir.join(".git/index.lock");
-        std::fs::write(&lock_path, "").unwrap();
-
-        // Trigger sync — should be skipped due to index.lock
-        h.roundtrip(&Request::Sync {
-            repo_path: Some(h.repo_id_str.clone()),
-            all: false,
-        })
-        .await;
-        // Wait a few sync cycles
-        tokio::time::sleep(Duration::from_secs(4)).await;
-
-        // Branch should still be "synced" (from initial sync) because the
-        // daemon skipped due to index.lock — it didn't detect the new commit.
-        let bs = h.get_branch_status(&h.branch_name).await;
-        assert!(bs.is_some());
-        let bs = bs.unwrap();
-        assert_eq!(
-            bs.status, "synced",
-            "branch should still show old synced status while index.lock exists"
-        );
-
-        // Remove lock and sync again — should detect local_ahead and push
-        std::fs::remove_file(&lock_path).unwrap();
-        h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
-
-        // Verify the push actually happened (remote has the commit)
-        let bare = git2::Repository::open_bare(&h.bare_dir).unwrap();
-        let remote_ref = bare
-            .find_reference(&format!("refs/heads/{}", h.branch_name))
-            .unwrap();
-        let local_repo = h.open_local_repo();
-        let local_oid = local_repo.head().unwrap().target().unwrap().to_string();
-        assert_eq!(
-            remote_ref.target().unwrap().to_string(),
-            local_oid,
-            "remote should have the local commit after lock removed"
-        );
-
-        h.shutdown().await;
-    }
-
-    /// Pull-only mode: local commits are NOT pushed (status should be "local_ahead").
-    #[tokio::test]
-async fn pull_only_local_ahead_not_pushed() {
-        let h = E2eHarness::start("pull").await;
-
-        // Make a local commit — should NOT be pushed in pull-only mode
-        let local_repo = h.open_local_repo();
-        make_commit(
-            &local_repo,
-            "local_only.txt",
-            "content",
-            "Local commit",
-        );
-        let local_oid = local_repo
-            .head()
-            .unwrap()
-            .target()
-            .unwrap()
-            .to_string();
-        drop(local_repo);
-
-        h.trigger_sync_and_wait_for(&["local_ahead"], Duration::from_secs(10)).await;
-
-        let bs = h.get_branch_status(&h.branch_name).await;
-        assert!(bs.is_some(), "branch should exist in status");
-        let bs = bs.unwrap();
-        assert_eq!(
-            bs.status, "local_ahead",
-            "pull-only mode should report local_ahead, got: {} (error: {:?})",
-            bs.status, bs.last_action
-        );
-
-        // Verify remote does NOT have the local commit
-        let bare = git2::Repository::open_bare(&h.bare_dir).unwrap();
-        let remote_oid = bare
-            .find_reference(&format!("refs/heads/{}", h.branch_name))
-            .unwrap()
-            .target()
-            .unwrap()
-            .to_string();
-        assert_ne!(
-            remote_oid, local_oid,
-            "remote should NOT have the local commit in pull-only mode"
-        );
-
-        h.shutdown().await;
-    }
-
-    /// Push-only mode: local commits are pushed but remote-ahead is not pulled.
-    #[tokio::test]
-async fn push_only_mode() {
-        let h = E2eHarness::start("push").await;
-
-        // Make a local commit — should be pushed
-        let local_repo = h.open_local_repo();
-        make_commit(
-            &local_repo,
-            "pushed.txt",
-            "content",
-            "Local commit",
-        );
-        let local_oid = local_repo
-            .head()
-            .unwrap()
-            .target()
-            .unwrap()
-            .to_string();
-        drop(local_repo);
-
-        h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
-
-        // Verify push happened
-        let bare = git2::Repository::open_bare(&h.bare_dir).unwrap();
-        let remote_oid = bare
-            .find_reference(&format!("refs/heads/{}", h.branch_name))
-            .unwrap()
-            .target()
-            .unwrap()
-            .to_string();
-        assert_eq!(
-            remote_oid, local_oid,
-            "remote should have the local commit after push"
-        );
-
-        h.shutdown().await;
-    }
-
-    /// Fetch-only mode: remote changes are fetched but local branch is NOT
-    /// fast-forwarded (status should be "remote_ahead").
-    #[tokio::test]
-async fn fetch_only_mode_no_merge() {
-        let h = E2eHarness::start("fetch").await;
-
-        // Push a commit to the remote via second clone
-        let (_tmp2, other_clone) = h.open_second_clone();
-        make_commit(
-            &other_clone,
-            "fetched.txt",
-            "content",
-            "Remote-only",
-        );
-        let mut remote = other_clone.find_remote("origin").unwrap();
-        remote
-            .push(
-                &[&format!(
-                    "refs/heads/{}:refs/heads/{}",
-                    h.branch_name, h.branch_name
-                )],
-                None,
-            )
-            .unwrap();
-        drop(remote);
-        drop(other_clone);
-
-        h.trigger_sync_and_wait_for(
-            &["remote_ahead"],
-            Duration::from_secs(10),
-        )
-        .await;
-
-        let bs = h.get_branch_status(&h.branch_name).await;
-        assert!(bs.is_some(), "branch should exist in status");
-        let bs = bs.unwrap();
-        assert_eq!(
-            bs.status, "remote_ahead",
-            "fetch-only mode should report remote_ahead, got: {} (error: {:?})",
-            bs.status, bs.last_action
-        );
-
-        // Verify local branch was NOT updated
-        let file = h.local_dir.join("fetched.txt");
-        assert!(
-            !file.exists(),
-            "fetched.txt should not exist in worktree in fetch-only mode"
-        );
-
-        h.shutdown().await;
-    }
-
-    /// Explicit sync request triggers immediate processing.
-    #[tokio::test]
-async fn explicit_sync_request() {
-        let h = E2eHarness::start("push+pull").await;
-
-        let local_repo = h.open_local_repo();
-        make_commit(
-            &local_repo,
-            "sync_me.txt",
-            "data",
-            "Commit for explicit sync",
-        );
-        drop(local_repo);
-
-        // Send explicit sync and wait for it to complete
-        h.trigger_sync_and_wait_for(&["synced"], Duration::from_secs(10)).await;
-
-        let bs = h.get_branch_status(&h.branch_name).await;
-        assert!(bs.is_some());
-        let bs = bs.unwrap();
-        assert_eq!(
-            bs.status, "synced",
-            "should be synced after explicit sync, got: {} (error: {:?})",
-            bs.status, bs.last_action
-        );
-
-        h.shutdown().await;
-    }
-
-    /// PromptCheck registers the repo and returns status.
-    #[tokio::test]
-async fn prompt_check_registers_and_returns_status() {
-        let h = E2eHarness::start("push+pull").await;
-
-        let resp = h
-            .roundtrip(&Request::PromptCheck {
-                repo_path: h.local_dir.to_string_lossy().to_string(),
-            })
-            .await;
-        match &resp {
-            Response::Status { data } => {
-                assert_eq!(data.repo_id, h.repo_id_str);
-            }
-            Response::Error { message } => {
-                panic!("prompt_check failed: {}", message);
-            }
-            other => panic!("unexpected: {:?}", other),
-        }
-
-        h.shutdown().await;
+        // Now the upstream tip is by "other" — should not be owned
+        assert!(!git_ops::is_branch_owned_by_user(&repo_id, &branch).unwrap());
     }
 }

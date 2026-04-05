@@ -2,15 +2,25 @@
 
 A git utility that keeps your local branches in sync with their tracking remotes — automatically, silently, and safely. Single Rust binary that acts as both CLI and background daemon.
 
-- **Remote ahead** → fast-forward merge into local (pull)
-- **Local ahead** → push to remote
-- **Diverged** → do nothing, never force-push, notify the user
+- **Remote ahead** → fast-forward merge into local
+- **Local ahead + you own the branch** → push to remote
+- **Local ahead + not your branch** → notify the user
+- **Diverged** → notify the user
 
 ## Philosophy
 
+- **Zero configuration.** Behavior is derived from git's own tracking branches and commit authorship. No modes, no rules, no globs.
 - **Silent by default.** Invisible when everything is working.
-- **Notify on problems.** Diverged branches, failed pushes, auth errors — surfaced to the user.
+- **Notify on problems.** Diverged branches, unpushed commits on branches you don't own, failed pushes — surfaced to the user via shell prompt.
 - **Never destructive.** No force-push, no rebase, no reset. If ff is not possible, stop and tell the user.
+
+### Ownership Rule
+
+gitsitter decides whether to auto-push based on a simple heuristic: **if the tip commit of the remote tracking branch was authored by you, you own the branch.** This means:
+
+- Your feature branches get pushed automatically.
+- Someone else's branch that you checked out won't get pushed, even if you commit on it.
+- If someone else pushes to your branch, gitsitter stops auto-pushing until you push manually (reclaiming ownership).
 
 ## Quick Start
 
@@ -28,7 +38,7 @@ gitsitter install daemon
 gitsitter daemon run
 ```
 
-Once the shell hook is installed, repos are auto-registered when you `cd` into them. The daemon fetches, pulls, and pushes in the background based on your configuration.
+Once the shell hook is installed, repos are auto-registered when you `cd` into them. The daemon fetches, pulls, and pushes in the background.
 
 Platform notes:
 - Linux: `install daemon` writes a systemd user service.
@@ -44,11 +54,13 @@ gitsitter sync                     # trigger immediate sync for current repo
 gitsitter sync --all               # trigger immediate sync for all repos
 gitsitter config                   # show config for current repo
 gitsitter config --global          # show global config
-gitsitter config --repo pull       # set current repo to pull-only
-gitsitter config --branch push+pull  # set current branch mode
-gitsitter config --explain         # show full config resolution chain
+gitsitter config --explain         # show trust, disabled, and ownership diagnostics
 gitsitter enable                   # enable current repo
 gitsitter disable                  # disable current repo
+gitsitter trust <host>             # trust a remote host
+gitsitter untrust <host>           # untrust a remote host
+gitsitter enable --remote <name>   # enable a specific remote
+gitsitter disable --remote <name>  # disable a specific remote
 gitsitter log                      # show daemon log for current repo
 gitsitter log --global             # show global daemon log
 gitsitter daemon status            # check if daemon is running
@@ -61,8 +73,7 @@ gitsitter daemon stop              # graceful shutdown
 Config file: `~/.config/gitsitter/config.toml`
 On Windows: `%APPDATA%\gitsitter\config.toml`.
 
-If that file does not exist yet, gitsitter creates it on first run from the
-shipped default config template, including commented examples.
+If that file does not exist yet, gitsitter creates it on first run from the shipped default config template.
 
 ```toml
 [global]
@@ -74,56 +85,22 @@ notification_cooldown = "5m"
 [trusted_hosts]
 "git.corp.internal" = true
 
-[[defaults.remotes]]
-pattern = "git@github.com:myuser/*"
-mode = "push+pull"
-
-[[defaults.remotes]]
-pattern = "git@github.com:myorg/*"
-mode = "push+pull"
-
-[[defaults.branches]]
-pattern = "temp/*"
-mode = "none"
-
+# Per-repo overrides (optional)
 [repos."/home/user/projects/my-app"]
-mode = "push+pull"
 refresh_interval = "30s"
-
-[[repos."/home/user/projects/my-app".branches]]
-pattern = "main"
-mode = "pull"
-
-[[repos."/home/user/projects/my-app".branches]]
-pattern = "feature/*"
-mode = "push+pull"
+# disabled = true          # disable the whole repo
+# disabled = ["upstream"]  # disable specific remotes
 ```
 
-### Sync Modes
-
-**Repo-level:** `none`, `fetch`, `pull`, `push`, `push+pull`
-
-**Branch-level:** `inherit`, `none`, `pull`, `push`, `push+pull`
-
-Default is `pull` (push is opt-in). Branches default to `inherit` from their repo.
-
-### Config Resolution
-
-Repo mode is resolved top-down (first match wins):
-1. Remote host not trusted → `none`
-2. User per-repo `disabled=true` → disabled
-3. User per-repo mode
-4. In-repo `.gitsitter.toml` mode
-5. First matching `defaults.remotes` glob
-6. Fallback: `pull`
+That's it. No sync modes, no branch rules, no remote globs. Behavior is derived from git state and commit authorship.
 
 ### Trusted Hosts
 
-The daemon never contacts untrusted hosts. Built-in trusted: `github.com`, `gitlab.com`, `codeberg.org`, `bitbucket.org`, `sr.ht`. Add your own in `[trusted_hosts]`.
+The daemon never contacts untrusted hosts. Built-in trusted: `github.com`, `gitlab.com`, `codeberg.org`, `bitbucket.org`, `sr.ht`. Add your own in `[trusted_hosts]` or via `gitsitter trust <host>`.
 
 ### In-Repo Config
 
-Teams can commit `.gitsitter.toml` to share defaults. User config always takes precedence. In-repo config cannot set trusted hosts or remote defaults (security boundary).
+Teams can commit `.gitsitter.toml` to share a `refresh_interval` override. User config always takes precedence.
 
 ## Architecture
 
@@ -131,20 +108,23 @@ Teams can commit `.gitsitter.toml` to share defaults. User config always takes p
 - **Client-server:** CLI connects to daemon over local IPC, JSON protocol
   - Unix: Unix domain socket
   - Windows: named pipe
-- **Hybrid git:** `git2` for fast reads (merge analysis, status), `git` CLI for network/writes (fetch, push, merge)
+- **Hybrid git:** `git2` for fast reads (merge analysis, status, authorship), `git` CLI for network/writes (fetch, push, merge)
 - **File watching:** `notify` crate watches `.git/refs/` and `.git/HEAD` for near-instant reaction to local commits
-- **State:** SQLite (`~/.local/state/gitsitter/state.db`) for sync timestamps, branch status, worktree info
+- **State:** in-memory only, no database
 - **Config:** TOML (`~/.config/gitsitter/config.toml`) for human-editable settings
 
 ### Daemon Sync Loop
 
 Per repo, per refresh interval:
-1. Check repo exists, skip if missing
+1. Check repo exists, skip if missing or disabled
 2. Check for in-progress git operations (rebase, merge, etc.), skip if found
 3. Discover worktrees, build branch occupancy map
-4. Fetch from origin
-5. For each tracked branch: analyze merge status, then ff-merge / update-ref / push / mark diverged
-6. Persist state to SQLite
+4. Fetch all trusted, non-disabled remotes
+5. For each tracked branch: analyze merge status
+   - Fast-forward possible → ff-merge (checked out) or update-ref (not checked out)
+   - Local ahead + owned → push
+   - Local ahead + not owned → record as actionable issue
+   - Diverged → record as actionable issue
 
 Non-checked-out branches are updated via `git update-ref` (no checkout needed) — when you `git checkout feature-x`, it's already up to date.
 
@@ -152,7 +132,6 @@ Non-checked-out branches are updated via `git update-ref` (no checkout needed) �
 
 ```
 ~/.config/gitsitter/config.toml         # user configuration
-~/.local/state/gitsitter/state.db       # SQLite state database
 ~/.local/state/gitsitter/daemon.log     # daemon log
 ~/.local/state/gitsitter/daemon.pid     # PID file
 $XDG_RUNTIME_DIR/gitsitter.sock         # Unix domain socket
@@ -162,7 +141,6 @@ Windows defaults:
 
 ```
 %APPDATA%\gitsitter\config.toml         # user configuration
-%LOCALAPPDATA%\gitsitter\state.db       # SQLite state database
 %LOCALAPPDATA%\gitsitter\daemon.log     # daemon log
 %LOCALAPPDATA%\gitsitter\daemon.pid     # PID file
 \\.\pipe\gitsitter-<user>               # named pipe endpoint
@@ -184,12 +162,12 @@ cargo test
 
 ### Home Manager
 
-The flake also exports a Home Manager module at `homeManagerModules.default`.
+The flake exports a Home Manager module at `homeManagerModules.default`.
 Use this when you want Nix to manage:
 
 - installing the `gitsitter` binary
 - writing `~/.config/gitsitter/config.toml`
-- creating the user `systemd` service
+- creating the user systemd service (Linux) or launchd agent (macOS)
 - adding shell integration for bash, zsh, or fish
 
 Example:
@@ -206,9 +184,9 @@ Example:
         ({ ... }: {
           services.gitsitter = {
             enable = true;
+            shellIntegration.fish = true;
             settings = {
-              global.refresh_interval = "60s";
-              trusted_hosts."github.com" = true;
+              trusted_hosts."git.corp.internal" = true;
             };
           };
         })
@@ -217,19 +195,6 @@ Example:
   };
 }
 ```
-
-The module merges your `services.gitsitter.settings` over a small default config:
-
-```toml
-[global]
-refresh_interval = "60s"
-colors = true
-emoji = true
-notification_cooldown = "5m"
-```
-
-That means you can override just the pieces you care about instead of repeating the
-full file.
 
 When using the Home Manager module, prefer that over `gitsitter install shell` and
 `gitsitter install daemon`, since those commands modify files imperatively outside

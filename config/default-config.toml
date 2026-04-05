@@ -10,23 +10,3 @@ notification_cooldown = "5m"
 "codeberg.org" = true
 "bitbucket.org" = true
 "sr.ht" = true
-
-# Example remote defaults. Order matters: first match wins.
-#
-# [[defaults.remotes]]
-# pattern = "git@github.com:myuser/*"
-# mode = "push+pull"
-#
-# [[defaults.remotes]]
-# pattern = "git@github.com:myorg/*"
-# mode = "pull"
-
-# Example branch defaults.
-#
-# [[defaults.branches]]
-# pattern = "main"
-# mode = "pull"
-#
-# [[defaults.branches]]
-# pattern = "temp/*"
-# mode = "none"

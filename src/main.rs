@@ -21,10 +21,6 @@ enum Commands {
     Config {
         #[arg(short, long)]
         global: bool,
-        #[arg(short, long)]
-        repo: Option<String>,
-        #[arg(short, long)]
-        branch: Option<String>,
         #[arg(long)]
         explain: bool,
     },
@@ -113,10 +109,8 @@ async fn main() {
         Some(Commands::Status { global }) => cli::handle_status(&paths, global).await,
         Some(Commands::Config {
             global,
-            repo,
-            branch,
             explain,
-        }) => cli::handle_config(&paths, global, repo, branch, explain).await,
+        }) => cli::handle_config(&paths, global, explain).await,
         Some(Commands::Enable { target, remote }) => {
             if remote {
                 cli::handle_remote_enable(&paths, target.as_deref()).await
