@@ -50,6 +50,19 @@ async fn notify_daemon_reload(paths: &Paths) {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Print a one-liner if a newer version is available (from cached state file).
+fn print_update_hint() {
+    if std::env::var_os("GITSITTER_NO_UPDATE_CHECK").is_some() {
+        return;
+    }
+    if let Some(v) = crate::self_update::cached_update_available() {
+        eprintln!(
+            "\ngitsitter {v} available (current: v{}), run `gitsitter self-update`",
+            crate::self_update::current_version()
+        );
+    }
+}
+
 /// Replace the user's home directory prefix with `~` for display.
 fn display_path(p: &str) -> String {
     if let Some(home) = dirs::home_dir() {
@@ -211,6 +224,7 @@ pub async fn handle_status(paths: &Paths, global: bool) -> Result<()> {
             eprintln!("unexpected response from daemon");
         }
     }
+    print_update_hint();
     Ok(())
 }
 
@@ -1039,12 +1053,18 @@ pub async fn handle_daemon_status(paths: &Paths) -> Result<()> {
                     pid,
                     uptime_secs,
                     repos_watched,
+                    latest_version,
                 } => {
                     let icon = cli_ui::success_icon(opts);
                     println!("{} Daemon is running", icon);
                     println!("  PID:           {}", pid);
                     println!("  Uptime:        {}", format_uptime(uptime_secs));
                     println!("  Repos watched: {}", repos_watched);
+                    if let Some(v) = latest_version {
+                        println!();
+                        println!("  Update available: {v} (current: v{})", crate::self_update::current_version());
+                        println!("  Run 'gitsitter self-update' to update.");
+                    }
                 }
                 Response::Error { message } => {
                     eprintln!("error: {}", message);

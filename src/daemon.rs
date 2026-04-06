@@ -54,6 +54,8 @@ pub struct Daemon {
     pub sync_notify: Notify,
     pub shutdown_tx: watch::Sender<bool>,
     pub forge_cache: ForgeCache,
+    /// Latest available version if newer than current, checked periodically.
+    pub latest_version: RwLock<Option<String>>,
 }
 
 /// In-memory tracking info for a single repo.
@@ -255,6 +257,7 @@ pub async fn run_daemon(paths: &Paths) -> Result<()> {
         sync_notify: Notify::new(),
         shutdown_tx,
         forge_cache: ForgeCache::new(),
+        latest_version: RwLock::new(crate::self_update::cached_update_available()),
     });
 
     // 8. Remove stale endpoint if it exists
@@ -285,6 +288,37 @@ pub async fn run_daemon(paths: &Paths) -> Result<()> {
         crate::watcher::run(daemon_for_watcher, shutdown_rx_watcher).await;
     });
 
+    // 11c. Spawn update check task (checks every 24h, best-effort)
+    let daemon_for_update = Arc::clone(&daemon);
+    let mut shutdown_rx_update = shutdown_rx.clone();
+    let update_task = tokio::spawn(async move {
+        // Check shortly after startup, then every 24h
+        let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+        // First tick is immediate — run the check soon after boot
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    match crate::self_update::check_for_update().await {
+                        Ok(Some(v)) => {
+                            info!("update available: {v}");
+                            *daemon_for_update.latest_version.write().await = Some(v);
+                        }
+                        Ok(None) => {
+                            *daemon_for_update.latest_version.write().await = None;
+                        }
+                        Err(e) => {
+                            warn!("update check failed: {e:#}");
+                        }
+                    }
+                }
+                _ = shutdown_rx_update.changed() => {
+                    if *shutdown_rx_update.borrow() { return; }
+                }
+            }
+        }
+    });
+
     // 12. Wait for shutdown signal
     let mut shutdown_rx_main = shutdown_rx.clone();
     wait_for_shutdown_signal(&mut shutdown_rx_main).await?;
@@ -300,6 +334,7 @@ pub async fn run_daemon(paths: &Paths) -> Result<()> {
             let _ = socket_task.await;
             let _ = sync_task.await;
             let _ = watcher_task.await;
+            let _ = update_task.await;
         },
     )
     .await;
@@ -610,10 +645,12 @@ pub(crate) async fn reload_config(daemon: &SharedDaemon) {
 async fn handle_daemon_status(daemon: &SharedDaemon) -> Response {
     let uptime = daemon.start_time.elapsed();
     let repos = daemon.repos.read().await;
+    let latest_version = daemon.latest_version.read().await.clone();
     Response::DaemonStatus {
         pid: std::process::id(),
         uptime_secs: uptime.as_secs(),
         repos_watched: repos.len(),
+        latest_version,
     }
 }
 

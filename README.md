@@ -73,11 +73,27 @@ The flake exports a Home Manager module that manages the binary, config, shell i
 ### Without Nix
 
 ```sh
-cargo install --git ssh://git@github.com/mathijshenquet/gitsitter
-gitsitter install
+curl -fsSL https://raw.githubusercontent.com/mathijshenquet/gitsitter/main/install.sh | sh
 ```
 
-This installs shell hooks and the background daemon service (launchd on macOS, systemd on Linux). Repos are auto-registered when you `cd` into them.
+This downloads a pre-built binary to `~/.local/bin`, installs shell hooks and the background daemon service (launchd on macOS, systemd on Linux). Repos are auto-registered when you `cd` into them.
+
+To update, run `gitsitter self-update`. The daemon will also notify you when a new version is available.
+
+<details>
+<summary>Other install methods</summary>
+
+```sh
+# From source
+cargo install --git ssh://git@github.com/mathijshenquet/gitsitter
+gitsitter install
+
+# Specific version or custom path
+curl -fsSL https://raw.githubusercontent.com/mathijshenquet/gitsitter/main/install.sh | sh -s -- --version v0.2.0
+curl -fsSL https://raw.githubusercontent.com/mathijshenquet/gitsitter/main/install.sh | sh -s -- --path /usr/local/bin
+```
+
+</details>
 
 Running `gitsitter install` again updates everything in place.
 
@@ -136,6 +152,7 @@ gitsitter log                # show daemon log
 gitsitter daemon status      # check if daemon is running
 gitsitter daemon start       # start daemon
 gitsitter daemon stop        # graceful shutdown
+gitsitter self-update        # update to latest release
 gitsitter install            # install shell hooks and daemon service
 gitsitter install shell      # install only shell hooks
 gitsitter install daemon     # install only daemon service

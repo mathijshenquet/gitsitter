@@ -9,4 +9,5 @@ pub mod service;
 pub mod shell;
 pub mod transport;
 pub mod tui;
+pub mod self_update;
 pub mod watcher;

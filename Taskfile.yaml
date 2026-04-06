@@ -1,0 +1,33 @@
+version: '3'
+
+tasks:
+  build:
+    desc: Build in release mode
+    cmds:
+      - cargo build --release
+
+  test:
+    desc: Run all tests
+    cmds:
+      - cargo test
+
+  check:
+    desc: Check compilation
+    cmds:
+      - cargo check
+
+  release:
+    desc: Tag and push a release from Cargo.toml version
+    cmds:
+      - ./scripts/release.sh
+
+  release:dry-run:
+    desc: Show what release would do without making changes
+    cmds:
+      - ./scripts/release.sh --dry-run
+
+  version:
+    desc: Show current version from Cargo.toml
+    cmds:
+      - cargo pkgid | sed 's/.*@//'
+    silent: true

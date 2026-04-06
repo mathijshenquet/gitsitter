@@ -4,7 +4,7 @@ use gitsitter::cli;
 use gitsitter::paths::Paths;
 
 #[derive(Parser)]
-#[command(name = "gitsitter", about = "Keep local branches in sync with remotes")]
+#[command(name = "gitsitter", version, about = "Keep local branches in sync with remotes")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -76,6 +76,9 @@ enum Commands {
         #[arg(long)]
         agent: Option<String>,
     },
+    /// Update gitsitter to the latest release
+    #[clap(name = "self-update")]
+    SelfUpdate,
     /// Install daemon and shell hooks
     Install {
         component: Option<String>,
@@ -133,6 +136,7 @@ async fn main() {
         Some(Commands::Resolve { global }) => cli::handle_resolve(&paths, global).await,
         Some(Commands::AutoResolve { agent }) => cli::handle_auto_resolve(&paths, agent).await,
         Some(Commands::Register { path }) => cli::handle_register(&paths, path).await,
+        Some(Commands::SelfUpdate) => gitsitter::self_update::self_update().await,
         Some(Commands::Install { component, shell_name }) => {
             cli::handle_install(component, shell_name).await
         }

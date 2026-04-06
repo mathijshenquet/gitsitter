@@ -67,6 +67,9 @@ pub enum Response {
         pid: u32,
         uptime_secs: u64,
         repos_watched: usize,
+        /// Set when a newer version is available.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        latest_version: Option<String>,
     },
 
 }

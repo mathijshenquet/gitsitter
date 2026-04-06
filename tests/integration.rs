@@ -462,6 +462,7 @@ mod transport_tests {
                 pid: 1234,
                 uptime_secs: 3600,
                 repos_watched: 5,
+                latest_version: None,
             },
         ];
 
