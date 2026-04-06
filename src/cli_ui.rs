@@ -64,7 +64,7 @@ pub fn branch_status_icon(status: &str, opts: DisplayOpts) -> &'static str {
             "synced" | "up_to_date" => "\u{2705}",
             "local_ahead" => "\u{2B06}\u{FE0F}",
             "fast_forward" | "remote_ahead" => "\u{2B07}\u{FE0F}",
-            "diverged" => "\u{26A0}\u{FE0F}",
+            "diverged" | "diverged_yours" => "\u{26A0}\u{FE0F}",
             "error" => "\u{274C}",
             _ => "\u{2753}",
         }
@@ -73,7 +73,7 @@ pub fn branch_status_icon(status: &str, opts: DisplayOpts) -> &'static str {
             "synced" | "up_to_date" => "synced",
             "local_ahead" => "local ahead",
             "fast_forward" | "remote_ahead" => "remote ahead",
-            "diverged" => "diverged",
+            "diverged" | "diverged_yours" => "diverged",
             "error" => "error",
             _ => "unknown",
         }
@@ -86,7 +86,8 @@ pub fn branch_status_label(status: &str) -> &'static str {
         "synced" | "up_to_date" => "synced",
         "local_ahead" => "local ahead",
         "fast_forward" | "remote_ahead" => "remote ahead",
-        "diverged" => "diverged, ff not possible",
+        "diverged" => "diverged (someone else)",
+        "diverged_yours" => "diverged (rebase needed)",
         "error" => "error",
         _ => "unknown",
     }
@@ -102,10 +103,15 @@ pub fn branch_status_styled(status: &str, opts: DisplayOpts) -> String {
         "synced" | "up_to_date" => format!("{}", label.green()),
         "local_ahead" => format!("{}", label.blue()),
         "fast_forward" | "remote_ahead" => format!("{}", label.yellow()),
-        "diverged" => format!("{}", label.yellow()),
+        "diverged" | "diverged_yours" => format!("{}", label.yellow()),
         "error" => format!("{}", label.red()),
         _ => label.to_string(),
     }
+}
+
+/// Format a branch ↔ upstream sync pair.
+pub fn sync_pair(branch: &str, upstream: &str) -> String {
+    format!("{} \u{2194} {}", branch, upstream)
 }
 
 /// Print daemon warning if not running (used by register and enable).

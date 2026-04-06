@@ -179,7 +179,10 @@ pub async fn handle_status(paths: &Paths, global: bool) -> Result<()> {
         return handle_status_global(paths, opts, daemon_running).await;
     }
 
-    let repo_path = resolve_cwd_repo_path()?;
+    let repo_path = match resolve_cwd_repo_path() {
+        Ok(p) => p,
+        Err(_) => return handle_status_global(paths, opts, daemon_running).await,
+    };
 
     if !daemon_running {
         println!();
@@ -218,7 +221,7 @@ async fn handle_status_global(paths: &Paths, opts: DisplayOpts, daemon_running: 
             println!("No repos registered.");
         } else {
             println!();
-            println!("  Watched repositories (daemon not running)");
+            println!("Watched repositories (daemon not running)");
             println!();
             let mut table = global_status_table();
             for (path, repo_cfg) in &cfg.repos {
@@ -245,7 +248,7 @@ async fn handle_status_global(paths: &Paths, opts: DisplayOpts, daemon_running: 
                 println!("No repos being watched.");
             } else {
                 println!();
-                println!("  Watched repositories ({} total)", repos.len());
+                println!("Watched repositories ({} total)", repos.len());
                 println!();
                 let mut table = global_status_table();
                 for r in &repos {
@@ -325,39 +328,32 @@ fn print_repo_status(data: &transport::StatusData, opts: DisplayOpts) {
     println!("{}  {}", cli_ui::repo_header(&dp, opts), sync_info);
     println!();
     for b in &data.branches {
-        let upstream = match &b.upstream {
-            Some(u) => format!("\u{2190} {}", u),
-            None => "(no upstream)".to_string(),
-        };
+        let upstream = b.upstream.as_deref().unwrap_or("(no upstream)");
+        let pair = cli_ui::sync_pair(&b.name, upstream);
         let icon = cli_ui::branch_status_icon(&b.status, opts);
         let label = cli_ui::branch_status_styled(&b.status, opts);
         let action = match &b.last_action {
             Some(a) => format!(", {}", a),
             None => String::new(),
         };
-        println!(
-            "  {:<32} {}  {}{}",
-            format!("{} {}", b.name, upstream), icon, label, action
-        );
+        println!("  {:<32} {}  {}{}", pair, icon, label, action);
     }
-    println!();
-    // Show remote warnings
-    if !data.untrusted_remotes.is_empty() {
-        for r in &data.untrusted_remotes {
-            println!("  {} remote '{}' is not trusted — branches tracking it won't sync",
-                cli_ui::warning_icon(opts), r);
-        }
-        for host in &data.untrusted_hosts {
-            println!("  Add with: gitsitter trust {}", host);
-        }
+
+    // Show remotes section if any exist
+    if !data.remote_urls.is_empty() {
         println!();
-    }
-    if !data.disabled_remotes.is_empty() {
-        for r in &data.disabled_remotes {
-            println!("  {} remote '{}' is disabled",
-                cli_ui::warning_icon(opts), r);
+        println!("  Remotes:");
+        for (name, url) in &data.remote_urls {
+            let trust = if data.untrusted_remotes.contains(name) {
+                let host = crate::config::extract_host(url).unwrap_or_else(|| url.to_string());
+                format!("  {} untrusted \u{2014} run 'gitsitter trust {}'", cli_ui::warning_icon(opts), host)
+            } else if data.disabled_remotes.contains(name) {
+                format!("  {} disabled", cli_ui::warning_icon(opts))
+            } else {
+                String::new()
+            };
+            println!("    {}  {}{}", name, url, trust);
         }
-        println!();
     }
     println!();
 }
@@ -522,24 +518,23 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
             let action = match b.status.as_str() {
                 "local_ahead" => "unpushed commits (last remote commit by someone else)",
                 "diverged" => "diverged (last remote commit by someone else)",
-                "diverged_yours" => "diverged (last remote commit by you, auto-push failed)",
+                "diverged_yours" => "diverged (auto-rebase failed, resolve manually)",
                 _ => continue,
             };
 
             any_issues = true;
             println!();
-            println!("{}: {} \u{2192} {} — {}", cli_ui::repo_header(&dp, opts), b.name, upstream, action);
+            println!("{}: {} — {}", cli_ui::repo_header(&dp, opts), cli_ui::sync_pair(&b.name, upstream), action);
 
             match b.status.as_str() {
                 "local_ahead" => {
-                    println!("  [1] Force push (take ownership)");
+                    println!("  [1] Push to remote");
                     println!("  [2] Create a new branch from your commits");
                     println!("  [3] Skip");
                     match prompt_choice(3) {
                         1 => {
-                            // Force push
                             let branch_remote = upstream.split('/').next().unwrap_or("origin");
-                            match git_ops::git_push_force_with_lease(
+                            match git_ops::git_push(
                                 &repo_id_path,
                                 branch_remote,
                                 &b.name,
@@ -547,10 +542,10 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                                 30,
                             ).await {
                                 Ok(git_ops::PushResult::Success) => {
-                                    println!("  {} Force-pushed {}", cli_ui::success_icon(opts), b.name);
+                                    println!("  {} Pushed {}", cli_ui::success_icon(opts), b.name);
                                 }
                                 _ => {
-                                    println!("  Force push failed. Resolve manually.");
+                                    println!("  Push failed. Resolve manually.");
                                 }
                             }
                         }
@@ -587,24 +582,41 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                     }
                 }
                 "diverged" | "diverged_yours" => {
-                    println!("  [1] Force push (overwrite remote)");
+                    println!("  [1] Rebase onto remote and push");
                     println!("  [2] Create a new branch from your commits");
                     println!("  [3] Skip");
                     match prompt_choice(3) {
                         1 => {
                             let branch_remote = upstream.split('/').next().unwrap_or("origin");
-                            match git_ops::git_push_force_with_lease(
+                            let upstream_ref = format!("{}/{}", branch_remote, b.name);
+                            match git_ops::git_rebase(
                                 &repo_id_path,
-                                branch_remote,
-                                &b.name,
+                                &upstream_ref,
                                 None,
                                 30,
                             ).await {
-                                Ok(git_ops::PushResult::Success) => {
-                                    println!("  {} Force-pushed {}", cli_ui::success_icon(opts), b.name);
+                                Ok(true) => {
+                                    // Rebase succeeded, now push
+                                    match git_ops::git_push(
+                                        &repo_id_path,
+                                        branch_remote,
+                                        &b.name,
+                                        None,
+                                        30,
+                                    ).await {
+                                        Ok(git_ops::PushResult::Success) => {
+                                            println!("  {} Rebased and pushed {}", cli_ui::success_icon(opts), b.name);
+                                        }
+                                        _ => {
+                                            println!("  Rebase succeeded but push failed. Resolve manually.");
+                                        }
+                                    }
                                 }
-                                _ => {
-                                    println!("  Force push failed. The remote may have changed. Resolve manually.");
+                                Ok(false) => {
+                                    println!("  Rebase had conflicts and was aborted. Resolve manually.");
+                                }
+                                Err(e) => {
+                                    println!("  Rebase failed: {:#}. Resolve manually.", e);
                                 }
                             }
                         }
@@ -1263,33 +1275,52 @@ pub async fn handle_prompt(paths: &Paths) -> Result<()> {
 
     if let Response::Status { data } = resp {
         let dp = display_path(&data.display_path);
+
+        if data.newly_registered {
+            let remote_names: Vec<&str> = data.remote_urls.keys().map(|s| s.as_str()).collect();
+            if remote_names.is_empty() {
+                println!("gitsitter: Registered repo \u{1F4E6} {}, syncing tracking branches", dp);
+            } else {
+                println!("gitsitter: Registered repo \u{1F4E6} {}, syncing tracking branches on {}", dp, remote_names.join(", "));
+            }
+            for name in &data.untrusted_remotes {
+                let url = data.remote_urls.get(name).map(|s| s.as_str()).unwrap_or("?");
+                let host = crate::config::extract_host(url).unwrap_or_else(|| url.to_string());
+                println!(
+                    "gitsitter: \u{26A0}\u{FE0F} remote '{}' at {} not trusted \u{2014} run 'gitsitter trust {}' to enable syncing",
+                    name, url, host,
+                );
+            }
+        }
+
         let mut issues = Vec::new();
 
         for b in &data.branches {
             let upstream = b.upstream.as_deref().unwrap_or("upstream");
+            let pair = cli_ui::sync_pair(&b.name, upstream);
             match b.status.as_str() {
                 "local_ahead" => {
                     issues.push(format!(
-                        "gitsitter: \u{1F4E6} {} {} \u{2192} {} has unpushed changes (last remote commit by someone else)",
-                        dp, b.name, upstream
+                        "gitsitter: \u{1F4E6} {} {} has unpushed changes (last remote commit by someone else)",
+                        dp, pair
                     ));
                 }
                 "diverged" => {
                     issues.push(format!(
-                        "gitsitter: \u{1F4E6} {} {} \u{2192} {} has diverged (last remote commit by someone else)",
-                        dp, b.name, upstream
+                        "gitsitter: \u{1F4E6} {} {} has diverged (last remote commit by someone else)",
+                        dp, pair
                     ));
                 }
                 "diverged_yours" => {
                     issues.push(format!(
-                        "gitsitter: \u{1F4E6} {} {} \u{2192} {} has diverged (last remote commit by you, auto-push failed)",
-                        dp, b.name, upstream
+                        "gitsitter: \u{1F4E6} {} {} has diverged (auto-rebase failed, resolve manually)",
+                        dp, pair
                     ));
                 }
                 "push_rejected" | "auth_failed" | "network_error" | "push_blocked_hook_timeout" => {
                     issues.push(format!(
-                        "gitsitter: \u{1F4E6} {} {} \u{2192} {} sync error ({})",
-                        dp, b.name, upstream, b.status.replace('_', " ")
+                        "gitsitter: \u{1F4E6} {} {} sync error ({})",
+                        dp, pair, b.status.replace('_', " ")
                     ));
                 }
                 _ => continue,

@@ -6,6 +6,8 @@
 //!
 //! Maximum message size: 16 MB.
 
+use std::collections::HashMap;
+
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -84,6 +86,12 @@ pub struct StatusData {
     /// Remote names explicitly disabled in config.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_remotes: Vec<String>,
+    /// All remotes: name -> URL.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub remote_urls: HashMap<String, String>,
+    /// True when the repo was just auto-registered by a PromptCheck.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub newly_registered: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -625,51 +625,40 @@ fn get_upstream_committer_email(
     ))
 }
 
-/// Force-push a branch with --force-with-lease (safe force-push).
-pub async fn git_push_force_with_lease(
-    repo_path: &Path,
-    remote: &str,
-    branch: &str,
+/// Rebase the current branch onto its upstream.
+/// Returns Ok(true) if rebase succeeded, Ok(false) if there were conflicts
+/// (rebase is aborted automatically).
+pub async fn git_rebase(
+    worktree_path: &Path,
+    upstream_ref: &str,
     git_path: Option<&str>,
     timeout_secs: u64,
-) -> Result<PushResult> {
-    let mut cmd = git_command(repo_path, git_path);
-    cmd.arg("push")
-        .arg("--force-with-lease")
-        .arg(remote)
-        .arg(branch);
+) -> Result<bool> {
+    let mut cmd = git_command(worktree_path, git_path);
+    cmd.arg("rebase").arg(upstream_ref);
 
-    let output = match tokio::time::timeout(
+    let output = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
         cmd.output(),
     )
     .await
-    {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => return Err(e).context("failed to spawn git push --force-with-lease"),
-        Err(_) => return Ok(PushResult::HookTimeout),
-    };
+    .with_context(|| format!("git rebase timed out after {}s", timeout_secs))?
+    .context("failed to spawn git rebase")?;
 
     if output.status.success() {
-        return Ok(PushResult::Success);
+        return Ok(true);
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let stderr_lower = stderr.to_lowercase();
+    // Rebase failed (conflicts) — abort it so we don't leave a dirty state
+    let mut abort = git_command(worktree_path, git_path);
+    abort.arg("rebase").arg("--abort");
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        abort.output(),
+    )
+    .await;
 
-    if stderr_lower.contains("rejected")
-        || stderr_lower.contains("stale info")
-        || stderr_lower.contains("[remote rejected]")
-    {
-        Ok(PushResult::Rejected(stderr))
-    } else if stderr_lower.contains("authentication")
-        || stderr_lower.contains("permission denied")
-        || stderr_lower.contains("could not read from remote")
-    {
-        Ok(PushResult::AuthFailed(stderr))
-    } else {
-        Ok(PushResult::Rejected(stderr))
-    }
+    Ok(false)
 }
 
 /// Update a ref to a new OID, with expected-old-OID for safety.

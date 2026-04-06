@@ -537,7 +537,16 @@ async fn handle_prompt_check(daemon: &SharedDaemon, repo_path: &str) -> Response
         reload_config(daemon).await;
     }
 
-    handle_status(daemon, Some(repo_id_str)).await
+    let resp = handle_status(daemon, Some(repo_id_str)).await;
+
+    if !already_tracked {
+        if let Response::Status { mut data } = resp {
+            data.newly_registered = true;
+            return Response::Status { data };
+        }
+    }
+
+    resp
 }
 
 async fn handle_reload_config(daemon: &SharedDaemon) -> Response {
@@ -667,6 +676,8 @@ fn build_status_data(tr: &TrackedRepo, config: &UserConfig) -> StatusData {
         untrusted_remotes,
         untrusted_hosts,
         disabled_remotes,
+        remote_urls: tr.remote_urls.clone(),
+        newly_registered: false,
     }
 }
 
@@ -1226,52 +1237,85 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 .unwrap_or(false);
 
                 if is_owner {
-                    // We own the remote tip (likely a rebase/amend) — try force-with-lease
-                    let push_path = worktrees
+                    // We own both sides — rebase local onto remote, then push
+                    let rebase_path = worktrees
                         .first()
                         .map(|wt| PathBuf::from(&wt.path))
                         .unwrap_or_else(|| repo_path.clone());
 
-                    match git_ops::git_push_force_with_lease(
-                        &push_path,
-                        &branch.remote,
-                        &branch.name,
+                    let upstream_ref = format!("{}/{}", branch.remote, branch.name);
+                    let rebase_ok = git_ops::git_rebase(
+                        &rebase_path,
+                        &upstream_ref,
                         git_path_ref,
                         GIT_TIMEOUT_SECS,
                     )
                     .await
-                    {
-                        Ok(PushResult::Success) => {
-                            had_activity = true;
-                            info!("force-pushed (lease) {}:{}", repo_label, branch.name);
-                            let now = chrono::Utc::now().to_rfc3339();
-                            let mut repos = daemon.repos.write().await;
-                            if let Some(tr) = repos.get_mut(repo_id) {
-                                tr.backoff.reset_push_backoff(&ref_name);
-                                tr.set_branch(&branch.name, BranchRuntimeState {
-                                    sync_status: "synced".into(),
-                                    last_pull_at: None,
-                                    last_push_at: Some(now),
-                                    local_oid: Some(branch.local_oid.clone()),
-                                    remote_oid: Some(branch.local_oid.clone()),
-                                    error_message: None,
-                                });
+                    .unwrap_or(false);
+
+                    if rebase_ok {
+                        info!("rebased {}:{} onto {}", repo_label, branch.name, upstream_ref);
+                        // Now push the rebased commits
+                        let push_path = worktrees
+                            .first()
+                            .map(|wt| PathBuf::from(&wt.path))
+                            .unwrap_or_else(|| repo_path.clone());
+
+                        match git_ops::git_push(
+                            &push_path,
+                            &branch.remote,
+                            &branch.name,
+                            git_path_ref,
+                            GIT_TIMEOUT_SECS,
+                        )
+                        .await
+                        {
+                            Ok(PushResult::Success) => {
+                                had_activity = true;
+                                info!("pushed (after rebase) {}:{}", repo_label, branch.name);
+                                let now = chrono::Utc::now().to_rfc3339();
+                                let mut repos = daemon.repos.write().await;
+                                if let Some(tr) = repos.get_mut(repo_id) {
+                                    tr.backoff.reset_push_backoff(&ref_name);
+                                    tr.set_branch(&branch.name, BranchRuntimeState {
+                                        sync_status: "synced".into(),
+                                        last_pull_at: None,
+                                        last_push_at: Some(now),
+                                        local_oid: Some(branch.local_oid.clone()),
+                                        remote_oid: Some(branch.local_oid.clone()),
+                                        error_message: None,
+                                    });
+                                }
+                            }
+                            _ => {
+                                warn!("push after rebase failed for {}:{}", repo_label, branch.name);
+                                let mut repos = daemon.repos.write().await;
+                                if let Some(tr) = repos.get_mut(repo_id) {
+                                    tr.backoff.record_push_failure(&ref_name);
+                                    tr.set_branch(&branch.name, BranchRuntimeState {
+                                        sync_status: "diverged_yours".into(),
+                                        last_pull_at: None,
+                                        last_push_at: None,
+                                        local_oid: Some(branch.local_oid.clone()),
+                                        remote_oid: branch.remote_oid.clone(),
+                                        error_message: Some("rebased but push failed — will retry".into()),
+                                    });
+                                }
                             }
                         }
-                        _ => {
-                            // Force-with-lease failed — someone else pushed in between
-                            warn!("force-push (lease) failed for {}:{}", repo_label, branch.name);
-                            let mut repos = daemon.repos.write().await;
-                            if let Some(tr) = repos.get_mut(repo_id) {
-                                tr.set_branch(&branch.name, BranchRuntimeState {
-                                    sync_status: "diverged_yours".into(),
-                                    last_pull_at: None,
-                                    last_push_at: None,
-                                    local_oid: Some(branch.local_oid.clone()),
-                                    remote_oid: branch.remote_oid.clone(),
-                                    error_message: Some("diverged (last remote commit by you), force-push failed".into()),
-                                });
-                            }
+                    } else {
+                        // Rebase had conflicts — nag the user
+                        warn!("rebase conflicts for {}:{}", repo_label, branch.name);
+                        let mut repos = daemon.repos.write().await;
+                        if let Some(tr) = repos.get_mut(repo_id) {
+                            tr.set_branch(&branch.name, BranchRuntimeState {
+                                sync_status: "diverged_yours".into(),
+                                last_pull_at: None,
+                                last_push_at: None,
+                                local_oid: Some(branch.local_oid.clone()),
+                                remote_oid: branch.remote_oid.clone(),
+                                error_message: Some("diverged — rebase has conflicts, resolve manually".into()),
+                            });
                         }
                     }
                 } else {
