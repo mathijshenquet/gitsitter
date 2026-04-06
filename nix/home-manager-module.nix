@@ -17,7 +17,7 @@ let
   renderedSettings = lib.recursiveUpdate
     (lib.recursiveUpdate defaultSettings resolveAgentSettings)
     cfg.settings;
-  daemonPathPackages = [ pkgs.git ]
+  daemonPathPackages = [ pkgs.git pkgs.openssh ]
     ++ lib.optional cfg.githubIntegration.enable pkgs.gh
     ++ lib.optional (cfg.resolveAgent.enable && cfg.resolveAgent.package != null) cfg.resolveAgent.package;
   daemonPath = lib.makeBinPath daemonPathPackages;
