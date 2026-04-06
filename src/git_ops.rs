@@ -675,8 +675,9 @@ fn get_upstream_committer_email(
 }
 
 /// Rebase the current branch onto its upstream.
-/// Returns Ok(true) if rebase succeeded, Ok(false) if there were conflicts
-/// (rebase is aborted automatically).
+/// Returns Ok(true) if rebase succeeded, Ok(false) if there were conflicts.
+/// On conflict the repo is left in mid-rebase state — caller decides whether
+/// to abort, leave, or invoke a resolve agent.
 pub async fn git_rebase(
     worktree_path: &Path,
     upstream_ref: &str,
@@ -694,20 +695,99 @@ pub async fn git_rebase(
     .with_context(|| format!("git rebase timed out after {}s", timeout_secs))?
     .context("failed to spawn git rebase")?;
 
-    if output.status.success() {
-        return Ok(true);
-    }
+    Ok(output.status.success())
+}
 
-    // Rebase failed (conflicts) — abort it so we don't leave a dirty state
-    let mut abort = git_command(worktree_path, git_path);
-    abort.arg("rebase").arg("--abort");
+/// Abort an in-progress rebase.
+pub async fn git_rebase_abort(
+    worktree_path: &Path,
+    git_path: Option<&str>,
+    timeout_secs: u64,
+) -> Result<()> {
+    let mut cmd = git_command(worktree_path, git_path);
+    cmd.arg("rebase").arg("--abort");
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        abort.output(),
+        cmd.output(),
     )
     .await;
+    Ok(())
+}
 
-    Ok(false)
+const RESOLVE_AGENT_PROMPT: &str = r#"You are resolving git rebase conflicts in the current directory.
+
+1. Run `git status` to see conflicted files.
+2. For each conflicted file:
+   - Read the file to understand both sides of the conflict.
+   - Resolve the conflict markers (<<<<<<< ======= >>>>>>>) by producing the correct merged result.
+   - Be conservative: only resolve conflicts where the intent of both sides is clear.
+   - If a conflict is genuinely ambiguous, make your best effort but leave a comment like `// FIXME: ambiguous merge — review this` near the resolution.
+   - `git add` each resolved file.
+3. Run `git rebase --continue`. If there are multiple conflicting commits, repeat steps 1-2 for each.
+4. Do NOT add new code, refactor, or change anything beyond resolving conflicts.
+5. If you cannot resolve a conflict at all, `git add` the file with your best attempt and continue. Do NOT abort the rebase."#;
+
+/// Result of running a resolve agent.
+pub struct ResolveAgentResult {
+    /// Whether the rebase completed fully (no more conflicts).
+    pub completed: bool,
+    /// Output from the agent (stderr/stdout), useful for surfacing messages to the user.
+    pub agent_output: String,
+}
+
+/// Run a resolve agent to fix rebase conflicts in the given worktree.
+/// The repo must already be in a mid-rebase conflict state.
+pub async fn run_resolve_agent(
+    worktree_path: &Path,
+    agent: &str,
+    agent_path: Option<&str>,
+    timeout_secs: u64,
+) -> Result<ResolveAgentResult> {
+    let bin = match agent {
+        "claude" => agent_path.unwrap_or("claude"),
+        // Future: "codex" => agent_path.unwrap_or("codex"),
+        other => bail!("unknown resolve agent: {}", other),
+    };
+
+    let mut cmd = TokioCommand::new(bin);
+    cmd.current_dir(worktree_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    match agent {
+        "claude" => {
+            cmd.arg("-p")
+                .arg("--bare")
+                .arg("--allowedTools")
+                .arg("Bash(git:*) Edit Write Read Grep Glob")
+                .arg(RESOLVE_AGENT_PROMPT);
+        }
+        // Future: "codex" => { ... }
+        _ => unreachable!(),
+    }
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        cmd.output(),
+    )
+    .await
+    .with_context(|| format!("resolve agent timed out after {}s", timeout_secs))?
+    .with_context(|| format!("failed to spawn resolve agent '{}'", bin))?;
+
+    let agent_output = String::from_utf8_lossy(&output.stdout).to_string();
+
+    // Check if the rebase is fully resolved by looking for rebase-merge/rebase-apply markers.
+    // We need the git dir, not the worktree path.
+    let repo = git2::Repository::open(worktree_path)
+        .context("failed to open repo to check rebase state")?;
+    let git_dir = repo.path().to_path_buf();
+    let completed = !is_operation_in_progress(&git_dir);
+
+    Ok(ResolveAgentResult {
+        completed,
+        agent_output,
+    })
 }
 
 /// Update a ref to a new OID, with expected-old-OID for safety.

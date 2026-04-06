@@ -8,8 +8,18 @@ let
   zshHook = builtins.readFile ../src/embed/zsh_hook.zsh;
   fishHook = builtins.readFile ../src/embed/fish_hook.fish;
   defaultSettings = builtins.fromTOML (builtins.readFile ../config/default-config.toml);
-  renderedSettings = lib.recursiveUpdate defaultSettings cfg.settings;
-  daemonPathPackages = [ pkgs.git ] ++ lib.optional cfg.githubIntegration.enable pkgs.gh;
+  resolveAgentSettings = lib.optionalAttrs cfg.resolveAgent.enable {
+    global = {
+      on_conflict = "auto";
+      resolve_agent = cfg.resolveAgent.tool;
+    };
+  };
+  renderedSettings = lib.recursiveUpdate
+    (lib.recursiveUpdate defaultSettings resolveAgentSettings)
+    cfg.settings;
+  daemonPathPackages = [ pkgs.git ]
+    ++ lib.optional cfg.githubIntegration.enable pkgs.gh
+    ++ lib.optional (cfg.resolveAgent.enable && cfg.resolveAgent.package != null) cfg.resolveAgent.package;
   daemonPath = lib.makeBinPath daemonPathPackages;
 in
 {
@@ -51,6 +61,20 @@ in
     };
 
     githubIntegration.enable = lib.mkEnableOption "GitHub integration (relaxed ownership via gh CLI)";
+
+    resolveAgent = {
+      enable = lib.mkEnableOption "AI-assisted conflict resolution";
+      tool = lib.mkOption {
+        type = lib.types.str;
+        default = "claude";
+        description = "Which resolve agent to use (e.g. \"claude\").";
+      };
+      package = lib.mkOption {
+        type = lib.types.nullOr lib.types.package;
+        default = null;
+        description = "Resolve agent package. If null, assumes the tool binary is on PATH.";
+      };
+    };
   };
 
   config = lib.mkIf cfg.enable {

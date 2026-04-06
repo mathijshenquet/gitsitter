@@ -70,6 +70,12 @@ enum Commands {
         #[arg(short, long)]
         global: bool,
     },
+    /// Run resolve agent on current rebase conflicts
+    AutoResolve {
+        /// Override resolve agent (e.g. "claude")
+        #[arg(long)]
+        agent: Option<String>,
+    },
     /// Install daemon and shell hooks
     Install {
         component: Option<String>,
@@ -125,6 +131,7 @@ async fn main() {
         }) => cli::handle_log(&paths, global, follow, since).await,
         Some(Commands::Sync { all }) => cli::handle_sync(&paths, all).await,
         Some(Commands::Resolve { global }) => cli::handle_resolve(&paths, global).await,
+        Some(Commands::AutoResolve { agent }) => cli::handle_auto_resolve(&paths, agent).await,
         Some(Commands::Register { path }) => cli::handle_register(&paths, path).await,
         Some(Commands::Install { component, shell_name }) => {
             cli::handle_install(component, shell_name).await

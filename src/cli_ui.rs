@@ -66,6 +66,7 @@ pub fn branch_status_icon(status: &str, opts: DisplayOpts) -> &'static str {
             "fast_forward" | "remote_ahead" => "\u{2B07}\u{FE0F}",
             "diverged" | "diverged_yours" => "\u{26A0}\u{FE0F}",
             "pending_dirty" => "\u{270F}\u{FE0F}",
+            "merge_conflict" => "\u{1F527}",
             "error" => "\u{274C}",
             _ => "\u{2753}",
         }
@@ -76,6 +77,7 @@ pub fn branch_status_icon(status: &str, opts: DisplayOpts) -> &'static str {
             "fast_forward" | "remote_ahead" => "remote ahead",
             "diverged" | "diverged_yours" => "diverged",
             "pending_dirty" => "dirty",
+            "merge_conflict" => "conflict",
             "error" => "error",
             _ => "unknown",
         }
@@ -91,6 +93,7 @@ pub fn branch_status_label(status: &str) -> &'static str {
         "diverged" => "diverged (someone else)",
         "diverged_yours" => "diverged (rebase needed)",
         "pending_dirty" => "dirty worktree",
+        "merge_conflict" => "merge conflict",
         "error" => "error",
         _ => "unknown",
     }
@@ -108,6 +111,7 @@ pub fn branch_status_styled(status: &str, opts: DisplayOpts) -> String {
         "fast_forward" | "remote_ahead" => format!("{}", label.yellow()),
         "diverged" | "diverged_yours" => format!("{}", label.yellow()),
         "pending_dirty" => format!("{}", label.yellow()),
+        "merge_conflict" => format!("{}", label.red()),
         "error" => format!("{}", label.red()),
         _ => label.to_string(),
     }

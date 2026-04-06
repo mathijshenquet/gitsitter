@@ -160,6 +160,12 @@ struct RawGlobalSettings {
         skip_serializing_if = "Option::is_none"
     )]
     watcher_debounce: Option<Duration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    on_conflict: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolve_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resolve_agent_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -197,6 +203,70 @@ pub struct UserConfig {
     pub repos: HashMap<String, RepoConfig>,
 }
 
+/// What to do when a rebase hits conflicts.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnConflict {
+    /// Try resolve agent if configured, otherwise leave conflicts. Default.
+    Auto,
+    /// Abort rebase, restore clean state.
+    Revert,
+    /// Leave repo in conflict state for user to handle.
+    Leave,
+    /// Spawn resolve agent (falls back to leave if not configured).
+    ResolveAgent,
+}
+
+impl OnConflict {
+    fn from_str_opt(s: Option<&str>) -> Self {
+        match s {
+            Some("revert") => OnConflict::Revert,
+            Some("leave") => OnConflict::Leave,
+            Some("resolve-agent") => OnConflict::ResolveAgent,
+            Some("auto") | None => OnConflict::Auto,
+            Some(_) => OnConflict::Auto,
+        }
+    }
+
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            OnConflict::Auto => "auto",
+            OnConflict::Revert => "revert",
+            OnConflict::Leave => "leave",
+            OnConflict::ResolveAgent => "resolve-agent",
+        }
+    }
+
+    /// Resolve the effective policy given whether an agent is configured.
+    pub fn effective(&self, has_agent: bool) -> EffectiveConflictAction {
+        match self {
+            OnConflict::Revert => EffectiveConflictAction::Revert,
+            OnConflict::Leave => EffectiveConflictAction::Leave,
+            OnConflict::ResolveAgent => {
+                if has_agent {
+                    EffectiveConflictAction::ResolveAgent
+                } else {
+                    EffectiveConflictAction::Leave
+                }
+            }
+            OnConflict::Auto => {
+                if has_agent {
+                    EffectiveConflictAction::ResolveAgent
+                } else {
+                    EffectiveConflictAction::Leave
+                }
+            }
+        }
+    }
+}
+
+/// The resolved action after considering agent availability.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EffectiveConflictAction {
+    Revert,
+    Leave,
+    ResolveAgent,
+}
+
 #[derive(Debug, Clone)]
 pub struct GlobalSettings {
     pub refresh_interval: Duration,
@@ -205,6 +275,9 @@ pub struct GlobalSettings {
     pub notification_cooldown: Duration,
     pub git_path: Option<String>,
     pub watcher_debounce: Option<Duration>,
+    pub on_conflict: OnConflict,
+    pub resolve_agent: Option<String>,
+    pub resolve_agent_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -259,6 +332,9 @@ impl From<RawUserConfig> for UserConfig {
                 notification_cooldown: g.notification_cooldown.unwrap_or(Duration::from_secs(300)),
                 git_path: g.git_path,
                 watcher_debounce: g.watcher_debounce,
+                on_conflict: OnConflict::from_str_opt(g.on_conflict.as_deref()),
+                resolve_agent: g.resolve_agent,
+                resolve_agent_path: g.resolve_agent_path,
             },
             None => GlobalSettings::default(),
         };
@@ -295,6 +371,9 @@ impl From<&UserConfig> for RawUserConfig {
             notification_cooldown: Some(cfg.global.notification_cooldown),
             git_path: cfg.global.git_path.clone(),
             watcher_debounce: cfg.global.watcher_debounce,
+            on_conflict: Some(cfg.global.on_conflict.to_str().to_string()),
+            resolve_agent: cfg.global.resolve_agent.clone(),
+            resolve_agent_path: cfg.global.resolve_agent_path.clone(),
         });
         let trusted_hosts = if cfg.trusted_hosts.is_empty() {
             None

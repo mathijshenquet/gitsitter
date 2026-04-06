@@ -3,6 +3,14 @@ refresh_interval = "60s"
 colors = true
 emoji = true
 notification_cooldown = "5m"
+# What to do when rebase hits conflicts:
+#   "auto"          — try resolve agent if configured, otherwise leave
+#   "revert"        — abort rebase, restore clean state
+#   "leave"         — leave repo in conflict state
+#   "resolve-agent" — spawn resolve agent to fix conflicts
+on_conflict = "auto"
+# resolve_agent = "claude"     # "claude" (future: "codex", ...)
+# resolve_agent_path = ""      # optional path override for agent binary
 
 [trusted_hosts]
 "github.com" = true

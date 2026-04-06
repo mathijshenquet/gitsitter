@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{Notify, RwLock, watch};
 use tracing::{error, info, warn};
 
-use crate::config::UserConfig;
+use crate::config::{EffectiveConflictAction, UserConfig};
 use crate::forge::ForgeCache;
 use crate::git_ops::{
     self, MergeAnalysis, PushResult,
@@ -1327,18 +1327,141 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                             }
                         }
                     } else {
-                        // Rebase had conflicts — nag the user
+                        // Rebase had conflicts — apply on_conflict policy
                         warn!("rebase conflicts for {}:{}", repo_label, branch.name);
-                        let mut repos = daemon.repos.write().await;
-                        if let Some(tr) = repos.get_mut(repo_id) {
-                            tr.set_branch(&branch.name, BranchRuntimeState {
-                                sync_status: "diverged_yours".into(),
-                                last_pull_at: None,
-                                last_push_at: None,
-                                local_oid: Some(branch.local_oid.clone()),
-                                remote_oid: branch.remote_oid.clone(),
-                                error_message: Some("diverged — rebase has conflicts, resolve manually".into()),
-                            });
+                        let has_agent = config.global.resolve_agent.is_some();
+                        let action = config.global.on_conflict.effective(has_agent);
+
+                        match action {
+                            EffectiveConflictAction::Revert => {
+                                let _ = git_ops::git_rebase_abort(
+                                    &rebase_path, git_path_ref, GIT_TIMEOUT_SECS,
+                                ).await;
+                                let mut repos = daemon.repos.write().await;
+                                if let Some(tr) = repos.get_mut(repo_id) {
+                                    tr.set_branch(&branch.name, BranchRuntimeState {
+                                        sync_status: "diverged_yours".into(),
+                                        last_pull_at: None,
+                                        last_push_at: None,
+                                        local_oid: Some(branch.local_oid.clone()),
+                                        remote_oid: branch.remote_oid.clone(),
+                                        error_message: Some("diverged — rebase has conflicts, resolve manually".into()),
+                                    });
+                                }
+                            }
+                            EffectiveConflictAction::Leave => {
+                                let mut repos = daemon.repos.write().await;
+                                if let Some(tr) = repos.get_mut(repo_id) {
+                                    tr.set_branch(&branch.name, BranchRuntimeState {
+                                        sync_status: "merge_conflict".into(),
+                                        last_pull_at: None,
+                                        last_push_at: None,
+                                        local_oid: Some(branch.local_oid.clone()),
+                                        remote_oid: branch.remote_oid.clone(),
+                                        error_message: Some("rebase conflicts — resolve manually or run `gitsitter auto-resolve`".into()),
+                                    });
+                                }
+                            }
+                            EffectiveConflictAction::ResolveAgent => {
+                                let agent = config.global.resolve_agent.as_deref().unwrap_or("claude");
+                                let agent_path = config.global.resolve_agent_path.as_deref();
+                                info!("running resolve agent '{}' for {}:{}", agent, repo_label, branch.name);
+
+                                const RESOLVE_TIMEOUT_SECS: u64 = 180;
+                                match git_ops::run_resolve_agent(
+                                    &rebase_path, agent, agent_path, RESOLVE_TIMEOUT_SECS,
+                                ).await {
+                                    Ok(result) if result.completed => {
+                                        info!("resolve agent succeeded for {}:{}", repo_label, branch.name);
+                                        // Push the resolved rebase
+                                        match git_ops::git_push(
+                                            &rebase_path,
+                                            &branch.remote,
+                                            &branch.name,
+                                            git_path_ref,
+                                            GIT_TIMEOUT_SECS,
+                                        ).await {
+                                            Ok(PushResult::Success) => {
+                                                had_activity = true;
+                                                info!("pushed (after resolve agent) {}:{}", repo_label, branch.name);
+                                                let now = chrono::Utc::now().to_rfc3339();
+                                                let mut repos = daemon.repos.write().await;
+                                                if let Some(tr) = repos.get_mut(repo_id) {
+                                                    tr.backoff.reset_push_backoff(&ref_name);
+                                                    tr.set_branch(&branch.name, BranchRuntimeState {
+                                                        sync_status: "synced".into(),
+                                                        last_pull_at: None,
+                                                        last_push_at: Some(now),
+                                                        local_oid: Some(branch.local_oid.clone()),
+                                                        remote_oid: Some(branch.local_oid.clone()),
+                                                        error_message: None,
+                                                    });
+                                                }
+                                            }
+                                            _ => {
+                                                warn!("push after resolve agent failed for {}:{}", repo_label, branch.name);
+                                                let mut repos = daemon.repos.write().await;
+                                                if let Some(tr) = repos.get_mut(repo_id) {
+                                                    tr.backoff.record_push_failure(&ref_name);
+                                                    tr.set_branch(&branch.name, BranchRuntimeState {
+                                                        sync_status: "diverged_yours".into(),
+                                                        last_pull_at: None,
+                                                        last_push_at: None,
+                                                        local_oid: Some(branch.local_oid.clone()),
+                                                        remote_oid: branch.remote_oid.clone(),
+                                                        error_message: Some("resolved but push failed — will retry".into()),
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Ok(result) => {
+                                        // Agent ran but didn't fully resolve — leave conflicts
+                                        warn!("resolve agent did not complete for {}:{}", repo_label, branch.name);
+                                        let msg = if result.agent_output.is_empty() {
+                                            "resolve agent could not fully resolve conflicts — finish manually or run `gitsitter auto-resolve`".to_string()
+                                        } else {
+                                            // Trim to last meaningful line(s) from agent output
+                                            let trimmed: String = result.agent_output
+                                                .lines()
+                                                .rev()
+                                                .take(3)
+                                                .collect::<Vec<_>>()
+                                                .into_iter()
+                                                .rev()
+                                                .collect::<Vec<_>>()
+                                                .join("\n");
+                                            format!("resolve agent partial: {}", trimmed)
+                                        };
+                                        let mut repos = daemon.repos.write().await;
+                                        if let Some(tr) = repos.get_mut(repo_id) {
+                                            tr.set_branch(&branch.name, BranchRuntimeState {
+                                                sync_status: "merge_conflict".into(),
+                                                last_pull_at: None,
+                                                last_push_at: None,
+                                                local_oid: Some(branch.local_oid.clone()),
+                                                remote_oid: branch.remote_oid.clone(),
+                                                error_message: Some(msg),
+                                            });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("resolve agent failed for {}:{}: {:#}", repo_label, branch.name, e);
+                                        // Leave conflicts in place
+                                        let mut repos = daemon.repos.write().await;
+                                        if let Some(tr) = repos.get_mut(repo_id) {
+                                            tr.set_branch(&branch.name, BranchRuntimeState {
+                                                sync_status: "merge_conflict".into(),
+                                                last_pull_at: None,
+                                                last_push_at: None,
+                                                local_oid: Some(branch.local_oid.clone()),
+                                                remote_oid: branch.remote_oid.clone(),
+                                                error_message: Some(format!("resolve agent error: {:#}", e)),
+                                            });
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 } else {

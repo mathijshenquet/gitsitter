@@ -520,6 +520,7 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                 "diverged" => "diverged (last remote commit by someone else)",
                 "diverged_yours" => "diverged (auto-rebase failed, resolve manually)",
                 "pending_dirty" => "dirty worktree — commit or stash to sync",
+                "merge_conflict" => "merge conflict — resolve manually or run `gitsitter auto-resolve`",
                 _ => continue,
             };
 
@@ -614,9 +615,11 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                                     }
                                 }
                                 Ok(false) => {
+                                    let _ = git_ops::git_rebase_abort(&repo_id_path, None, 30).await;
                                     println!("  Rebase had conflicts and was aborted. Resolve manually.");
                                 }
                                 Err(e) => {
+                                    let _ = git_ops::git_rebase_abort(&repo_id_path, None, 30).await;
                                     println!("  Rebase failed: {:#}. Resolve manually.", e);
                                 }
                             }
@@ -680,12 +683,18 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                                     ).await.is_ok()
                                 }
                                 Ok(git_ops::MergeAnalysis::Diverged) => {
-                                    git_ops::git_rebase(
+                                    match git_ops::git_rebase(
                                         &repo_id_path,
                                         &upstream_ref,
                                         None,
                                         30,
-                                    ).await.unwrap_or(false)
+                                    ).await {
+                                        Ok(true) => true,
+                                        _ => {
+                                            let _ = git_ops::git_rebase_abort(&repo_id_path, None, 30).await;
+                                            false
+                                        }
+                                    }
                                 }
                                 _ => {
                                     println!("  Branch is already up to date after stash.");
@@ -719,6 +728,42 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                         }
                     }
                 }
+                "merge_conflict" => {
+                    let cfg = UserConfig::load(&paths.config_file).ok();
+                    let has_agent = cfg.as_ref()
+                        .and_then(|c| c.global.resolve_agent.as_ref())
+                        .is_some();
+
+                    if has_agent {
+                        println!("  [1] Run resolve agent");
+                        println!("  [2] Abort rebase");
+                        println!("  [3] Skip (resolve manually)");
+                        match prompt_choice(3) {
+                            1 => {
+                                run_resolve_agent_interactive(&repo_id_path, cfg.as_ref().unwrap(), opts).await;
+                            }
+                            2 => {
+                                let _ = git_ops::git_rebase_abort(&repo_id_path, None, 30).await;
+                                println!("  Rebase aborted.");
+                            }
+                            _ => {
+                                println!("  Skipped.");
+                            }
+                        }
+                    } else {
+                        println!("  [1] Abort rebase");
+                        println!("  [2] Skip (resolve manually)");
+                        match prompt_choice(2) {
+                            1 => {
+                                let _ = git_ops::git_rebase_abort(&repo_id_path, None, 30).await;
+                                println!("  Rebase aborted.");
+                            }
+                            _ => {
+                                println!("  Skipped.");
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -732,6 +777,72 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
     if any_issues {
         let _ = notify_daemon_reload(paths).await;
     }
+
+    Ok(())
+}
+
+/// Shared code path for running the resolve agent — used by both `resolve` and `auto-resolve`.
+async fn run_resolve_agent_interactive(
+    repo_path: &Path,
+    config: &UserConfig,
+    opts: DisplayOpts,
+) {
+    let agent = config.global.resolve_agent.as_deref().unwrap_or("claude");
+    let agent_path = config.global.resolve_agent_path.as_deref();
+
+    println!("  Running resolve agent '{}'...", agent);
+    match git_ops::run_resolve_agent(repo_path, agent, agent_path, 180).await {
+        Ok(result) if result.completed => {
+            println!("  {} Conflicts resolved by agent", cli_ui::success_icon(opts));
+        }
+        Ok(result) => {
+            println!("  Agent did not fully resolve conflicts.");
+            if !result.agent_output.is_empty() {
+                // Surface last few lines of agent output
+                for line in result.agent_output.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev() {
+                    println!("  | {}", line);
+                }
+            }
+            println!("  Finish resolving manually, then `git rebase --continue`.");
+        }
+        Err(e) => {
+            println!("  Resolve agent failed: {:#}", e);
+            println!("  Conflicts remain — resolve manually or `git rebase --abort`.");
+        }
+    }
+}
+
+pub async fn handle_auto_resolve(paths: &Paths, agent_override: Option<String>) -> Result<()> {
+    let opts = load_display_opts(paths);
+    let config = UserConfig::load(&paths.config_file)?;
+
+    let cwd = std::env::current_dir().context("failed to get current directory")?;
+    let repo_id = git_ops::discover_repo_id(&cwd)?;
+
+    // Check if there's an in-progress rebase
+    if !git_ops::is_operation_in_progress(&repo_id) {
+        println!("No rebase conflicts in progress.");
+        return Ok(());
+    }
+
+    // Determine which agent to use
+    let effective_config = if let Some(ref agent) = agent_override {
+        let mut cfg = config.clone();
+        cfg.global.resolve_agent = Some(agent.clone());
+        cfg
+    } else {
+        config
+    };
+
+    if effective_config.global.resolve_agent.is_none() {
+        bail!("no resolve agent configured. Set resolve_agent in config or pass --agent");
+    }
+
+    // Use the worktree path (cwd), not the .git dir
+    run_resolve_agent_interactive(&cwd, &effective_config, opts).await;
+
+    // Notify daemon to re-evaluate
+    let _ = notify_daemon_reload(paths).await;
 
     Ok(())
 }
@@ -1397,6 +1508,12 @@ pub async fn handle_prompt(paths: &Paths) -> Result<()> {
                 "pending_dirty" => {
                     issues.push(format!(
                         "gitsitter: \u{270F}\u{FE0F} {} {} dirty worktree \u{2014} commit or stash to sync",
+                        dp, pair
+                    ));
+                }
+                "merge_conflict" => {
+                    issues.push(format!(
+                        "gitsitter: \u{1F527} {} {} has merge conflicts \u{2014} run `gitsitter auto-resolve` or resolve manually",
                         dp, pair
                     ));
                 }
