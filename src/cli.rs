@@ -960,33 +960,51 @@ pub async fn handle_untrust(paths: &Paths, host: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn handle_log(paths: &Paths, _global: bool, _follow: bool, since: Option<String>) -> Result<()> {
-    let log_path = paths.daemon_log.clone();
-    if !log_path.exists() {
-        println!("No log file found at {}", log_path.display());
+pub async fn handle_log(paths: &Paths, _global: bool, follow: bool, _since: Option<String>) -> Result<()> {
+    let log_dir = paths.daemon_log.parent().context("daemon_log has no parent")?;
+
+    // Find all daemon.log files (current + rotated daily files)
+    let mut log_files: Vec<_> = std::fs::read_dir(log_dir)
+        .context("failed to read log directory")?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("daemon.log"))
+        })
+        .collect();
+
+    if log_files.is_empty() {
+        println!("No log files found in {}", log_dir.display());
         return Ok(());
     }
-    let content = std::fs::read_to_string(&log_path)
-        .context("failed to read daemon log")?;
-    if let Some(ref since_str) = since {
-        if let Ok(since_dt) = DateTime::parse_from_rfc3339(since_str) {
-            for line in content.lines() {
-                if let Some(ts_end) = line.find(' ') {
-                    if let Ok(line_dt) = DateTime::parse_from_rfc3339(&line[..ts_end]) {
-                        if line_dt >= since_dt {
-                            println!("{}", line);
-                        }
-                        continue;
-                    }
-                }
-                println!("{}", line);
-            }
-        } else {
-            print!("{}", content);
+
+    log_files.sort();
+
+    if follow {
+        // tail -f the most recent log file
+        let latest = log_files.last().unwrap();
+        let status = std::process::Command::new("tail")
+            .args(["-f", &latest.to_string_lossy()])
+            .status()
+            .context("failed to run tail")?;
+        if !status.success() {
+            bail!("tail exited with {}", status);
         }
     } else {
-        print!("{}", content);
+        // cat all log files (sorted) into less
+        let status = std::process::Command::new("less")
+            .arg("+G") // start at the end
+            .args(log_files.iter().map(|p| p.as_os_str()))
+            .status()
+            .context("failed to run less")?;
+        if !status.success() && status.code() != Some(1) {
+            // less exits 1 on 'q', that's fine
+            bail!("less exited with {}", status);
+        }
     }
+
     Ok(())
 }
 
@@ -1195,15 +1213,11 @@ pub async fn handle_daemon_start(paths: &Paths) -> Result<()> {
     let exe = std::env::current_exe().context("failed to determine own executable path")?;
     paths.ensure_dirs()?;
 
-    let log_file = std::fs::File::create(paths.daemon_log.clone())
-        .context("failed to create daemon log file")?;
-    let log_stderr = log_file.try_clone()?;
-
     let child = std::process::Command::new(&exe)
         .args(["daemon", "run"])
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::from(log_file))
-        .stderr(std::process::Stdio::from(log_stderr))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .context("failed to spawn daemon process")?;
 

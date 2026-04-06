@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokio::sync::{Notify, RwLock, watch};
 use tracing::{error, info, warn};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 use crate::config::{EffectiveConflictAction, UserConfig};
 use crate::forge::ForgeCache;
@@ -205,9 +206,11 @@ pub async fn run_daemon(paths: &Paths) -> Result<()> {
     std::fs::write(&paths.daemon_pid, pid.to_string())
         .with_context(|| format!("failed to write PID file at {}", paths.daemon_pid.display()))?;
 
-    // 3. Set up tracing
+    // 3. Set up tracing — write to both stderr (for service managers) and daemon.log
+    let log_dir = paths.daemon_log.parent().expect("daemon_log has parent dir");
+    let file_appender = tracing_appender::rolling::daily(log_dir, "daemon.log");
     let _ = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(std::io::stderr.and(file_appender))
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
