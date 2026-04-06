@@ -2,4 +2,4 @@ There is a git rebase in progress with conflicts. Resolve all conflicts and comp
 
 Be conservative — only resolve where intent is clear. Do not abort the rebase.
 
-If any conflicts are ambiguous, resolve them as best you can but print a short summary at the end listing what was unclear and why, with enough context for a human to review (e.g. "file.rs:42 — both sides modify the error handling differently, chose the remote version").
+If you complete the rebase successfully with no ambiguity, produce no output. Only print output if some conflicts were ambiguous — briefly list what you couldn't confidently resolve and why (e.g. "file.rs:42 — both sides restructure error handling differently, picked remote version").
