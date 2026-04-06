@@ -991,12 +991,12 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.set_branch(&branch.name, BranchRuntimeState {
-                                sync_status: "pending_ff_dirty".into(),
+                                sync_status: "pending_dirty".into(),
                                 last_pull_at: None,
                                 last_push_at: None,
                                 local_oid: Some(branch.local_oid.clone()),
                                 remote_oid: Some(remote_oid),
-                                error_message: Some("worktree dirty, ff pending".into()),
+                                error_message: Some("dirty worktree — commit or stash to sync".into()),
                             });
                         }
                         continue;
@@ -1242,6 +1242,29 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         .first()
                         .map(|wt| PathBuf::from(&wt.path))
                         .unwrap_or_else(|| repo_path.clone());
+
+                    // Check if worktree is dirty before attempting rebase
+                    if let Some(wt_path) = occupancy.get(&branch.name) {
+                        let wt_path_buf = PathBuf::from(wt_path);
+                        if git_ops::is_worktree_dirty(&wt_path_buf).unwrap_or(false) {
+                            info!(
+                                "skipping rebase for {}:{} — worktree dirty",
+                                repo_label, branch.name
+                            );
+                            let mut repos = daemon.repos.write().await;
+                            if let Some(tr) = repos.get_mut(repo_id) {
+                                tr.set_branch(&branch.name, BranchRuntimeState {
+                                    sync_status: "pending_dirty".into(),
+                                    last_pull_at: None,
+                                    last_push_at: None,
+                                    local_oid: Some(branch.local_oid.clone()),
+                                    remote_oid: branch.remote_oid.clone(),
+                                    error_message: Some("dirty worktree — commit or stash to sync".into()),
+                                });
+                            }
+                            continue;
+                        }
+                    }
 
                     let upstream_ref = format!("{}/{}", branch.remote, branch.name);
                     let rebase_ok = git_ops::git_rebase(

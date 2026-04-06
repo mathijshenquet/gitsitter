@@ -402,6 +402,55 @@ pub async fn git_fetch(
     Ok(())
 }
 
+/// Stash uncommitted changes.
+/// Returns Ok(true) if something was stashed, Ok(false) if nothing to stash.
+pub async fn git_stash(
+    worktree_path: &Path,
+    git_path: Option<&str>,
+    timeout_secs: u64,
+) -> Result<bool> {
+    let mut cmd = git_command(worktree_path, git_path);
+    cmd.arg("stash").arg("push").arg("-m").arg("gitsitter: auto-stash for sync");
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        cmd.output(),
+    )
+    .await
+    .with_context(|| format!("git stash timed out after {}s", timeout_secs))?
+    .context("failed to spawn git stash")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git stash failed: {}", stderr.trim());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // "No local changes to save" means nothing was stashed
+    Ok(!stdout.contains("No local changes"))
+}
+
+/// Pop the most recent stash entry.
+/// Returns Ok(true) if pop succeeded cleanly, Ok(false) if there were conflicts.
+pub async fn git_stash_pop(
+    worktree_path: &Path,
+    git_path: Option<&str>,
+    timeout_secs: u64,
+) -> Result<bool> {
+    let mut cmd = git_command(worktree_path, git_path);
+    cmd.arg("stash").arg("pop");
+
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        cmd.output(),
+    )
+    .await
+    .with_context(|| format!("git stash pop timed out after {}s", timeout_secs))?
+    .context("failed to spawn git stash pop")?;
+
+    Ok(output.status.success())
+}
+
 /// Fast-forward merge the current branch.
 pub async fn git_ff_merge(
     worktree_path: &Path,

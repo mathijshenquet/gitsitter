@@ -519,6 +519,7 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                 "local_ahead" => "unpushed commits (last remote commit by someone else)",
                 "diverged" => "diverged (last remote commit by someone else)",
                 "diverged_yours" => "diverged (auto-rebase failed, resolve manually)",
+                "pending_dirty" => "dirty worktree — commit or stash to sync",
                 _ => continue,
             };
 
@@ -634,6 +635,82 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                                     _ => {
                                         println!("  Failed to create branch.");
                                     }
+                                }
+                            }
+                        }
+                        _ => {
+                            println!("  Skipped.");
+                        }
+                    }
+                }
+                "pending_dirty" => {
+                    println!("  [1] Stash, sync, pop stash");
+                    println!("  [2] Skip (will auto-sync when worktree is clean)");
+                    match prompt_choice(2) {
+                        1 => {
+                            let branch_remote = upstream.split('/').next().unwrap_or("origin");
+                            // Stash
+                            match git_ops::git_stash(&repo_id_path, None, 30).await {
+                                Ok(true) => {
+                                    println!("  Stashed working changes.");
+                                }
+                                Ok(false) => {
+                                    println!("  Nothing to stash — worktree already clean.");
+                                    // Proceed anyway, daemon will pick up on next cycle
+                                    continue;
+                                }
+                                Err(e) => {
+                                    println!("  Stash failed: {:#}. Resolve manually.", e);
+                                    continue;
+                                }
+                            }
+
+                            // Determine what sync operation is needed
+                            let upstream_ref = format!("{}/{}", branch_remote, b.name);
+                            let sync_ok = match git_ops::analyze_merge(
+                                &repo_id_path,
+                                &b.name,
+                            ) {
+                                Ok(git_ops::MergeAnalysis::FastForward) => {
+                                    git_ops::git_ff_merge(
+                                        &repo_id_path,
+                                        &upstream_ref,
+                                        None,
+                                        30,
+                                    ).await.is_ok()
+                                }
+                                Ok(git_ops::MergeAnalysis::Diverged) => {
+                                    git_ops::git_rebase(
+                                        &repo_id_path,
+                                        &upstream_ref,
+                                        None,
+                                        30,
+                                    ).await.unwrap_or(false)
+                                }
+                                _ => {
+                                    println!("  Branch is already up to date after stash.");
+                                    true
+                                }
+                            };
+
+                            // Pop stash
+                            match git_ops::git_stash_pop(&repo_id_path, None, 30).await {
+                                Ok(true) => {
+                                    if sync_ok {
+                                        println!("  {} Synced and restored working changes", cli_ui::success_icon(opts));
+                                    } else {
+                                        println!("  Sync failed but working changes restored. Resolve manually.");
+                                    }
+                                }
+                                Ok(false) => {
+                                    if sync_ok {
+                                        println!("  Synced, but stash pop has conflicts — resolve with `git stash pop` or `git stash drop`");
+                                    } else {
+                                        println!("  Sync failed and stash pop has conflicts. Resolve manually.");
+                                    }
+                                }
+                                Err(e) => {
+                                    println!("  Stash pop failed: {:#}. Your changes are in `git stash list`.", e);
                                 }
                             }
                         }
@@ -1314,6 +1391,12 @@ pub async fn handle_prompt(paths: &Paths) -> Result<()> {
                 "diverged_yours" => {
                     issues.push(format!(
                         "gitsitter: \u{1F4E6} {} {} has diverged (auto-rebase failed, resolve manually)",
+                        dp, pair
+                    ));
+                }
+                "pending_dirty" => {
+                    issues.push(format!(
+                        "gitsitter: \u{270F}\u{FE0F} {} {} dirty worktree \u{2014} commit or stash to sync",
                         dp, pair
                     ));
                 }

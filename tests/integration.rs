@@ -497,6 +497,8 @@ mod transport_tests {
                     untrusted_remotes: vec![],
                     untrusted_hosts: vec![],
                     disabled_remotes: vec![],
+                    remote_urls: std::collections::HashMap::new(),
+                    newly_registered: false,
                 },
             },
             Response::GlobalStatus {
