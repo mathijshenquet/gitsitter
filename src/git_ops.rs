@@ -714,18 +714,7 @@ pub async fn git_rebase_abort(
     Ok(())
 }
 
-const RESOLVE_AGENT_PROMPT: &str = r#"You are resolving git rebase conflicts in the current directory.
-
-1. Run `git status` to see conflicted files.
-2. For each conflicted file:
-   - Read the file to understand both sides of the conflict.
-   - Resolve the conflict markers (<<<<<<< ======= >>>>>>>) by producing the correct merged result.
-   - Be conservative: only resolve conflicts where the intent of both sides is clear.
-   - If a conflict is genuinely ambiguous, make your best effort but leave a comment like `// FIXME: ambiguous merge — review this` near the resolution.
-   - `git add` each resolved file.
-3. Run `git rebase --continue`. If there are multiple conflicting commits, repeat steps 1-2 for each.
-4. Do NOT add new code, refactor, or change anything beyond resolving conflicts.
-5. If you cannot resolve a conflict at all, `git add` the file with your best attempt and continue. Do NOT abort the rebase."#;
+const RESOLVE_AGENT_PROMPT: &str = include_str!("embed/resolve_agent_prompt.txt");
 
 /// Result of running a resolve agent.
 pub struct ResolveAgentResult {
