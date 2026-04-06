@@ -11,6 +11,8 @@ use anyhow::{Context, Result};
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub config_file: PathBuf,
+    pub repos_file: PathBuf,
+    pub trusted_hosts_file: PathBuf,
     pub daemon_log: PathBuf,
     pub daemon_pid: PathBuf,
     pub socket_path: PathBuf,
@@ -38,6 +40,8 @@ impl Paths {
 
         Self {
             config_file: config_dir.join("config.toml"),
+            repos_file: config_dir.join("repos.toml"),
+            trusted_hosts_file: config_dir.join("trusted_hosts"),
             daemon_log: state_dir.join("daemon.log"),
             daemon_pid: state_dir.join("daemon.pid"),
             socket_path,
@@ -46,7 +50,7 @@ impl Paths {
 
     /// Creates parent directories for all paths if they don't exist.
     pub fn ensure_dirs(&self) -> Result<()> {
-        for path in [&self.config_file, &self.daemon_log, &self.daemon_pid] {
+        for path in [&self.config_file, &self.repos_file, &self.daemon_log, &self.daemon_pid] {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create directory: {}", parent.display()))?;
@@ -100,11 +104,15 @@ mod tests {
     fn direct_construction() {
         let p = Paths {
             config_file: PathBuf::from("/tmp/test/config.toml"),
+            repos_file: PathBuf::from("/tmp/test/repos.toml"),
+            trusted_hosts_file: PathBuf::from("/tmp/test/trusted_hosts"),
             daemon_log: PathBuf::from("/tmp/test/daemon.log"),
             daemon_pid: PathBuf::from("/tmp/test/daemon.pid"),
             socket_path: PathBuf::from("/tmp/test/test.sock"),
         };
         assert_eq!(p.config_file.file_name().unwrap(), "config.toml");
+        assert_eq!(p.repos_file.file_name().unwrap(), "repos.toml");
+        assert_eq!(p.trusted_hosts_file.file_name().unwrap(), "trusted_hosts");
         assert_eq!(p.daemon_log.file_name().unwrap(), "daemon.log");
     }
 }

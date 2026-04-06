@@ -1,17 +1,21 @@
 //! Configuration parsing for gitsitter.
 //!
-//! Handles TOML config files at two levels:
-//! - User config: `~/.config/gitsitter/config.toml`
-//! - In-repo config: `.gitsitter.toml` in a repo's root
+//! Configuration is split across three files in the config directory:
+//! - `config.toml`: global settings (read-only, managed by nix or user)
+//! - `repos.toml`: per-repo registration and overrides (mutable by CLI)
+//! - `trusted_hosts`: one host per line (mutable by CLI)
+//!
+//! Plus an optional in-repo config: `.gitsitter.toml` in a repo's root.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::paths::Paths;
 
 // ---------------------------------------------------------------------------
 // Disabled enum (repo-level or per-remote)
@@ -117,22 +121,12 @@ fn serialize_opt_duration<S: Serializer>(d: &Option<Duration>, s: S) -> Result<S
 }
 
 // ---------------------------------------------------------------------------
-// Raw serde structs (what the TOML file looks like on disk)
+// Raw serde structs (what the TOML files look like on disk)
 // ---------------------------------------------------------------------------
 
-/// Raw representation of the user config file for serde.
-#[derive(Debug, Serialize, Deserialize)]
-struct RawUserConfig {
-    #[serde(default)]
-    global: Option<RawGlobalSettings>,
-    #[serde(default)]
-    trusted_hosts: Option<IndexMap<String, bool>>,
-    #[serde(default)]
-    repos: Option<IndexMap<String, RawRepoConfig>>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct RawGlobalSettings {
+/// Raw representation of config.toml — flat top-level keys, no sections.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct RawConfigToml {
     #[serde(
         default,
         deserialize_with = "deserialize_opt_duration",
@@ -168,6 +162,10 @@ struct RawGlobalSettings {
     resolve_agent_path: Option<String>,
 }
 
+/// Raw representation of repos.toml.
+/// Keys are repo paths, values are per-repo config.
+type RawReposToml = IndexMap<String, RawRepoConfig>;
+
 #[derive(Debug, Serialize, Deserialize)]
 struct RawRepoConfig {
     #[serde(
@@ -199,7 +197,7 @@ struct RawInRepoConfig {
 #[derive(Debug, Clone)]
 pub struct UserConfig {
     pub global: GlobalSettings,
-    pub trusted_hosts: HashMap<String, bool>,
+    pub trusted_hosts: HashSet<String>,
     pub repos: HashMap<String, RepoConfig>,
 }
 
@@ -291,191 +289,267 @@ pub struct InRepoConfig {
     pub refresh_interval: Option<Duration>,
 }
 
-const DEFAULT_CONFIG_TOML: &str = include_str!("../config/default-config.toml");
-
-fn default_user_config() -> &'static UserConfig {
-    static DEFAULT_CONFIG: OnceLock<UserConfig> = OnceLock::new();
-    DEFAULT_CONFIG.get_or_init(|| {
-        let raw: RawUserConfig = toml::from_str(DEFAULT_CONFIG_TOML)
-            .expect("embedded default-config.toml must parse");
-        raw.into()
-    })
-}
-
 // ---------------------------------------------------------------------------
-// Defaults
+// Defaults (compiled-in)
 // ---------------------------------------------------------------------------
 
 impl Default for GlobalSettings {
     fn default() -> Self {
-        default_user_config().global.clone()
+        Self {
+            refresh_interval: Duration::from_secs(60),
+            colors: true,
+            emoji: true,
+            notification_cooldown: Duration::from_secs(300),
+            git_path: None,
+            watcher_debounce: None,
+            on_conflict: OnConflict::Auto,
+            resolve_agent: None,
+            resolve_agent_path: None,
+        }
     }
 }
 
 impl Default for UserConfig {
     fn default() -> Self {
-        default_user_config().clone()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Conversions raw <-> public
-// ---------------------------------------------------------------------------
-
-impl From<RawUserConfig> for UserConfig {
-    fn from(raw: RawUserConfig) -> Self {
-        let global = match raw.global {
-            Some(g) => GlobalSettings {
-                refresh_interval: g.refresh_interval.unwrap_or(Duration::from_secs(60)),
-                colors: g.colors.unwrap_or(true),
-                emoji: g.emoji.unwrap_or(true),
-                notification_cooldown: g.notification_cooldown.unwrap_or(Duration::from_secs(300)),
-                git_path: g.git_path,
-                watcher_debounce: g.watcher_debounce,
-                on_conflict: OnConflict::from_str_opt(g.on_conflict.as_deref()),
-                resolve_agent: g.resolve_agent,
-                resolve_agent_path: g.resolve_agent_path,
-            },
-            None => GlobalSettings::default(),
-        };
-        let trusted_hosts = raw.trusted_hosts.map(|m| m.into_iter().collect()).unwrap_or_default();
-        let repos = match raw.repos {
-            Some(m) => m
-                .into_iter()
-                .map(|(k, v)| {
-                    (
-                        k,
-                        RepoConfig {
-                            refresh_interval: v.refresh_interval,
-                            disabled: v.disabled,
-                        },
-                    )
-                })
-                .collect(),
-            None => HashMap::new(),
-        };
         Self {
-            global,
-            trusted_hosts,
-            repos,
-        }
-    }
-}
-
-impl From<&UserConfig> for RawUserConfig {
-    fn from(cfg: &UserConfig) -> Self {
-        let global = Some(RawGlobalSettings {
-            refresh_interval: Some(cfg.global.refresh_interval),
-            colors: Some(cfg.global.colors),
-            emoji: Some(cfg.global.emoji),
-            notification_cooldown: Some(cfg.global.notification_cooldown),
-            git_path: cfg.global.git_path.clone(),
-            watcher_debounce: cfg.global.watcher_debounce,
-            on_conflict: Some(cfg.global.on_conflict.to_str().to_string()),
-            resolve_agent: cfg.global.resolve_agent.clone(),
-            resolve_agent_path: cfg.global.resolve_agent_path.clone(),
-        });
-        let trusted_hosts = if cfg.trusted_hosts.is_empty() {
-            None
-        } else {
-            Some(cfg.trusted_hosts.iter().map(|(k, v)| (k.clone(), *v)).collect())
-        };
-        let repos = if cfg.repos.is_empty() {
-            None
-        } else {
-            Some(
-                cfg.repos
-                    .iter()
-                    .map(|(k, v)| {
-                        (
-                            k.clone(),
-                            RawRepoConfig {
-                                refresh_interval: v.refresh_interval,
-                                disabled: v.disabled.clone(),
-                            },
-                        )
-                    })
-                    .collect(),
-            )
-        };
-        RawUserConfig {
-            global,
-            trusted_hosts,
-            repos,
-        }
-    }
-}
-
-impl From<RawInRepoConfig> for InRepoConfig {
-    fn from(raw: RawInRepoConfig) -> Self {
-        Self {
-            refresh_interval: raw.refresh_interval,
+            global: GlobalSettings::default(),
+            trusted_hosts: HashSet::new(),
+            repos: HashMap::new(),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Loading & saving
+// Loading
 // ---------------------------------------------------------------------------
 
 impl UserConfig {
-    /// Load user config, creating the default if the file doesn't exist.
-    pub fn load(config_file: &Path) -> Result<Self> {
-        if !config_file.exists() {
-            if let Some(parent) = config_file.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("failed to create config directory: {}", parent.display()))?;
-            }
-            std::fs::write(config_file, DEFAULT_CONFIG_TOML)
-                .with_context(|| format!("failed to initialize config file: {}", config_file.display()))?;
-            // Config file created silently — CLI commands handle user-facing output.
-        }
-        let text = std::fs::read_to_string(config_file)
-            .with_context(|| format!("failed to read config file: {}", config_file.display()))?;
-        let raw: RawUserConfig = toml::from_str(&text).with_context(|| {
-            format!(
-                "failed to parse config file: {}. Remove it and rerun gitsitter to regenerate the default config",
-                config_file.display()
-            )
-        })?;
-        Ok(raw.into())
+    /// Load merged config from all three files. Missing files use defaults.
+    pub fn load(paths: &Paths) -> Result<Self> {
+        let global = load_config_toml(&paths.config_file)?;
+        let trusted_hosts = load_trusted_hosts(&paths.trusted_hosts_file)?;
+        let repos = load_repos_toml(&paths.repos_file)?;
+
+        Ok(Self {
+            global,
+            trusted_hosts,
+            repos,
+        })
     }
 
-    /// Atomically read-modify-write the config file under a file lock.
-    ///
-    /// Safe to call concurrently from multiple processes (CLI + daemon).
-    pub fn modify<F>(config_file: &Path, f: F) -> Result<()>
-    where
-        F: FnOnce(&mut UserConfig),
-    {
-        let lock_path = config_file.with_extension("toml.lock");
+    // -----------------------------------------------------------------------
+    // Trusted hosts
+    // -----------------------------------------------------------------------
 
-        if let Some(parent) = config_file.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create config directory: {}", parent.display()))?;
-        }
+    /// Add a host to the trusted_hosts file.
+    pub fn trust(paths: &Paths, host: &str) -> Result<()> {
+        check_nix_managed(&paths.trusted_hosts_file)?;
+        ensure_parent(&paths.trusted_hosts_file)?;
 
+        let lock_path = paths.trusted_hosts_file.with_extension("lock");
         let lock_file = std::fs::File::create(&lock_path)
             .with_context(|| format!("failed to create lock file: {}", lock_path.display()))?;
-        lock_exclusive(&lock_file)
-            .context("failed to acquire config lock")?;
+        lock_exclusive(&lock_file)?;
 
-        let mut cfg = Self::load(config_file)?;
-        f(&mut cfg);
+        let mut hosts = load_trusted_hosts(&paths.trusted_hosts_file)?;
+        hosts.insert(host.to_string());
+        write_trusted_hosts(&paths.trusted_hosts_file, &hosts)?;
+        Ok(())
+    }
 
-        // Write to temp file and atomically rename
-        let raw = RawUserConfig::from(&cfg);
-        let text = toml::to_string_pretty(&raw).context("failed to serialize config")?;
-        let tmp = config_file.with_extension("toml.tmp");
-        std::fs::write(&tmp, &text)
-            .with_context(|| format!("failed to write temp config: {}", tmp.display()))?;
-        std::fs::rename(&tmp, config_file)
-            .with_context(|| format!("failed to rename config into place: {}", config_file.display()))?;
+    /// Remove a host from the trusted_hosts file.
+    pub fn untrust(paths: &Paths, host: &str) -> Result<()> {
+        check_nix_managed(&paths.trusted_hosts_file)?;
+        ensure_parent(&paths.trusted_hosts_file)?;
 
-        // Lock released on drop of lock_file
+        let lock_path = paths.trusted_hosts_file.with_extension("lock");
+        let lock_file = std::fs::File::create(&lock_path)
+            .with_context(|| format!("failed to create lock file: {}", lock_path.display()))?;
+        lock_exclusive(&lock_file)?;
+
+        let mut hosts = load_trusted_hosts(&paths.trusted_hosts_file)?;
+        hosts.remove(host);
+        write_trusted_hosts(&paths.trusted_hosts_file, &hosts)?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Repos
+    // -----------------------------------------------------------------------
+
+    /// Read-modify-write a repo entry in repos.toml under a file lock.
+    pub fn update_repo<F>(paths: &Paths, repo_id: &str, f: F) -> Result<()>
+    where
+        F: FnOnce(&mut RepoConfig),
+    {
+        ensure_parent(&paths.repos_file)?;
+
+        let lock_path = paths.repos_file.with_extension("toml.lock");
+        let lock_file = std::fs::File::create(&lock_path)
+            .with_context(|| format!("failed to create lock file: {}", lock_path.display()))?;
+        lock_exclusive(&lock_file)?;
+
+        let mut repos = load_repos_toml(&paths.repos_file)?;
+        let entry = repos.entry(repo_id.to_string()).or_default();
+        f(entry);
+        save_repos_toml(&paths.repos_file, &repos)?;
+        Ok(())
+    }
+
+    /// Remove a repo entry from repos.toml.
+    pub fn remove_repo(paths: &Paths, repo_id: &str) -> Result<()> {
+        ensure_parent(&paths.repos_file)?;
+
+        let lock_path = paths.repos_file.with_extension("toml.lock");
+        let lock_file = std::fs::File::create(&lock_path)
+            .with_context(|| format!("failed to create lock file: {}", lock_path.display()))?;
+        lock_exclusive(&lock_file)?;
+
+        let mut repos = load_repos_toml(&paths.repos_file)?;
+        repos.remove(repo_id);
+        save_repos_toml(&paths.repos_file, &repos)?;
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// File loaders
+// ---------------------------------------------------------------------------
+
+/// Load config.toml (global settings). Returns defaults if missing.
+fn load_config_toml(path: &Path) -> Result<GlobalSettings> {
+    if !path.exists() {
+        return Ok(GlobalSettings::default());
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file: {}", path.display()))?;
+    let raw: RawConfigToml = toml::from_str(&text).with_context(|| {
+        format!("failed to parse config file: {}", path.display())
+    })?;
+    Ok(GlobalSettings {
+        refresh_interval: raw.refresh_interval.unwrap_or(Duration::from_secs(60)),
+        colors: raw.colors.unwrap_or(true),
+        emoji: raw.emoji.unwrap_or(true),
+        notification_cooldown: raw.notification_cooldown.unwrap_or(Duration::from_secs(300)),
+        git_path: raw.git_path,
+        watcher_debounce: raw.watcher_debounce,
+        on_conflict: OnConflict::from_str_opt(raw.on_conflict.as_deref()),
+        resolve_agent: raw.resolve_agent,
+        resolve_agent_path: raw.resolve_agent_path,
+    })
+}
+
+/// Load trusted_hosts file (one host per line). Returns empty set if missing.
+fn load_trusted_hosts(path: &Path) -> Result<HashSet<String>> {
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read trusted hosts: {}", path.display()))?;
+    Ok(text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_string())
+        .collect())
+}
+
+/// Write trusted_hosts file atomically.
+fn write_trusted_hosts(path: &Path, hosts: &HashSet<String>) -> Result<()> {
+    let mut sorted: Vec<&str> = hosts.iter().map(|s| s.as_str()).collect();
+    sorted.sort();
+    let text = sorted.join("\n") + if sorted.is_empty() { "" } else { "\n" };
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, &text)
+        .with_context(|| format!("failed to write temp trusted hosts: {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("failed to rename trusted hosts into place: {}", path.display()))?;
+    Ok(())
+}
+
+/// Load repos.toml. Returns empty map if missing.
+fn load_repos_toml(path: &Path) -> Result<HashMap<String, RepoConfig>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read repos file: {}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(HashMap::new());
+    }
+    let raw: RawReposToml = toml::from_str(&text).with_context(|| {
+        format!("failed to parse repos file: {}", path.display())
+    })?;
+    Ok(raw
+        .into_iter()
+        .map(|(k, v)| {
+            (
+                k,
+                RepoConfig {
+                    refresh_interval: v.refresh_interval,
+                    disabled: v.disabled,
+                },
+            )
+        })
+        .collect())
+}
+
+/// Save repos.toml atomically.
+fn save_repos_toml(path: &Path, repos: &HashMap<String, RepoConfig>) -> Result<()> {
+    let raw: RawReposToml = repos
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                RawRepoConfig {
+                    refresh_interval: v.refresh_interval,
+                    disabled: v.disabled.clone(),
+                },
+            )
+        })
+        .collect();
+    let text = toml::to_string_pretty(&raw).context("failed to serialize repos")?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, &text)
+        .with_context(|| format!("failed to write temp repos: {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("failed to rename repos into place: {}", path.display()))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Nix symlink detection
+// ---------------------------------------------------------------------------
+
+/// Check if a file is a nix-store symlink and bail if so.
+fn check_nix_managed(path: &Path) -> Result<()> {
+    if path.is_symlink() {
+        if let Ok(target) = std::fs::read_link(path) {
+            if target.to_string_lossy().starts_with("/nix/store/") {
+                anyhow::bail!(
+                    "{} is managed by nix (symlink to {}). \
+                     Edit your nix configuration instead.",
+                    path.display(),
+                    target.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ensure parent directory exists.
+fn ensure_parent(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory: {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// File locking
+// ---------------------------------------------------------------------------
 
 /// Acquire an exclusive (write) lock on a file.
 #[cfg(unix)]
@@ -513,6 +587,10 @@ fn lock_exclusive(file: &std::fs::File) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// In-repo config
+// ---------------------------------------------------------------------------
+
 impl InRepoConfig {
     /// Load `.gitsitter.toml` from a repo root. Returns `None` if the file doesn't exist.
     pub fn load(repo_root: &Path) -> Result<Option<Self>> {
@@ -528,7 +606,9 @@ impl InRepoConfig {
                 path.display()
             )
         })?;
-        Ok(Some(raw.into()))
+        Ok(Some(Self {
+            refresh_interval: raw.refresh_interval,
+        }))
     }
 }
 
@@ -539,7 +619,7 @@ impl InRepoConfig {
 impl UserConfig {
     /// Check whether a host is trusted.
     pub fn is_host_trusted(&self, host: &str) -> bool {
-        self.trusted_hosts.get(host).copied().unwrap_or(false)
+        self.trusted_hosts.contains(host)
     }
 
     /// Check whether a remote URL is trusted.

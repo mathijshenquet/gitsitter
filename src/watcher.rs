@@ -122,13 +122,16 @@ pub async fn run(
                     }
                 }
 
-                // Check if this is a config.toml change
-                if path.file_name().is_some_and(|f| f == "config.toml")
-                    && path.parent().is_some_and(|p| p == config_path.parent().unwrap_or(Path::new("")))
-                {
-                    info!("⚡ config.toml changed, reloading");
-                    crate::daemon::reload_config(&daemon).await;
-                    continue;
+                // Check if this is a config file change (config.toml, repos.toml, trusted_hosts)
+                if path.parent().is_some_and(|p| p == config_path.parent().unwrap_or(Path::new(""))) {
+                    let is_config_file = path.file_name().is_some_and(|f| {
+                        f == "config.toml" || f == "repos.toml" || f == "trusted_hosts"
+                    });
+                    if is_config_file {
+                        info!("⚡ {} changed, reloading", path.file_name().unwrap_or_default().to_string_lossy());
+                        crate::daemon::reload_config(&daemon).await;
+                        continue;
+                    }
                 }
 
                 if let Some(repo_id) = resolve_repo_id_for_path(&path, &watched_repos) {

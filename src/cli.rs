@@ -20,7 +20,7 @@ use crate::transport::{
 
 /// Load display options from user config (best-effort, defaults if config fails).
 fn load_display_opts(paths: &Paths) -> DisplayOpts {
-    match UserConfig::load(&paths.config_file) {
+    match UserConfig::load(paths) {
         Ok(cfg) => DisplayOpts {
             emoji: cfg.global.emoji,
             colors: cfg.global.colors,
@@ -216,7 +216,7 @@ pub async fn handle_status(paths: &Paths, global: bool) -> Result<()> {
 
 async fn handle_status_global(paths: &Paths, opts: DisplayOpts, daemon_running: bool) -> Result<()> {
     if !daemon_running {
-        let cfg = UserConfig::load(&paths.config_file)?;
+        let cfg = UserConfig::load(paths)?;
         if cfg.repos.is_empty() {
             println!("No repos registered.");
         } else {
@@ -359,7 +359,7 @@ fn print_repo_status(data: &transport::StatusData, opts: DisplayOpts) {
 }
 
 pub async fn handle_config(paths: &Paths) -> Result<()> {
-    let cfg = UserConfig::load(&paths.config_file)?;
+    let cfg = UserConfig::load(paths)?;
 
     println!("Global settings:");
     println!("  refresh_interval: {:?}", cfg.global.refresh_interval);
@@ -376,12 +376,10 @@ pub async fn handle_config(paths: &Paths) -> Result<()> {
 
     if !cfg.trusted_hosts.is_empty() {
         println!("Trusted hosts:");
-        for (host, trusted) in &cfg.trusted_hosts {
-            println!(
-                "  {}: {}",
-                host,
-                if *trusted { "trusted" } else { "untrusted" }
-            );
+        let mut hosts: Vec<&str> = cfg.trusted_hosts.iter().map(|s| s.as_str()).collect();
+        hosts.sort();
+        for host in hosts {
+            println!("  {}", host);
         }
         println!();
     }
@@ -425,20 +423,16 @@ pub async fn handle_enable(paths: &Paths, remote: Option<String>, all: bool) -> 
     match target_remote {
         Some(name) => {
             // Enable a specific remote
-            let cfg = UserConfig::load(&paths.config_file)?;
+            let cfg = UserConfig::load(paths)?;
             if cfg.is_repo_disabled(&repo_id_str) {
                 bail!("repo is fully disabled — run `gitsitter enable --all` first");
             }
-            UserConfig::modify(&paths.config_file, {
-                let repo_path = repo_id_str.clone();
-                let remote_name = name.to_string();
-                move |cfg| {
-                    let entry = cfg.repos.entry(repo_path).or_default();
-                    if let Some(config::Disabled::Remotes(list)) = &mut entry.disabled {
-                        list.retain(|r| r != &remote_name);
-                        if list.is_empty() {
-                            entry.disabled = Some(config::Disabled::All(false));
-                        }
+            let remote_name = name.to_string();
+            UserConfig::update_repo(paths, &repo_id_str, move |entry| {
+                if let Some(config::Disabled::Remotes(list)) = &mut entry.disabled {
+                    list.retain(|r| r != &remote_name);
+                    if list.is_empty() {
+                        entry.disabled = Some(config::Disabled::All(false));
                     }
                 }
             })?;
@@ -448,19 +442,15 @@ pub async fn handle_enable(paths: &Paths, remote: Option<String>, all: bool) -> 
         }
         None => {
             // Enable whole repo
-            UserConfig::modify(&paths.config_file, {
-                let repo_id = repo_id_str.clone();
-                move |cfg| {
-                    let entry = cfg.repos.entry(repo_id).or_default();
-                    entry.disabled = Some(config::Disabled::All(false));
-                }
+            UserConfig::update_repo(paths, &repo_id_str, |entry| {
+                entry.disabled = Some(config::Disabled::All(false));
             })?;
             notify_daemon_reload(paths).await;
             let dp = display_path(&repo_id_str);
             let icon = cli_ui::success_icon(opts);
             println!("{} Enabled {}", icon, cli_ui::repo_header(&dp, opts));
 
-            let cfg = UserConfig::load(&paths.config_file)?;
+            let cfg = UserConfig::load(paths)?;
             let daemon_running = transport::is_daemon_running(&paths.socket_path);
             cli_ui::print_daemon_warning(daemon_running, opts);
             print_untrusted_remote_warnings(&repo_id, &cfg, opts);
@@ -729,7 +719,7 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                     }
                 }
                 "merge_conflict" => {
-                    let cfg = UserConfig::load(&paths.config_file).ok();
+                    let cfg = UserConfig::load(paths).ok();
                     let has_agent = cfg.as_ref()
                         .and_then(|c| c.global.resolve_agent.as_ref())
                         .is_some();
@@ -814,7 +804,7 @@ async fn run_resolve_agent_interactive(
 
 pub async fn handle_auto_resolve(paths: &Paths, agent_override: Option<String>) -> Result<()> {
     let opts = load_display_opts(paths);
-    let config = UserConfig::load(&paths.config_file)?;
+    let config = UserConfig::load(paths)?;
 
     let cwd = std::env::current_dir().context("failed to get current directory")?;
     let repo_id = git_ops::discover_repo_id(&cwd)?;
@@ -886,22 +876,18 @@ pub async fn handle_disable(paths: &Paths, remote: Option<String>, all: bool, pu
     match target_remote {
         Some(name) => {
             // Disable a specific remote
-            let cfg = UserConfig::load(&paths.config_file)?;
+            let cfg = UserConfig::load(paths)?;
             if cfg.is_repo_disabled(&repo_id_str) {
                 bail!("repo is already fully disabled");
             }
-            UserConfig::modify(&paths.config_file, {
-                let repo_path = repo_id_str.clone();
-                let remote_name = name.to_string();
-                move |cfg| {
-                    let entry = cfg.repos.entry(repo_path).or_default();
-                    if let Some(config::Disabled::Remotes(list)) = &mut entry.disabled {
-                        if !list.contains(&remote_name) {
-                            list.push(remote_name);
-                        }
-                    } else {
-                        entry.disabled = Some(config::Disabled::Remotes(vec![remote_name]));
+            let remote_name = name.to_string();
+            UserConfig::update_repo(paths, &repo_id_str, move |entry| {
+                if let Some(config::Disabled::Remotes(list)) = &mut entry.disabled {
+                    if !list.contains(&remote_name) {
+                        list.push(remote_name);
                     }
+                } else {
+                    entry.disabled = Some(config::Disabled::Remotes(vec![remote_name]));
                 }
             })?;
             notify_daemon_reload(paths).await;
@@ -910,17 +896,13 @@ pub async fn handle_disable(paths: &Paths, remote: Option<String>, all: bool, pu
         }
         None => {
             // Disable whole repo
-            UserConfig::modify(&paths.config_file, {
-                let repo_id = repo_id_str.clone();
-                move |cfg| {
-                    if purge {
-                        cfg.repos.remove(&repo_id);
-                    } else {
-                        let entry = cfg.repos.entry(repo_id).or_default();
-                        entry.disabled = Some(config::Disabled::All(true));
-                    }
-                }
-            })?;
+            if purge {
+                UserConfig::remove_repo(paths, &repo_id_str)?;
+            } else {
+                UserConfig::update_repo(paths, &repo_id_str, |entry| {
+                    entry.disabled = Some(config::Disabled::All(true));
+                })?;
+            }
             notify_daemon_reload(paths).await;
             let dp = display_path(&repo_id_str);
             let icon = cli_ui::pause_icon(opts);
@@ -932,12 +914,7 @@ pub async fn handle_disable(paths: &Paths, remote: Option<String>, all: bool, pu
 
 pub async fn handle_trust(paths: &Paths, host: &str) -> Result<()> {
     let opts = load_display_opts(paths);
-    UserConfig::modify(&paths.config_file, {
-        let host = host.to_string();
-        move |cfg| {
-            cfg.trusted_hosts.insert(host, true);
-        }
-    })?;
+    UserConfig::trust(paths, host)?;
     notify_daemon_reload(paths).await;
 
     let icon = cli_ui::success_icon(opts);
@@ -947,12 +924,7 @@ pub async fn handle_trust(paths: &Paths, host: &str) -> Result<()> {
 
 pub async fn handle_untrust(paths: &Paths, host: &str) -> Result<()> {
     let opts = load_display_opts(paths);
-    UserConfig::modify(&paths.config_file, {
-        let host = host.to_string();
-        move |cfg| {
-            cfg.trusted_hosts.remove(&host);
-        }
-    })?;
+    UserConfig::untrust(paths, host)?;
     notify_daemon_reload(paths).await;
 
     let icon = cli_ui::pause_icon(opts);
@@ -1041,19 +1013,14 @@ pub async fn handle_register(paths: &Paths, path: Option<String>) -> Result<()> 
         .context("not a git repository")?;
     let repo_id_str = repo_id.to_string_lossy().to_string();
 
-    UserConfig::modify(&paths.config_file, {
-        let repo_id = repo_id_str.clone();
-        move |cfg| {
-            cfg.repos.entry(repo_id).or_default();
-        }
-    })?;
+    UserConfig::update_repo(paths, &repo_id_str, |_| {})?;
     notify_daemon_reload(paths).await;
 
     let dp = display_path(&repo_id_str);
     let icon = cli_ui::celebrate_icon(opts);
     println!("{} Registered {}", icon, cli_ui::repo_header(&dp, opts));
 
-    let cfg = UserConfig::load(&paths.config_file)?;
+    let cfg = UserConfig::load(paths)?;
     let daemon_running = transport::is_daemon_running(&paths.socket_path);
     cli_ui::print_daemon_warning(daemon_running, opts);
     print_untrusted_remote_warnings(&repo_id, &cfg, opts);

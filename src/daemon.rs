@@ -221,7 +221,7 @@ pub async fn run_daemon(paths: &Paths) -> Result<()> {
     info!("gitsitter daemon starting (pid={})", pid);
 
     // 4. Load config
-    let config = UserConfig::load(&paths.config_file).context("failed to load config")?;
+    let config = UserConfig::load(paths).context("failed to load config")?;
     info!("initialized config from {}", paths.config_file.display());
 
     // 5. Seed repos from config.toml
@@ -529,13 +529,10 @@ async fn handle_prompt_check(daemon: &SharedDaemon, repo_path: &str) -> Response
     };
 
     if !already_tracked {
-        // Write to config.toml under lock and reload
+        // Write to repos.toml under lock and reload
         let id = repo_id_str.clone();
-        let cf = daemon.paths.config_file.clone();
-        if let Err(e) = UserConfig::modify(&cf, move |cfg| {
-            cfg.repos.entry(id).or_default();
-        }) {
-            warn!("failed to register repo in config: {:#}", e);
+        if let Err(e) = UserConfig::update_repo(&daemon.paths, &id, |_| {}) {
+            warn!("failed to register repo: {:#}", e);
         }
         reload_config(daemon).await;
     }
@@ -559,11 +556,11 @@ async fn handle_reload_config(daemon: &SharedDaemon) -> Response {
     }
 }
 
-/// Reload config.toml from disk and sync in-memory repo tracking.
+/// Reload config from disk and sync in-memory repo tracking.
 ///
 /// Called from: ReloadConfig RPC, PromptCheck, and the file watcher.
 pub(crate) async fn reload_config(daemon: &SharedDaemon) {
-    let new_config = match UserConfig::load(&daemon.paths.config_file) {
+    let new_config = match UserConfig::load(&daemon.paths) {
         Ok(c) => c,
         Err(e) => {
             warn!("failed to reload config: {:#}", e);

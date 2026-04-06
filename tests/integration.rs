@@ -87,6 +87,8 @@ fn test_paths(base: &Path) -> Paths {
     std::fs::create_dir_all(&state_dir).unwrap();
     Paths {
         config_file: config_dir.join("config.toml"),
+        repos_file: config_dir.join("repos.toml"),
+        trusted_hosts_file: config_dir.join("trusted_hosts"),
         daemon_log: state_dir.join("daemon.log"),
         daemon_pid: state_dir.join("daemon.pid"),
         socket_path: base.join("gitsitter-test.sock"),
@@ -105,30 +107,31 @@ mod config_tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn parse_complete_user_config() {
+    fn parse_flat_config_toml() {
         let tmp = temp_dir();
-        let config_dir = tmp.path().join("cfg");
-        std::fs::create_dir_all(&config_dir).unwrap();
+        let paths = test_paths(tmp.path());
 
-        let full_toml = r#"
-[global]
+        let config_toml = r#"
 refresh_interval = "120s"
 colors = false
 emoji = false
 notification_cooldown = "10m"
 git_path = "/usr/bin/git"
+"#;
+        std::fs::write(&paths.config_file, config_toml).unwrap();
 
-[trusted_hosts]
-"github.com" = true
-"evil.example.com" = false
-
-[repos."/home/user/project"]
+        // Write repos
+        let repos_toml = r#"
+["/home/user/project"]
 refresh_interval = "30s"
 disabled = false
 "#;
-        std::fs::write(config_dir.join("config.toml"), full_toml).unwrap();
+        std::fs::write(&paths.repos_file, repos_toml).unwrap();
 
-        let cfg = UserConfig::load(&config_dir.join("config.toml")).unwrap();
+        // Write trusted hosts
+        std::fs::write(&paths.trusted_hosts_file, "github.com\nevil.example.com\n").unwrap();
+
+        let cfg = UserConfig::load(&paths).unwrap();
 
         assert_eq!(cfg.global.refresh_interval, Duration::from_secs(120));
         assert!(!cfg.global.colors);
@@ -136,8 +139,8 @@ disabled = false
         assert_eq!(cfg.global.notification_cooldown, Duration::from_secs(600));
         assert_eq!(cfg.global.git_path.as_deref(), Some("/usr/bin/git"));
 
-        assert_eq!(cfg.trusted_hosts.get("github.com"), Some(&true));
-        assert_eq!(cfg.trusted_hosts.get("evil.example.com"), Some(&false));
+        assert!(cfg.trusted_hosts.contains("github.com"));
+        assert!(cfg.trusted_hosts.contains("evil.example.com"));
 
         let repo_cfg = cfg.repos.get("/home/user/project").unwrap();
         assert_eq!(repo_cfg.refresh_interval, Some(Duration::from_secs(30)));
@@ -158,32 +161,26 @@ refresh_interval = "5m"
     }
 
     #[test]
-    fn parse_empty_config() {
+    fn empty_config_uses_defaults() {
         let tmp = temp_dir();
-        std::fs::write(tmp.path().join(".gitsitter.toml"), "").unwrap();
-        let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
-        assert!(irc.refresh_interval.is_none());
+        let paths = test_paths(tmp.path());
 
-        // Also test UserConfig defaults
-        let cfg = UserConfig::default();
+        // No files created — all defaults
+        let cfg = UserConfig::load(&paths).unwrap();
         assert_eq!(cfg.global.refresh_interval, Duration::from_secs(60));
         assert!(cfg.global.colors);
         assert!(cfg.global.emoji);
         assert_eq!(cfg.global.notification_cooldown, Duration::from_secs(300));
         assert!(cfg.global.git_path.is_none());
-        assert_eq!(cfg.trusted_hosts.get("github.com"), Some(&true));
+        assert!(cfg.trusted_hosts.is_empty());
         assert!(cfg.repos.is_empty());
     }
 
     #[test]
-    fn parse_missing_config_returns_defaults() {
+    fn parse_missing_in_repo_config() {
         let tmp = temp_dir();
         let irc = InRepoConfig::load(tmp.path()).unwrap();
         assert!(irc.is_none());
-
-        let cfg = UserConfig::default();
-        assert_eq!(cfg.global.refresh_interval, Duration::from_secs(60));
-        assert!(cfg.global.colors);
     }
 
     #[test]
@@ -223,13 +220,22 @@ refresh_interval = "5m"
     // -----------------------------------------------------------------------
 
     #[test]
-    fn builtin_hosts_trusted_by_default() {
+    fn no_default_trusted_hosts() {
         let cfg = UserConfig::default();
+        assert!(!cfg.is_host_trusted("github.com"));
+        assert!(cfg.trusted_hosts.is_empty());
+    }
+
+    #[test]
+    fn trusted_hosts_from_file() {
+        let tmp = temp_dir();
+        let paths = test_paths(tmp.path());
+        std::fs::write(&paths.trusted_hosts_file, "github.com\ngitlab.com\n").unwrap();
+
+        let cfg = UserConfig::load(&paths).unwrap();
         assert!(cfg.is_host_trusted("github.com"));
         assert!(cfg.is_host_trusted("gitlab.com"));
-        assert!(cfg.is_host_trusted("codeberg.org"));
-        assert!(cfg.is_host_trusted("bitbucket.org"));
-        assert!(cfg.is_host_trusted("sr.ht"));
+        assert!(!cfg.is_host_trusted("evil.example.com"));
     }
 
     #[test]
@@ -240,16 +246,12 @@ refresh_interval = "5m"
     }
 
     #[test]
-    fn explicitly_disabled_builtin_host() {
-        let mut cfg = UserConfig::default();
-        cfg.trusted_hosts.insert("github.com".to_string(), false);
-        assert!(!cfg.is_host_trusted("github.com"));
-        assert!(cfg.is_host_trusted("gitlab.com"));
-    }
-
-    #[test]
     fn untrusted_remote_detected() {
-        let cfg = UserConfig::default();
+        let tmp = temp_dir();
+        let paths = test_paths(tmp.path());
+        std::fs::write(&paths.trusted_hosts_file, "github.com\n").unwrap();
+
+        let cfg = UserConfig::load(&paths).unwrap();
         assert!(!cfg.is_remote_trusted("git@evil.example.com:user/repo.git"));
         assert!(cfg.is_remote_trusted("git@github.com:user/repo.git"));
         assert!(cfg.is_remote_trusted("")); // no remote = trusted
@@ -308,97 +310,45 @@ refresh_interval = "5m"
     }
 
     // -----------------------------------------------------------------------
-    // Config round-trip
+    // Trust/untrust and repo operations
     // -----------------------------------------------------------------------
 
     #[test]
-    fn config_save_and_load_round_trip() {
+    fn trust_and_untrust_round_trip() {
         let tmp = temp_dir();
-        let config_dir = tmp.path().join("config_rt");
-        std::fs::create_dir_all(&config_dir).unwrap();
+        let paths = test_paths(tmp.path());
 
-        let config_file = config_dir.join("config.toml");
+        UserConfig::trust(&paths, "github.com").unwrap();
+        UserConfig::trust(&paths, "gitlab.com").unwrap();
 
-        UserConfig::modify(&config_file, |cfg| {
-            cfg.global.refresh_interval = Duration::from_secs(120);
-            cfg.global.colors = false;
-            cfg.global.emoji = false;
-            cfg.global.notification_cooldown = Duration::from_secs(600);
-            cfg.global.git_path = Some("/usr/bin/git".to_string());
-            cfg.trusted_hosts.insert("myhost.com".to_string(), true);
-            cfg.repos.insert(
-                "/home/user/project".to_string(),
-                RepoConfig {
-                    refresh_interval: Some(Duration::from_secs(30)),
-                    disabled: Some(config::Disabled::All(false)),
-                },
-            );
+        let cfg = UserConfig::load(&paths).unwrap();
+        assert!(cfg.is_host_trusted("github.com"));
+        assert!(cfg.is_host_trusted("gitlab.com"));
+
+        UserConfig::untrust(&paths, "github.com").unwrap();
+
+        let cfg = UserConfig::load(&paths).unwrap();
+        assert!(!cfg.is_host_trusted("github.com"));
+        assert!(cfg.is_host_trusted("gitlab.com"));
+    }
+
+    #[test]
+    fn update_repo_and_remove_round_trip() {
+        let tmp = temp_dir();
+        let paths = test_paths(tmp.path());
+
+        UserConfig::update_repo(&paths, "/home/user/project", |repo| {
+            repo.refresh_interval = Some(Duration::from_secs(30));
         }).unwrap();
-        let loaded = UserConfig::load(&config_file).unwrap();
 
-        assert_eq!(loaded.global.refresh_interval, Duration::from_secs(120));
-        assert!(!loaded.global.colors);
-        assert!(!loaded.global.emoji);
-        assert_eq!(loaded.global.notification_cooldown, Duration::from_secs(600));
-        assert_eq!(loaded.global.git_path.as_deref(), Some("/usr/bin/git"));
-        assert_eq!(loaded.trusted_hosts.get("myhost.com"), Some(&true));
-        let repo = loaded.repos.get("/home/user/project").unwrap();
-        assert_eq!(repo.refresh_interval, Some(Duration::from_secs(30)));
-    }
-
-    #[test]
-    fn load_creates_default_config_file() {
-        let tmp = TempDir::new().unwrap();
-        let config_dir = tmp.path().join("config_bootstrap");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let config_path = config_dir.join("config.toml");
-
-        let cfg = UserConfig::load(&config_path).unwrap();
-
-        assert!(config_path.exists());
-        assert_eq!(cfg.global.refresh_interval, Duration::from_secs(60));
-        assert_eq!(cfg.trusted_hosts.get("github.com"), Some(&true));
-    }
-
-    #[test]
-    fn old_config_with_mode_fields_parses_ok() {
-        // Backward compatibility: configs with now-removed mode/defaults fields
-        // should parse without error (serde ignores unknown fields by default).
-        let tmp = temp_dir();
-        let config_dir = tmp.path().join("cfg");
-        std::fs::create_dir_all(&config_dir).unwrap();
-
-        let old_toml = r#"
-[global]
-refresh_interval = "60s"
-
-[trusted_hosts]
-"github.com" = true
-
-[[defaults.remotes]]
-pattern = "github.com/*"
-mode = "push+pull"
-
-[[defaults.branches]]
-pattern = "main"
-mode = "pull"
-
-[repos."/home/user/project"]
-mode = "push"
-refresh_interval = "30s"
-
-[[repos."/home/user/project".branches]]
-pattern = "main"
-mode = "push+pull"
-"#;
-        std::fs::write(config_dir.join("config.toml"), old_toml).unwrap();
-
-        let cfg = UserConfig::load(&config_dir.join("config.toml")).unwrap();
-        assert_eq!(cfg.global.refresh_interval, Duration::from_secs(60));
-        assert_eq!(cfg.trusted_hosts.get("github.com"), Some(&true));
-        // Old mode/defaults/branches fields are silently ignored
+        let cfg = UserConfig::load(&paths).unwrap();
         let repo = cfg.repos.get("/home/user/project").unwrap();
         assert_eq!(repo.refresh_interval, Some(Duration::from_secs(30)));
+
+        UserConfig::remove_repo(&paths, "/home/user/project").unwrap();
+
+        let cfg = UserConfig::load(&paths).unwrap();
+        assert!(!cfg.repos.contains_key("/home/user/project"));
     }
 }
 
