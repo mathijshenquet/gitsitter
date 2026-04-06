@@ -6,7 +6,7 @@ A git utility that keeps your local branches in sync with their tracking remotes
 - **Local ahead + you own the branch** → push to remote
 - **Local ahead + not your branch** → notify the user (unless local tip is a merge of the remote tip)
 
-- **Diverged + you own the remote tip** → force-push with lease (safe rebase workflow)
+- **Diverged + you own the remote tip** → auto rebase and push
 - **Diverged + not your remote tip** → notify the user
 
 ## Philosophy
