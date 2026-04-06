@@ -1,3 +1,5 @@
 There is a git rebase in progress with conflicts. Resolve all conflicts and complete the rebase.
 
-Be conservative — only resolve where intent is clear. For ambiguous conflicts, make your best effort but mark with a FIXME comment. Do not abort the rebase.
+Be conservative — only resolve where intent is clear. Do not abort the rebase.
+
+If any conflicts are ambiguous, resolve them as best you can but print a short summary at the end listing what was unclear and why, with enough context for a human to review (e.g. "file.rs:42 — both sides modify the error handling differently, chose the remote version").
