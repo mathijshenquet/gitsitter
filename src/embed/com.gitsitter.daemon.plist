@@ -22,5 +22,10 @@
     <string>@@LOG_DIR@@/gitsitter.out.log</string>
     <key>StandardErrorPath</key>
     <string>@@LOG_DIR@@/gitsitter.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>@@DAEMON_PATH@@</string>
+    </dict>
 </dict>
 </plist>

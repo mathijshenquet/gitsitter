@@ -1284,10 +1284,156 @@ pub async fn handle_daemon_service() -> Result<()> {
     crate::service::run_service_dispatcher()
 }
 
+/// Build a PATH string for the daemon service by discovering tool locations.
+/// Keep in sync with nix/home-manager-module.nix (daemonPathPackages).
+fn build_daemon_path() -> String {
+    let mut dirs = Vec::new();
+    for tool in ["git", "ssh"] {
+        if let Ok(output) = std::process::Command::new("which").arg(tool).output() {
+            if output.status.success() {
+                if let Some(dir) = std::path::Path::new(
+                    std::str::from_utf8(&output.stdout).unwrap_or("").trim(),
+                )
+                .parent()
+                {
+                    let d = dir.to_string_lossy().to_string();
+                    if !dirs.contains(&d) {
+                        dirs.push(d);
+                    }
+                }
+            }
+        }
+    }
+    // Optionally include gh and resolve agent if available
+    for tool in ["gh", "claude"] {
+        if let Ok(output) = std::process::Command::new("which").arg(tool).output() {
+            if output.status.success() {
+                if let Some(dir) = std::path::Path::new(
+                    std::str::from_utf8(&output.stdout).unwrap_or("").trim(),
+                )
+                .parent()
+                {
+                    let d = dir.to_string_lossy().to_string();
+                    if !dirs.contains(&d) {
+                        dirs.push(d);
+                    }
+                }
+            }
+        }
+    }
+    if dirs.is_empty() {
+        "/usr/bin:/usr/local/bin".to_string()
+    } else {
+        dirs.join(":")
+    }
+}
+
+async fn install_daemon() -> Result<()> {
+    let exe = std::env::current_exe()?;
+    let daemon_path = build_daemon_path();
+    let state_dir = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .context("cannot determine state directory")?
+        .join("gitsitter");
+    std::fs::create_dir_all(&state_dir)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let launch_agents = dirs::home_dir()
+            .context("cannot determine home directory")?
+            .join("Library/LaunchAgents");
+        std::fs::create_dir_all(&launch_agents)?;
+        let plist = include_str!("embed/com.gitsitter.daemon.plist")
+            .replace("@@EXEC_PATH@@", &exe.display().to_string())
+            .replace("@@LOG_DIR@@", &state_dir.display().to_string())
+            .replace("@@DAEMON_PATH@@", &daemon_path);
+        let plist_path = launch_agents.join("com.gitsitter.daemon.plist");
+        std::fs::write(&plist_path, &plist)?;
+        println!("launchd plist written to {}", plist_path.display());
+        println!("Daemon PATH: {daemon_path}");
+        // Bootstrap the service
+        let uid = unsafe { libc::getuid() };
+        let domain = format!("gui/{uid}");
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &domain, &plist_path.display().to_string()])
+            .output();
+        let output = std::process::Command::new("launchctl")
+            .args(["bootstrap", &domain, &plist_path.display().to_string()])
+            .output()?;
+        if output.status.success() {
+            println!("launchd service bootstrapped");
+        } else {
+            println!(
+                "launchctl bootstrap failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            println!("Run manually: launchctl bootstrap {domain} {}", plist_path.display());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let unit_dir = dirs::home_dir()
+            .context("cannot determine home directory")?
+            .join(".config/systemd/user");
+        std::fs::create_dir_all(&unit_dir)?;
+        let unit = include_str!("embed/gitsitter.service")
+            .replace("@@EXEC_PATH@@", &exe.display().to_string())
+            .replace("@@DAEMON_PATH@@", &daemon_path);
+        let unit_path = unit_dir.join("gitsitter.service");
+        std::fs::write(&unit_path, &unit)?;
+        println!("Systemd user service written to {}", unit_path.display());
+        println!("Daemon PATH: {daemon_path}");
+        let output = std::process::Command::new("systemctl")
+            .args(["--user", "daemon-reload"])
+            .output();
+        if let Ok(o) = output {
+            if o.status.success() {
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", "enable", "--now", "gitsitter"])
+                    .output();
+                println!("systemd service enabled and started");
+            }
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
+    {
+        bail!("daemon service installation is not implemented for this Unix platform");
+    }
+
+    #[cfg(windows)]
+    {
+        let bin_path = format!("\"{}\" daemon service", exe.display());
+        let output = sc_command(&[
+            "create",
+            crate::service::SERVICE_NAME,
+            &format!("DisplayName= {}", crate::service::SERVICE_DISPLAY_NAME),
+            &format!("binPath= {}", bin_path),
+            "start= auto",
+            "type= own",
+        ])
+        .await?;
+        if !output.status.success() {
+            bail!(
+                "failed to create Windows service: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        println!(
+            "Windows service '{}' installed",
+            crate::service::SERVICE_DISPLAY_NAME
+        );
+        println!("Run: sc.exe start {}", crate::service::SERVICE_NAME);
+    }
+
+    Ok(())
+}
+
 pub async fn handle_install(component: Option<String>, shell_name: Option<String>) -> Result<()> {
     let comp = component.as_deref().unwrap_or("all");
     match comp {
-        "shell" | "hooks" | "all" => {
+        "shell" | "hooks" => {
             let sh = match &shell_name {
                 Some(s) => s.clone(),
                 None => crate::shell::detect_shell()
@@ -1297,147 +1443,113 @@ pub async fn handle_install(component: Option<String>, shell_name: Option<String
             println!("Shell hook installed for {sh}");
         }
         "daemon" => {
-            let exe = std::env::current_exe()?;
-            #[cfg(target_os = "macos")]
-            {
-                // Generate launchd plist
-                let launch_agents = dirs::home_dir()
-                    .context("cannot determine home directory")?
-                    .join("Library/LaunchAgents");
-                std::fs::create_dir_all(&launch_agents)?;
-                let log_dir = dirs::home_dir()
-                    .context("cannot determine home directory")?
-                    .join("Library/Logs/gitsitter");
-                std::fs::create_dir_all(&log_dir)?;
-                let plist = include_str!("embed/com.gitsitter.daemon.plist")
-                    .replace("@@EXEC_PATH@@", &exe.display().to_string())
-                    .replace("@@LOG_DIR@@", &log_dir.display().to_string());
-                let plist_path = launch_agents.join("com.gitsitter.daemon.plist");
-                std::fs::write(&plist_path, plist)?;
-                println!("launchd plist written to {}", plist_path.display());
-                println!("Run: launchctl bootstrap gui/$(id -u) {}", plist_path.display());
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                // Generate systemd unit file
-                let unit_dir = dirs::home_dir()
-                    .context("cannot determine home directory")?
-                    .join(".config/systemd/user");
-                std::fs::create_dir_all(&unit_dir)?;
-                let unit = include_str!("embed/gitsitter.service")
-                    .replace("@@EXEC_PATH@@", &exe.display().to_string());
-                let unit_path = unit_dir.join("gitsitter.service");
-                std::fs::write(&unit_path, unit)?;
-                println!("Systemd user service written to {}", unit_path.display());
-                println!("Run: systemctl --user daemon-reload && systemctl --user enable --now gitsitter");
-            }
-
-            #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
-            {
-                bail!("daemon service installation is not implemented for this Unix platform");
-            }
-
-            #[cfg(windows)]
-            {
-                let bin_path = format!("\"{}\" daemon service", exe.display());
-                let output = sc_command(&[
-                    "create",
-                    crate::service::SERVICE_NAME,
-                    &format!("DisplayName= {}", crate::service::SERVICE_DISPLAY_NAME),
-                    &format!("binPath= {}", bin_path),
-                    "start= auto",
-                    "type= own",
-                ])
-                .await?;
-                if !output.status.success() {
-                    bail!(
-                        "failed to create Windows service: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
-                }
-                println!(
-                    "Windows service '{}' installed",
-                    crate::service::SERVICE_DISPLAY_NAME
-                );
-                println!("Run: sc.exe start {}", crate::service::SERVICE_NAME);
-            }
+            install_daemon().await?;
         }
-        _ => bail!("unknown component: {}. Use 'shell', 'hooks', 'daemon', or 'all'", comp),
+        "all" => {
+            let sh = match &shell_name {
+                Some(s) => s.clone(),
+                None => crate::shell::detect_shell()
+                    .context("could not detect shell, specify with: gitsitter install shell <name>")?,
+            };
+            crate::shell::install_hook(&sh)?;
+            println!("Shell hook installed for {sh}");
+            println!();
+            install_daemon().await?;
+        }
+        _ => bail!("unknown component: {}. Use 'shell', 'daemon', or 'all'", comp),
+    }
+    Ok(())
+}
+
+async fn uninstall_daemon() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = dirs::home_dir()
+            .context("cannot determine home directory")?
+            .join("Library/LaunchAgents/com.gitsitter.daemon.plist");
+        if plist_path.exists() {
+            let uid = unsafe { libc::getuid() };
+            let domain = format!("gui/{uid}");
+            let output = std::process::Command::new("launchctl")
+                .args(["bootout", &domain, &plist_path.display().to_string()])
+                .output();
+            match output {
+                Ok(o) if o.status.success() => println!("launchd service stopped"),
+                Ok(o) => println!(
+                    "launchctl bootout: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ),
+                Err(e) => println!("failed to run launchctl: {e}"),
+            }
+            std::fs::remove_file(&plist_path)?;
+            println!("launchd plist removed");
+        } else {
+            println!("No launchd plist found");
+        }
     }
 
-    if comp == "all" {
-        // Also offer daemon install hint
-        println!();
-        #[cfg(target_os = "macos")]
-        println!("To also install the launchd service, run: gitsitter install daemon");
-        #[cfg(target_os = "linux")]
-        println!("To also install the systemd service, run: gitsitter install daemon");
-        #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
-        println!("Daemon service installation is not implemented for this Unix platform");
-        #[cfg(windows)]
-        println!("To also install the Windows service, run: gitsitter install daemon");
+    #[cfg(target_os = "linux")]
+    {
+        let unit_path = dirs::home_dir()
+            .context("cannot determine home directory")?
+            .join(".config/systemd/user/gitsitter.service");
+        if unit_path.exists() {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "disable", "--now", "gitsitter"])
+                .output();
+            println!("systemd service stopped and disabled");
+            std::fs::remove_file(&unit_path)?;
+            println!("Systemd service file removed");
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .output();
+        } else {
+            println!("No systemd service file found");
+        }
     }
+
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
+    {
+        bail!("daemon service uninstall is not implemented for this Unix platform");
+    }
+
+    #[cfg(windows)]
+    {
+        let output = sc_command(&["delete", crate::service::SERVICE_NAME]).await?;
+        if output.status.success() {
+            println!("Windows service removed");
+        } else {
+            println!(
+                "Windows service removal failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+    }
+
     Ok(())
 }
 
 pub async fn handle_uninstall(component: Option<String>) -> Result<()> {
     let comp = component.as_deref().unwrap_or("all");
     match comp {
-        "shell" | "hooks" | "all" => {
+        "shell" | "hooks" => {
             let sh = crate::shell::detect_shell()
                 .unwrap_or_else(|| "bash".to_string());
             crate::shell::uninstall_hook(&sh)?;
             println!("Shell hook removed for {sh}");
         }
         "daemon" => {
-            #[cfg(target_os = "macos")]
-            {
-                let plist_path = dirs::home_dir()
-                    .context("cannot determine home directory")?
-                    .join("Library/LaunchAgents/com.gitsitter.daemon.plist");
-                if plist_path.exists() {
-                    println!("Run first: launchctl bootout gui/$(id -u) {}", plist_path.display());
-                    std::fs::remove_file(&plist_path)?;
-                    println!("launchd plist removed");
-                } else {
-                    println!("No launchd plist found");
-                }
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                let unit_path = dirs::home_dir()
-                    .context("cannot determine home directory")?
-                    .join(".config/systemd/user/gitsitter.service");
-                if unit_path.exists() {
-                    std::fs::remove_file(&unit_path)?;
-                    println!("Systemd service file removed");
-                    println!("Run: systemctl --user daemon-reload");
-                } else {
-                    println!("No systemd service file found");
-                }
-            }
-
-            #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
-            {
-                bail!("daemon service uninstall is not implemented for this Unix platform");
-            }
-
-            #[cfg(windows)]
-            {
-                let output = sc_command(&["delete", crate::service::SERVICE_NAME]).await?;
-                if output.status.success() {
-                    println!("Windows service removed");
-                } else {
-                    println!(
-                        "Windows service removal failed: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    );
-                }
-            }
+            uninstall_daemon().await?;
         }
-        _ => bail!("unknown component: {}. Use 'shell', 'hooks', 'daemon', or 'all'", comp),
+        "all" => {
+            let sh = crate::shell::detect_shell()
+                .unwrap_or_else(|| "bash".to_string());
+            crate::shell::uninstall_hook(&sh)?;
+            println!("Shell hook removed for {sh}");
+            println!();
+            uninstall_daemon().await?;
+        }
+        _ => bail!("unknown component: {}. Use 'shell', 'daemon', or 'all'", comp),
     }
     Ok(())
 }

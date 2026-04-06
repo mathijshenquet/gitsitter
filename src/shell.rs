@@ -71,15 +71,25 @@ pub fn install_hook(shell: &str) -> Result<()> {
         }
     };
 
-    // Check if hook is already installed
-    if existing.contains("__gitsitter_hook") {
+    let block = format!("{HOOK_START_MARKER}\n{hook_script}\n{HOOK_END_MARKER}\n");
+
+    // If hook is already installed, replace the existing block
+    if let (Some(start), Some(end_pos)) = (
+        existing.find(HOOK_START_MARKER),
+        existing.find(HOOK_END_MARKER),
+    ) {
+        let end = end_pos + HOOK_END_MARKER.len();
+        let end = if existing[end..].starts_with('\n') { end + 1 } else { end };
+        let mut updated = String::with_capacity(existing.len());
+        updated.push_str(&existing[..start]);
+        updated.push_str(&block);
+        updated.push_str(&existing[end..]);
+        std::fs::write(&config_path, updated)
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
         return Ok(());
     }
 
-    // Build the block to append
-    let block = format!("\n{HOOK_START_MARKER}\n{hook_script}\n{HOOK_END_MARKER}\n");
-
-    // Append to the config file
+    // First install: append to the config file
     use std::io::Write;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -87,7 +97,7 @@ pub fn install_hook(shell: &str) -> Result<()> {
         .open(&config_path)
         .with_context(|| format!("failed to open {} for writing", config_path.display()))?;
 
-    file.write_all(block.as_bytes())
+    file.write_all(format!("\n{block}").as_bytes())
         .with_context(|| format!("failed to write to {}", config_path.display()))?;
 
     Ok(())

@@ -84,7 +84,7 @@ in
       source = tomlFormat.generate "gitsitter-config.toml" renderedSettings;
     };
 
-    # Keep in sync with src/embed/gitsitter.service
+    # Keep in sync with src/embed/gitsitter.service and handle_install in src/cli.rs
     systemd.user.services.gitsitter = lib.mkIf cfg.systemd.enable {
       Unit = {
         Description = "gitsitter daemon";
@@ -103,7 +103,7 @@ in
       };
     };
 
-    # Keep in sync with src/embed/com.gitsitter.daemon.plist
+    # Keep in sync with src/embed/com.gitsitter.daemon.plist and handle_install in src/cli.rs
     launchd.agents.gitsitter = lib.mkIf cfg.launchd.enable {
       enable = true;
       config = {
