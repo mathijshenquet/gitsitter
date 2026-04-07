@@ -32,24 +32,6 @@
       in
       {
         packages.default = mkPackage pkgs;
-
-        devShells.default = pkgs.mkShell {
-          buildInputs = with pkgs; [
-            rustc
-            cargo
-            clippy
-            rustfmt
-            rust-analyzer
-            pkg-config
-            openssl
-            libgit2
-            sqlite
-          ];
-
-          shellHook = ''
-            export PATH="./target/debug:./target/release:$PATH"
-          '';
-        };
       }) // {
         homeManagerModules.default = import ./nix/home-manager-module.nix { inherit self; };
       };

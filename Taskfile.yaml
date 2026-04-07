@@ -16,6 +16,12 @@ tasks:
     cmds:
       - cargo check
 
+  check:cfg:
+    desc: Validate all cfg() conditions reference known values
+    cmds:
+      - cargo check -q 2>&1
+      - cargo clippy -q -- -W unexpected_cfgs 2>&1
+
   release:
     desc: Tag and push a release from Cargo.toml version
     cmds:

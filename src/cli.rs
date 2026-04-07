@@ -1200,13 +1200,19 @@ pub async fn handle_daemon_start(paths: &Paths) -> Result<()> {
     let exe = std::env::current_exe().context("failed to determine own executable path")?;
     paths.ensure_dirs()?;
 
-    let child = std::process::Command::new(&exe)
-        .args(["daemon", "run"])
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.args(["daemon", "run"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .context("failed to spawn daemon process")?;
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
+    let child = cmd.spawn().context("failed to spawn daemon process")?;
 
     if wait_for_daemon_ready(paths, std::time::Duration::from_secs(3)).await {
         println!("\u{2713} Daemon started, PID: {}", child.id());
@@ -1274,32 +1280,19 @@ pub async fn handle_daemon_service() -> Result<()> {
 /// Build a PATH string for the daemon service by discovering tool locations.
 /// Keep in sync with nix/home-manager-module.nix (daemonPathPackages).
 fn build_daemon_path() -> String {
+    #[cfg(not(windows))]
+    const WHICH_CMD: &str = "which";
+    #[cfg(windows)]
+    const WHICH_CMD: &str = "where.exe";
+
     let mut dirs = Vec::new();
-    for tool in ["git", "ssh"] {
-        if let Ok(output) = std::process::Command::new("which").arg(tool).output() {
+    for tool in ["git", "ssh", "gh", "claude"] {
+        if let Ok(output) = std::process::Command::new(WHICH_CMD).arg(tool).output() {
             if output.status.success() {
-                if let Some(dir) = std::path::Path::new(
-                    std::str::from_utf8(&output.stdout).unwrap_or("").trim(),
-                )
-                .parent()
-                {
-                    let d = dir.to_string_lossy().to_string();
-                    if !dirs.contains(&d) {
-                        dirs.push(d);
-                    }
-                }
-            }
-        }
-    }
-    // Optionally include gh and resolve agent if available
-    for tool in ["gh", "claude"] {
-        if let Ok(output) = std::process::Command::new("which").arg(tool).output() {
-            if output.status.success() {
-                if let Some(dir) = std::path::Path::new(
-                    std::str::from_utf8(&output.stdout).unwrap_or("").trim(),
-                )
-                .parent()
-                {
+                // `where.exe` may return multiple lines; take the first
+                let stdout = std::str::from_utf8(&output.stdout).unwrap_or("");
+                let line = stdout.lines().next().unwrap_or("").trim();
+                if let Some(dir) = std::path::Path::new(line).parent() {
                     let d = dir.to_string_lossy().to_string();
                     if !dirs.contains(&d) {
                         dirs.push(d);
@@ -1309,10 +1302,13 @@ fn build_daemon_path() -> String {
         }
     }
     if dirs.is_empty() {
-        "/usr/bin:/usr/local/bin".to_string()
-    } else {
-        dirs.join(":")
+        #[cfg(not(windows))]
+        return "/usr/bin:/usr/local/bin".to_string();
+        #[cfg(windows)]
+        return r"C:\Windows\System32".to_string();
     }
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    dirs.join(sep)
 }
 
 async fn install_daemon() -> Result<()> {

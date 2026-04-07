@@ -14,6 +14,7 @@ mod imp {
     use windows_service::service_dispatcher;
 
     use crate::daemon;
+    use crate::paths::Paths;
     use crate::transport::{self, Request, Response};
 
     pub const SERVICE_NAME: &str = "gitsitter";
@@ -33,6 +34,9 @@ mod imp {
     }
 
     fn run_service() -> Result<()> {
+        let paths = Paths::resolve();
+        paths.ensure_dirs()?;
+
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
 
         let status_handle = service_control_handler::register(SERVICE_NAME, move |control| {
@@ -57,9 +61,10 @@ mod imp {
         let runtime = Runtime::new().context("failed to create Tokio runtime for service")?;
 
         runtime.block_on(async move {
-            let daemon_task = tokio::spawn(async { daemon::run_daemon().await });
+            let paths_clone = paths.clone();
+            let daemon_task = tokio::spawn(async move { daemon::run_daemon(&paths_clone).await });
 
-            wait_for_daemon_ready().await;
+            wait_for_daemon_ready(&paths.socket_path).await;
 
             status_handle
                 .set_service_status(service_status(
@@ -69,7 +74,7 @@ mod imp {
                 .context("failed to mark Windows service running")?;
 
             let _ = shutdown_rx.recv();
-            request_daemon_shutdown().await;
+            request_daemon_shutdown(&paths.socket_path).await;
 
             let daemon_result = daemon_task
                 .await
@@ -101,17 +106,17 @@ mod imp {
         }
     }
 
-    async fn wait_for_daemon_ready() {
+    async fn wait_for_daemon_ready(socket_path: &std::path::Path) {
         for _ in 0..40 {
-            if transport::is_daemon_running() {
+            if transport::is_daemon_running(socket_path) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
 
-    async fn request_daemon_shutdown() {
-        let Ok(mut stream) = transport::connect_to_daemon().await else {
+    async fn request_daemon_shutdown(socket_path: &std::path::Path) {
+        let Ok(mut stream) = transport::connect_to_daemon(socket_path).await else {
             return;
         };
         let _ = transport::send_request(&mut stream, &Request::Shutdown).await;
