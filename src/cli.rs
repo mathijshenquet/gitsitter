@@ -540,10 +540,12 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                     match prompt_choice(3) {
                         1 => {
                             let branch_remote = upstream.split('/').next().unwrap_or("origin");
+                            let remote_ref = upstream.splitn(2, '/').nth(1).unwrap_or(&b.name);
                             match git_ops::git_push(
                                 &repo_id_path,
                                 branch_remote,
                                 &b.name,
+                                remote_ref,
                                 None,
                                 30,
                             ).await {
@@ -594,7 +596,8 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                     match prompt_choice(3) {
                         1 => {
                             let branch_remote = upstream.split('/').next().unwrap_or("origin");
-                            let upstream_ref = format!("{}/{}", branch_remote, b.name);
+                            let remote_ref = upstream.splitn(2, '/').nth(1).unwrap_or(&b.name);
+                            let upstream_ref = format!("{}/{}", branch_remote, remote_ref);
                             match git_ops::git_rebase(
                                 &repo_id_path,
                                 &upstream_ref,
@@ -607,6 +610,7 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                                         &repo_id_path,
                                         branch_remote,
                                         &b.name,
+                                        remote_ref,
                                         None,
                                         30,
                                     ).await {

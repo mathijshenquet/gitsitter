@@ -971,7 +971,57 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         }
     }
 
-    for branch in &branches {
+    // Build a set of canonical branches per (remote, remote_ref) pair.
+    // If multiple local branches track the same remote ref, the one whose
+    // local name matches the remote ref is canonical; the rest are skipped.
+    // If none match by name, skip all of them (ambiguous).
+    let canonical: std::collections::HashSet<usize> = {
+        let mut by_target: HashMap<(&str, &str), Vec<usize>> = HashMap::new();
+        for (i, b) in branches.iter().enumerate() {
+            if b.upstream_name.is_some() {
+                by_target
+                    .entry((&b.remote, &b.remote_ref))
+                    .or_default()
+                    .push(i);
+            }
+        }
+        let mut set = std::collections::HashSet::new();
+        for ((remote, remote_ref), indices) in &by_target {
+            if indices.len() == 1 {
+                set.insert(indices[0]);
+            } else {
+                // Multiple locals track the same remote ref — pick the one whose name matches
+                if let Some(&canon) = indices.iter().find(|&&i| branches[i].name == *remote_ref) {
+                    set.insert(canon);
+                    for &i in indices {
+                        if i != canon {
+                            repo_info!(
+                                repo_label,
+                                "skipping :{} — also tracks {}/{} which is canonical via :{}",
+                                branches[i].name, remote, remote_ref, branches[canon].name
+                            );
+                        }
+                    }
+                } else {
+                    // No name match — ambiguous, skip all
+                    for &i in indices {
+                        repo_warn!(
+                            repo_label,
+                            "skipping :{} — multiple branches track {}/{} with no name match",
+                            branches[i].name, remote, remote_ref
+                        );
+                    }
+                }
+            }
+        }
+        set
+    };
+
+    for (branch_idx, branch) in branches.iter().enumerate() {
+        if !canonical.contains(&branch_idx) {
+            continue;
+        }
+
         // Only process branches with upstreams
         let upstream_name = match &branch.upstream_name {
             Some(u) => u.clone(),
@@ -1178,6 +1228,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                     &push_path,
                     &branch.remote,
                     &branch.name,
+                    &branch.remote_ref,
                     git_path_ref,
                     GIT_TIMEOUT_SECS,
                 )
@@ -1305,7 +1356,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         }
                     }
 
-                    let upstream_ref = format!("{}/{}", branch.remote, branch.name);
+                    let upstream_ref = format!("{}/{}", branch.remote, branch.remote_ref);
                     let rebase_ok = git_ops::git_rebase(
                         &rebase_path,
                         &upstream_ref,
@@ -1327,6 +1378,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                             &push_path,
                             &branch.remote,
                             &branch.name,
+                            &branch.remote_ref,
                             git_path_ref,
                             GIT_TIMEOUT_SECS,
                         )
@@ -1417,6 +1469,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                             &rebase_path,
                                             &branch.remote,
                                             &branch.name,
+                                            &branch.remote_ref,
                                             git_path_ref,
                                             GIT_TIMEOUT_SECS,
                                         ).await {

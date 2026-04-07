@@ -23,6 +23,9 @@ pub struct RepoBranch {
     pub is_head: bool,
     /// The remote configured for this branch (`branch.<name>.remote`), defaults to "origin".
     pub remote: String,
+    /// The branch name on the remote side (`branch.<name>.merge` stripped of `refs/heads/`),
+    /// defaults to the local branch name.
+    pub remote_ref: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,13 +182,23 @@ pub fn list_branches(repo_id: &Path) -> Result<Vec<RepoBranch>> {
         };
 
         // Read branch.<name>.remote from git config, default to "origin".
-        let remote = repo
-            .config()
-            .ok()
-            .and_then(|cfg| {
-                cfg.get_string(&format!("branch.{}.remote", name)).ok()
+        let cfg = repo.config().ok();
+        let remote = cfg
+            .as_ref()
+            .and_then(|c| {
+                c.get_string(&format!("branch.{}.remote", name)).ok()
             })
             .unwrap_or_else(|| "origin".to_string());
+
+        // Read branch.<name>.merge (e.g. "refs/heads/bar") to get the remote-side
+        // branch name. Falls back to the local branch name.
+        let remote_ref = cfg
+            .as_ref()
+            .and_then(|c| {
+                c.get_string(&format!("branch.{}.merge", name)).ok()
+            })
+            .and_then(|m| m.strip_prefix("refs/heads/").map(|s| s.to_string()))
+            .unwrap_or_else(|| name.clone());
 
         branches.push(RepoBranch {
             name,
@@ -194,6 +207,7 @@ pub fn list_branches(repo_id: &Path) -> Result<Vec<RepoBranch>> {
             remote_oid,
             is_head,
             remote,
+            remote_ref,
         });
     }
     Ok(branches)
@@ -480,12 +494,14 @@ pub async fn git_ff_merge(
 pub async fn git_push(
     repo_path: &Path,
     remote: &str,
-    branch: &str,
+    local_branch: &str,
+    remote_ref: &str,
     git_path: Option<&str>,
     timeout_secs: u64,
 ) -> Result<PushResult> {
     let mut cmd = git_command(repo_path, git_path);
-    cmd.arg("push").arg(remote).arg(branch);
+    let refspec = format!("{}:{}", local_branch, remote_ref);
+    cmd.arg("push").arg(remote).arg(&refspec);
 
     let output = match tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
