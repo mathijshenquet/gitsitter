@@ -15,6 +15,18 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use tokio::sync::{Notify, RwLock, watch};
 use tracing::{error, info, warn};
+
+/// Log macros that prefix messages with the canonical repo path (the .git dir).
+/// This makes log output semi-structured and easy to filter by repo.
+macro_rules! repo_info {
+    ($repo:expr, $($arg:tt)*) => { info!("{} · {}", $repo, format_args!($($arg)*)) };
+}
+macro_rules! repo_warn {
+    ($repo:expr, $($arg:tt)*) => { warn!("{} · {}", $repo, format_args!($($arg)*)) };
+}
+macro_rules! repo_error {
+    ($repo:expr, $($arg:tt)*) => { error!("{} · {}", $repo, format_args!($($arg)*)) };
+}
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 use crate::config::{EffectiveConflictAction, UserConfig};
@@ -210,7 +222,12 @@ pub async fn run_daemon(paths: &Paths) -> Result<()> {
 
     // 3. Set up tracing — write to both stderr (for service managers) and daemon.log
     let log_dir = paths.daemon_log.parent().expect("daemon_log has parent dir");
-    let file_appender = tracing_appender::rolling::daily(log_dir, "daemon.log");
+    let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("daemon.log")
+        .max_log_files(1) // keep only today + yesterday; system journal is the primary log
+        .build(log_dir)
+        .expect("failed to create log appender");
     let _ = tracing_subscriber::fmt()
         .with_writer(std::io::stderr.and(file_appender))
         .with_env_filter(
@@ -515,7 +532,7 @@ async fn handle_sync(
                 if let Some(tr) = repos.get_mut(&repo_id_str) {
                     tr.sync_reason = Some(format!("cli sync requested ({})", display_repo_label(&tr.display_path)));
                     drop(repos);
-                    info!("⚡ event cli sync requested {}", display_repo_label(&path));
+                    repo_info!(display_repo_label(&path), "⚡ cli sync requested");
                     daemon.sync_notify.notify_one();
                     Response::Ok {
                         message: format!("sync triggered for {}", path),
@@ -567,7 +584,7 @@ async fn handle_prompt_check(daemon: &SharedDaemon, repo_path: &str) -> Response
         // Write to repos.toml under lock and reload
         let id = repo_id_str.clone();
         if let Err(e) = UserConfig::update_repo(&daemon.paths, &id, |_| {}) {
-            warn!("failed to register repo: {:#}", e);
+            repo_warn!(repo_id_str, "failed to register: {:#}", e);
         }
         reload_config(daemon).await;
     }
@@ -621,7 +638,7 @@ pub(crate) async fn reload_config(daemon: &SharedDaemon) {
                     repo_path.clone(),
                     TrackedRepo::new(repo_path.clone(), display_path, remote_urls),
                 );
-                info!("tracking new repo: {}", repo_path);
+                repo_info!(repo_path, "tracking new repo");
             }
         }
         // Remove repos no longer in config
@@ -630,7 +647,7 @@ pub(crate) async fn reload_config(daemon: &SharedDaemon) {
             .cloned()
             .collect();
         for id in &to_remove {
-            info!("untracking repo: {}", id);
+            repo_info!(id, "untracking repo");
         }
         for id in to_remove {
             repos.remove(&id);
@@ -787,7 +804,7 @@ async fn sync_loop(daemon: SharedDaemon, mut shutdown_rx: watch::Receiver<bool>)
         // Sync each due repo
         for repo_id in repos_to_sync {
             if let Err(e) = sync_repo(&daemon, &repo_id).await {
-                warn!("sync error for {}: {:#}", repo_log_label(&repo_id), e);
+                repo_warn!(repo_log_label(&repo_id), "sync error: {:#}", e);
             }
         }
     }
@@ -828,7 +845,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
 
     // 1. Check repo exists
     if !repo_path.exists() {
-        warn!("repo path missing: {}", repo_label);
+        repo_warn!(repo_label, "repo path missing");
         // Update last_sync so we don't hammer every second
         let mut repos = daemon.repos.write().await;
         if let Some(tr) = repos.get_mut(repo_id) {
@@ -934,7 +951,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         any_success = true;
                     }
                     Err(e) => {
-                        warn!("fetch failed for {} remote {}: {:#}", repo_label, remote, e);
+                        repo_warn!(repo_label, "fetch failed for remote {}: {:#}", remote, e);
                     }
                 }
             }
@@ -965,10 +982,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         let analysis = match git_ops::analyze_merge(&repo_path, &branch.name) {
             Ok(a) => a,
             Err(e) => {
-                warn!(
-                    "merge analysis failed for {}:{}: {:#}",
-                    repo_label, branch.name, e
-                );
+                repo_warn!(repo_label, "merge analysis failed for :{}: {:#}", branch.name, e);
                 continue;
             }
         };
@@ -978,7 +992,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         match analysis {
             // 5b. Upstream gone
             MergeAnalysis::UpstreamGone => {
-                info!("upstream gone for {}:{}", repo_label, branch.name);
+                repo_info!(repo_label, "upstream gone :{}", branch.name);
                 let mut repos = daemon.repos.write().await;
                 if let Some(tr) = repos.get_mut(repo_id) {
                     tr.set_branch(&branch.name, BranchRuntimeState {
@@ -1021,10 +1035,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                     // Check if worktree is clean
                     let is_dirty = git_ops::is_worktree_dirty(&wt_path_buf).unwrap_or(true);
                     if is_dirty {
-                        info!(
-                            "skipping ff for {}:{} — worktree dirty",
-                            repo_label, branch.name
-                        );
+                        repo_info!(repo_label, "skipping ff :{} — worktree dirty", branch.name);
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.set_branch(&branch.name, BranchRuntimeState {
@@ -1050,7 +1061,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                     {
                         Ok(()) => {
                             had_activity = true;
-                            info!("ff-merged {}:{}", repo_label, branch.name);
+                            repo_info!(repo_label, "ff-merged :{}", branch.name);
                             let now = chrono::Utc::now().to_rfc3339();
                             let mut repos = daemon.repos.write().await;
                             if let Some(tr) = repos.get_mut(repo_id) {
@@ -1065,10 +1076,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            warn!(
-                                "ff-merge failed for {}:{}: {:#}",
-                                repo_label, branch.name, e
-                            );
+                            repo_warn!(repo_label, "ff-merge failed :{}: {:#}", branch.name, e);
                             let mut repos = daemon.repos.write().await;
                             if let Some(tr) = repos.get_mut(repo_id) {
                                 tr.set_branch(&branch.name, BranchRuntimeState {
@@ -1095,7 +1103,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                     {
                         Ok(()) => {
                             had_activity = true;
-                            info!("update-ref {}:{}", repo_label, branch.name);
+                            repo_info!(repo_label, "update-ref :{}", branch.name);
                             let now = chrono::Utc::now().to_rfc3339();
                             let mut repos = daemon.repos.write().await;
                             if let Some(tr) = repos.get_mut(repo_id) {
@@ -1110,10 +1118,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            warn!(
-                                "update-ref failed for {}:{}: {:#}",
-                                repo_label, branch.name, e
-                            );
+                            repo_warn!(repo_label, "update-ref failed :{}: {:#}", branch.name, e);
                             // Likely a race — retry next cycle
                         }
                     }
@@ -1180,7 +1185,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 {
                     Ok(PushResult::Success) => {
                         had_activity = true;
-                        info!("pushed {}:{}", repo_label, branch.name);
+                        repo_info!(repo_label, "pushed :{}", branch.name);
                         let now = chrono::Utc::now().to_rfc3339();
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
@@ -1196,7 +1201,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         }
                     }
                     Ok(PushResult::Rejected(msg)) => {
-                        warn!("push rejected for {}:{}: {}", repo_label, branch.name, msg);
+                        repo_warn!(repo_label, "push rejected :{}: {}", branch.name, msg);
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_push_failure(&ref_name);
@@ -1211,7 +1216,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         }
                     }
                     Ok(PushResult::AuthFailed(msg)) => {
-                        warn!("push auth failed for {}:{}: {}", repo_label, branch.name, msg);
+                        repo_warn!(repo_label, "push auth failed :{}: {}", branch.name, msg);
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_fetch_failure();
@@ -1226,7 +1231,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         }
                     }
                     Ok(PushResult::NetworkError(msg)) => {
-                        warn!("push network error for {}:{}: {}", repo_label, branch.name, msg);
+                        repo_warn!(repo_label, "push network error :{}: {}", branch.name, msg);
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_fetch_failure();
@@ -1241,7 +1246,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         }
                     }
                     Ok(PushResult::HookTimeout) => {
-                        warn!("push hook timeout for {}:{}", repo_label, branch.name);
+                        repo_warn!(repo_label, "push hook timeout :{}", branch.name);
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_push_failure(&ref_name);
@@ -1256,7 +1261,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         }
                     }
                     Err(e) => {
-                        error!("push error for {}:{}: {:#}", repo_label, branch.name, e);
+                        repo_error!(repo_label, "push error :{}: {:#}", branch.name, e);
                     }
                 }
             }
@@ -1284,10 +1289,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                     if let Some(wt_path) = occupancy.get(&branch.name) {
                         let wt_path_buf = PathBuf::from(wt_path);
                         if git_ops::is_worktree_dirty(&wt_path_buf).unwrap_or(false) {
-                            info!(
-                                "skipping rebase for {}:{} — worktree dirty",
-                                repo_label, branch.name
-                            );
+                            repo_info!(repo_label, "skipping rebase :{} — worktree dirty", branch.name);
                             let mut repos = daemon.repos.write().await;
                             if let Some(tr) = repos.get_mut(repo_id) {
                                 tr.set_branch(&branch.name, BranchRuntimeState {
@@ -1314,7 +1316,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                     .unwrap_or(false);
 
                     if rebase_ok {
-                        info!("rebased {}:{} onto {}", repo_label, branch.name, upstream_ref);
+                        repo_info!(repo_label, "rebased :{} onto {}", branch.name, upstream_ref);
                         // Now push the rebased commits
                         let push_path = worktrees
                             .first()
@@ -1332,7 +1334,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         {
                             Ok(PushResult::Success) => {
                                 had_activity = true;
-                                info!("pushed (after rebase) {}:{}", repo_label, branch.name);
+                                repo_info!(repo_label, "pushed (after rebase) :{}", branch.name);
                                 let now = chrono::Utc::now().to_rfc3339();
                                 let mut repos = daemon.repos.write().await;
                                 if let Some(tr) = repos.get_mut(repo_id) {
@@ -1348,7 +1350,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                 }
                             }
                             _ => {
-                                warn!("push after rebase failed for {}:{}", repo_label, branch.name);
+                                repo_warn!(repo_label, "push after rebase failed :{}", branch.name);
                                 let mut repos = daemon.repos.write().await;
                                 if let Some(tr) = repos.get_mut(repo_id) {
                                     tr.backoff.record_push_failure(&ref_name);
@@ -1365,7 +1367,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         }
                     } else {
                         // Rebase had conflicts — apply on_conflict policy
-                        warn!("rebase conflicts for {}:{}", repo_label, branch.name);
+                        repo_warn!(repo_label, "rebase conflicts :{}", branch.name);
                         let has_agent = config.global.resolve_agent.is_some();
                         let action = config.global.on_conflict.effective(has_agent);
 
@@ -1402,14 +1404,14 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                             EffectiveConflictAction::ResolveAgent => {
                                 let agent = config.global.resolve_agent.as_deref().unwrap_or("claude");
                                 let agent_path = config.global.resolve_agent_path.as_deref();
-                                info!("running resolve agent '{}' for {}:{}", agent, repo_label, branch.name);
+                                repo_info!(repo_label, "running resolve agent '{}' :{}", agent, branch.name);
 
                                 const RESOLVE_TIMEOUT_SECS: u64 = 180;
                                 match git_ops::run_resolve_agent(
                                     &rebase_path, agent, agent_path, RESOLVE_TIMEOUT_SECS,
                                 ).await {
                                     Ok(result) if result.completed => {
-                                        info!("resolve agent succeeded for {}:{}", repo_label, branch.name);
+                                        repo_info!(repo_label, "resolve agent succeeded :{}", branch.name);
                                         // Push the resolved rebase
                                         match git_ops::git_push(
                                             &rebase_path,
@@ -1420,7 +1422,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                         ).await {
                                             Ok(PushResult::Success) => {
                                                 had_activity = true;
-                                                info!("pushed (after resolve agent) {}:{}", repo_label, branch.name);
+                                                repo_info!(repo_label, "pushed (after resolve agent) :{}", branch.name);
                                                 let now = chrono::Utc::now().to_rfc3339();
                                                 let mut repos = daemon.repos.write().await;
                                                 if let Some(tr) = repos.get_mut(repo_id) {
@@ -1436,7 +1438,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                                 }
                                             }
                                             _ => {
-                                                warn!("push after resolve agent failed for {}:{}", repo_label, branch.name);
+                                                repo_warn!(repo_label, "push after resolve agent failed :{}", branch.name);
                                                 let mut repos = daemon.repos.write().await;
                                                 if let Some(tr) = repos.get_mut(repo_id) {
                                                     tr.backoff.record_push_failure(&ref_name);
@@ -1454,7 +1456,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                     }
                                     Ok(result) => {
                                         // Agent ran but didn't fully resolve — leave conflicts
-                                        warn!("resolve agent did not complete for {}:{}", repo_label, branch.name);
+                                        repo_warn!(repo_label, "resolve agent did not complete :{}", branch.name);
                                         let msg = if result.agent_output.is_empty() {
                                             "resolve agent could not fully resolve conflicts — finish manually or run `gitsitter auto-resolve`".to_string()
                                         } else {
@@ -1483,7 +1485,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("resolve agent failed for {}:{}: {:#}", repo_label, branch.name, e);
+                                        repo_warn!(repo_label, "resolve agent failed :{}: {:#}", branch.name, e);
                                         // Leave conflicts in place
                                         let mut repos = daemon.repos.write().await;
                                         if let Some(tr) = repos.get_mut(repo_id) {
@@ -1502,7 +1504,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         }
                     }
                 } else {
-                    warn!("diverged: {}:{}", repo_label, branch.name);
+                    repo_warn!(repo_label, "diverged :{}", branch.name);
                     let mut repos = daemon.repos.write().await;
                     if let Some(tr) = repos.get_mut(repo_id) {
                         tr.set_branch(&branch.name, BranchRuntimeState {
@@ -1537,10 +1539,10 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
     let branch_count = branches.len();
     let summary = format!("{} remote(s), {} branch(es)", remote_count, branch_count);
     match reason {
-        Some(r) if had_activity => info!("✅ sync completed for {} in {:.1?}, {} ({})", repo_label, elapsed, summary, r),
-        Some(r) => info!("• scan completed for {} in {:.1?}, {} ({})", repo_label, elapsed, summary, r),
-        None if had_activity => info!("✅ sync completed for {} in {:.1?}, {} (scheduled)", repo_label, elapsed, summary),
-        None => info!("• scheduled scan completed for {} in {:.1?}, {}", repo_label, elapsed, summary),
+        Some(r) if had_activity => repo_info!(repo_label, "✅ sync completed in {:.1?}, {} ({})", elapsed, summary, r),
+        Some(r) => repo_info!(repo_label, "• scan completed in {:.1?}, {} ({})", elapsed, summary, r),
+        None if had_activity => repo_info!(repo_label, "✅ sync completed in {:.1?}, {} (scheduled)", elapsed, summary),
+        None => repo_info!(repo_label, "• scheduled scan completed in {:.1?}, {}", elapsed, summary),
     }
 
     Ok(())
@@ -1565,11 +1567,7 @@ pub(crate) fn display_path_label(path: &Path) -> String {
 }
 
 fn repo_log_label(repo_id: &str) -> String {
-    let repo_path = Path::new(repo_id);
-    git_ops::get_display_path(repo_path)
-        .ok()
-        .map(|path| display_path_label(&path))
-        .unwrap_or_else(|| display_repo_label(repo_id))
+    display_repo_label(repo_id)
 }
 
 fn strip_windows_device_prefix(path: &str) -> String {

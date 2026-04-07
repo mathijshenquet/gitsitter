@@ -946,7 +946,7 @@ pub async fn handle_untrust(paths: &Paths, host: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn handle_log(paths: &Paths, _global: bool, follow: bool, _since: Option<String>) -> Result<()> {
+pub async fn handle_log(paths: &Paths, global: bool, follow: bool, path: Option<String>) -> Result<()> {
     let log_dir = paths.daemon_log.parent().context("daemon_log has no parent")?;
 
     // Find all daemon.log files (current + rotated daily files)
@@ -968,25 +968,79 @@ pub async fn handle_log(paths: &Paths, _global: bool, follow: bool, _since: Opti
 
     log_files.sort();
 
+    // Resolve repo filter: --global skips filtering, otherwise try to find .git
+    let repo_filter = if global {
+        None
+    } else {
+        let target = path
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        match git_ops::discover_repo_id(&target) {
+            Ok(repo_id) => {
+                let label = repo_id.to_string_lossy()
+                    .trim_end_matches(['/', '\\'])
+                    .to_string();
+                Some(label)
+            }
+            Err(_) => None, // not in a repo — fall back to global
+        }
+    };
+
     if follow {
-        // tail -f the most recent log file
         let latest = log_files.last().unwrap();
-        let status = std::process::Command::new("tail")
-            .args(["-f", &latest.to_string_lossy()])
+        if let Some(ref filter) = repo_filter {
+            // tail -f with grep filtering
+            let tail = std::process::Command::new("tail")
+                .args(["-f", &latest.to_string_lossy()])
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .context("failed to run tail")?;
+            let status = std::process::Command::new("grep")
+                .args(["--line-buffered", filter])
+                .stdin(tail.stdout.unwrap())
+                .status()
+                .context("failed to run grep")?;
+            if !status.success() {
+                // grep exits 1 on no match / interrupt, that's fine
+            }
+        } else {
+            let status = std::process::Command::new("tail")
+                .args(["-f", &latest.to_string_lossy()])
+                .status()
+                .context("failed to run tail")?;
+            if !status.success() {
+                bail!("tail exited with {}", status);
+            }
+        }
+    } else if let Some(ref filter) = repo_filter {
+        // cat all log files, grep for repo, pipe to less
+        let cat = std::process::Command::new("cat")
+            .args(log_files.iter().map(|p| p.as_os_str()))
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to run cat")?;
+        let grep = std::process::Command::new("grep")
+            .arg(filter)
+            .stdin(cat.stdout.unwrap())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to run grep")?;
+        let status = std::process::Command::new("less")
+            .args(["-Rf", "+G"])
+            .stdin(grep.stdout.unwrap())
             .status()
-            .context("failed to run tail")?;
-        if !status.success() {
-            bail!("tail exited with {}", status);
+            .context("failed to run less")?;
+        if !status.success() && status.code() != Some(1) {
+            bail!("less exited with {}", status);
         }
     } else {
-        // cat all log files (sorted) into less
+        // global: pipe all log files into less
         let status = std::process::Command::new("less")
-            .arg("+G") // start at the end
+            .args(["-Rf", "+G"])
             .args(log_files.iter().map(|p| p.as_os_str()))
             .status()
             .context("failed to run less")?;
         if !status.success() && status.code() != Some(1) {
-            // less exits 1 on 'q', that's fine
             bail!("less exited with {}", status);
         }
     }
