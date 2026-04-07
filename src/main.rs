@@ -46,14 +46,17 @@ enum Commands {
     Untrust {
         host: String,
     },
-    /// Show daemon log
+    /// Show daemon log (filtered to current repo by default)
+    #[clap(alias = "logs")]
     Log {
+        /// Show logs for all repos
         #[arg(short, long)]
         global: bool,
+        /// Follow log output (tail -f)
         #[arg(short, long)]
         follow: bool,
-        #[arg(long)]
-        since: Option<String>,
+        /// Path to filter logs for (defaults to current directory)
+        path: Option<String>,
     },
     /// Trigger immediate sync
     Sync {
@@ -130,8 +133,8 @@ async fn main() {
         Some(Commands::Log {
             global,
             follow,
-            since,
-        }) => cli::handle_log(&paths, global, follow, since).await,
+            path,
+        }) => cli::handle_log(&paths, global, follow, path).await,
         Some(Commands::Sync { all }) => cli::handle_sync(&paths, all).await,
         Some(Commands::Resolve { global }) => cli::handle_resolve(&paths, global).await,
         Some(Commands::AutoResolve { agent }) => cli::handle_auto_resolve(&paths, agent).await,
