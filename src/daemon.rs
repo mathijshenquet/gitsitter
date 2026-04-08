@@ -32,7 +32,7 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 use crate::config::{EffectiveConflictAction, UserConfig};
 use crate::forge::ForgeCache;
 use crate::git_ops::{
-    self, MergeAnalysis, PushResult,
+    self, HistoryRewrite, MergeAnalysis, PushResult,
 };
 use crate::paths::Paths;
 use crate::transport::{
@@ -1330,6 +1330,51 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 .unwrap_or(false);
 
                 if is_owner {
+                    // Before attempting rebase, check if the local branch
+                    // was intentionally rewritten (e.g. rebase -i, squash).
+                    let rewrite = git_ops::detect_history_rewrite(&repo_path, &branch.name)
+                        .unwrap_or(HistoryRewrite::None);
+
+                    match rewrite {
+                        HistoryRewrite::RemoteUnchanged => {
+                            repo_info!(repo_label, "history rewritten (remote unchanged) :{}", branch.name);
+                            let mut repos = daemon.repos.write().await;
+                            if let Some(tr) = repos.get_mut(repo_id) {
+                                tr.set_branch(&branch.name, BranchRuntimeState {
+                                    sync_status: "history_rewritten_remote_unchanged".into(),
+                                    last_pull_at: None,
+                                    last_push_at: None,
+                                    local_oid: Some(branch.local_oid.clone()),
+                                    remote_oid: branch.remote_oid.clone(),
+                                    error_message: Some(
+                                        "local history rewritten — push --force-with-lease when ready".into(),
+                                    ),
+                                });
+                            }
+                            continue;
+                        }
+                        HistoryRewrite::RemoteAdvanced => {
+                            repo_info!(repo_label, "history rewritten (remote advanced) :{}", branch.name);
+                            let mut repos = daemon.repos.write().await;
+                            if let Some(tr) = repos.get_mut(repo_id) {
+                                tr.set_branch(&branch.name, BranchRuntimeState {
+                                    sync_status: "history_rewritten_remote_advanced".into(),
+                                    last_pull_at: None,
+                                    last_push_at: None,
+                                    local_oid: Some(branch.local_oid.clone()),
+                                    remote_oid: branch.remote_oid.clone(),
+                                    error_message: Some(
+                                        "local history rewritten and remote advanced — force-push would discard remote commits; consider backing up and resetting to remote".into(),
+                                    ),
+                                });
+                            }
+                            continue;
+                        }
+                        HistoryRewrite::None => {
+                            // Ordinary divergence — proceed with rebase
+                        }
+                    }
+
                     // We own both sides — rebase local onto remote, then push
                     let rebase_path = worktrees
                         .first()
