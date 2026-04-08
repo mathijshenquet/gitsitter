@@ -1445,18 +1445,13 @@ pub async fn handle_daemon_service() -> Result<()> {
 
 /// Build a PATH string for the daemon service by discovering tool locations.
 /// Keep in sync with nix/home-manager-module.nix (daemonPathPackages).
+#[cfg(unix)]
 fn build_daemon_path() -> String {
-    #[cfg(not(windows))]
-    const WHICH_CMD: &str = "which";
-    #[cfg(windows)]
-    const WHICH_CMD: &str = "where.exe";
-
     let mut dirs = Vec::new();
     for tool in ["git", "ssh", "gh", "claude"] {
-        if let Ok(output) = std::process::Command::new(WHICH_CMD).arg(tool).output()
+        if let Ok(output) = std::process::Command::new("which").arg(tool).output()
             && output.status.success()
         {
-            // `where.exe` may return multiple lines; take the first
             let stdout = std::str::from_utf8(&output.stdout).unwrap_or("");
             let line = stdout.lines().next().unwrap_or("").trim();
             if let Some(dir) = std::path::Path::new(line).parent() {
@@ -1468,13 +1463,9 @@ fn build_daemon_path() -> String {
         }
     }
     if dirs.is_empty() {
-        #[cfg(not(windows))]
         return "/usr/bin:/usr/local/bin".to_string();
-        #[cfg(windows)]
-        return r"C:\Windows\System32".to_string();
     }
-    let sep = if cfg!(windows) { ";" } else { ":" };
-    dirs.join(sep)
+    dirs.join(":")
 }
 
 async fn install_daemon() -> Result<()> {
