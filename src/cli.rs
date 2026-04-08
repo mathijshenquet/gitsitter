@@ -1445,6 +1445,7 @@ pub async fn handle_daemon_service() -> Result<()> {
 
 /// Build a PATH string for the daemon service by discovering tool locations.
 /// Keep in sync with nix/home-manager-module.nix (daemonPathPackages).
+#[cfg(unix)]
 fn build_daemon_path() -> String {
     #[cfg(not(windows))]
     const WHICH_CMD: &str = "which";
