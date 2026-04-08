@@ -4,17 +4,62 @@ A background daemon that keeps your local branches in sync with their tracking r
 
 ## How it works
 
-Once running, gitsitter watches your repos and syncs branches in the background:
+One common annoyance with Git is starting work on a branch only to discover it's stale. Git doesn't automatically sync with the remote — your local branches and your view of what's on the remote can be out of date without you knowing.
 
-- **Remote is ahead** → fast-forward merge into your local branch
+```sh
+$ git checkout feature/search # not up-to-date with remote
+# ... make commits ...
+$ git push
+# surprise: you have to pull and resolve conflicts
+```
+
+```sh
+$ git checkout feature/search
+$ git rebase origin/main # not up-to-date with remote
+# ... slog through conflicts ...
+# surprise: your local view of origin/main was stale because you didn't fetch
+# now you have to merge or redo the rebase
+```
+
+gitsitter helps prevent these situations by fetching in the background and keeping your local branches up to date automatically when it's safe, and surfacing problems early when it's not.
+
+After install, gitsitter adds a system daemon and a small shell hook. When you `cd` into a Git repo, the hook registers it with the daemon:
+
+```sh
+$ cd ~/work/app
+gitsitter: Registered repo 📦 ~/work/app, syncing tracking branches on origin
+```
+
+From there, the daemon keeps syncing in the background. At a high level, it applies three rules:
+
+- **Remote is ahead** → fast-forward your local branch
 - **You're ahead** → push to remote
 - **Diverged** → rebase onto remote and push
 
-gitsitter decides whether it can push to remotes by checking who last committed to the remote tracking branch. If it thinks the committer is you (e.g. by email), then it assumes it can push to the branch. If it was someone else, gitsitter leaves it alone and warns you via your shell prompt.
+This also applies to branches you're not currently on:
 
-When the daemon can't keep branches in sync automatically -- due to merge conflicts, remotes which look like they do not belong to you, etc -- it flags it. Run `gitsitter resolve` to walk through each issue interactively to resolve them.
+```sh
+$ git checkout bugfix/login-timeout
+# meanwhile, someone pushes to feature/search on the remote
+# gitsitter fetches and fast-forwards your local feature/search in the background
 
-Non-checked-out branches are updated in the background via `git update-ref`, so when you `git checkout feature-x` it's already up to date.
+$ git checkout feature/search
+# already up to date — no stale surprises
+```
+
+The important qualifier is "when it's safe". If gitsitter isn't confident it should write to a remote branch, it stops and tells you instead of guessing.
+
+For example, suppose your local branch is ahead, but the last commit on the remote looks like someone else's work. gitsitter won't auto-push — that could disrupt some else's workflow.
+
+This protects shared and review branches where auto-pushing would be surprising. gitsitter decides whether it can auto-push by checking who last committed on the remote. If that looks like you (out of the box, by email), it treats the branch as safe to push. If not, it leaves it alone and warns you via your shell prompt.
+
+```sh
+$ cd ~/work/app
+gitsitter: 📦 ~/work/app feature/search has unpushed changes (last remote commit by someone else)
+gitsitter: Run `gitsitter resolve` to resolve issues
+```
+
+When the daemon can't sync a branch automatically — due to merge conflicts, ambiguous ownership, etc — it flags it. Run `gitsitter resolve` to walk through each issue interactively.
 
 ## Integrations
 
