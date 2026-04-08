@@ -50,7 +50,12 @@ impl Paths {
 
     /// Creates parent directories for all paths if they don't exist.
     pub fn ensure_dirs(&self) -> Result<()> {
-        for path in [&self.config_file, &self.repos_file, &self.daemon_log, &self.daemon_pid] {
+        for path in [
+            &self.config_file,
+            &self.repos_file,
+            &self.daemon_log,
+            &self.daemon_pid,
+        ] {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("failed to create directory: {}", parent.display()))?;

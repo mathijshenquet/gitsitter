@@ -216,11 +216,7 @@ impl ForgeCache {
 
     /// Check if the authenticated user owns a PR for the given branch
     /// (is creator or assignee).
-    pub async fn user_owns_pr(
-        &self,
-        gh_repo: &GitHubRepo,
-        branch: &str,
-    ) -> bool {
+    pub async fn user_owns_pr(&self, gh_repo: &GitHubRepo, branch: &str) -> bool {
         if !self.ensure_gh().await {
             return false;
         }
@@ -264,15 +260,16 @@ impl ForgeCache {
                         .is_some_and(|l| l.eq_ignore_ascii_case(&username));
 
                     // Check assignees
-                    let is_assignee = pr["assignees"]
-                        .as_array()
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .any(|a| {
-                            a["login"]
-                                .as_str()
-                                .is_some_and(|l| l.eq_ignore_ascii_case(&username))
-                        });
+                    let is_assignee =
+                        pr["assignees"]
+                            .as_array()
+                            .unwrap_or(&vec![])
+                            .iter()
+                            .any(|a| {
+                                a["login"]
+                                    .as_str()
+                                    .is_some_and(|l| l.eq_ignore_ascii_case(&username))
+                            });
 
                     is_creator || is_assignee
                 })

@@ -4,7 +4,11 @@ use gitsitter::cli;
 use gitsitter::paths::Paths;
 
 #[derive(Parser)]
-#[command(name = "gitsitter", version, about = "Keep local branches in sync with remotes")]
+#[command(
+    name = "gitsitter",
+    version,
+    about = "Keep local branches in sync with remotes"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -39,13 +43,9 @@ enum Commands {
         purge: bool,
     },
     /// Trust a remote host (allows syncing with remotes on this host)
-    Trust {
-        host: String,
-    },
+    Trust { host: String },
     /// Untrust a remote host
-    Untrust {
-        host: String,
-    },
+    Untrust { host: String },
     /// Show daemon log (filtered to current repo by default)
     #[clap(alias = "logs")]
     Log {
@@ -64,9 +64,7 @@ enum Commands {
         all: bool,
     },
     /// Register a repo (usually called by shell hooks)
-    Register {
-        path: Option<String>,
-    },
+    Register { path: Option<String> },
     /// Interactively resolve sync issues (diverged/unowned branches)
     Resolve {
         /// Resolve issues for all repos (default: current repo only)
@@ -88,9 +86,7 @@ enum Commands {
         shell_name: Option<String>,
     },
     /// Uninstall daemon and shell hooks
-    Uninstall {
-        component: Option<String>,
-    },
+    Uninstall { component: Option<String> },
     /// Internal: prompt hook for shell integration
     #[command(hide = true)]
     #[clap(name = "_prompt")]
@@ -122,9 +118,7 @@ async fn main() {
         None => cli::handle_status(&paths, false).await,
         Some(Commands::Status { global }) => cli::handle_status(&paths, global).await,
         Some(Commands::Config) => cli::handle_config(&paths).await,
-        Some(Commands::Enable { remote, all }) => {
-            cli::handle_enable(&paths, remote, all).await
-        }
+        Some(Commands::Enable { remote, all }) => cli::handle_enable(&paths, remote, all).await,
         Some(Commands::Disable { remote, all, purge }) => {
             cli::handle_disable(&paths, remote, all, purge).await
         }
@@ -140,12 +134,11 @@ async fn main() {
         Some(Commands::AutoResolve { agent }) => cli::handle_auto_resolve(&paths, agent).await,
         Some(Commands::Register { path }) => cli::handle_register(&paths, path).await,
         Some(Commands::SelfUpdate) => gitsitter::self_update::self_update().await,
-        Some(Commands::Install { component, shell_name }) => {
-            cli::handle_install(component, shell_name).await
-        }
-        Some(Commands::Uninstall { component }) => {
-            cli::handle_uninstall(component).await
-        }
+        Some(Commands::Install {
+            component,
+            shell_name,
+        }) => cli::handle_install(component, shell_name).await,
+        Some(Commands::Uninstall { component }) => cli::handle_uninstall(component).await,
         Some(Commands::Prompt) => cli::handle_prompt(&paths).await,
         Some(Commands::Daemon { action }) => match action {
             DaemonAction::Run => cli::handle_daemon_run(&paths).await,
