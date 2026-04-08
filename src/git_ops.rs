@@ -37,6 +37,19 @@ pub enum MergeAnalysis {
     UpstreamGone,
 }
 
+/// Result of history-rewrite detection on a diverged branch.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HistoryRewrite {
+    /// Not a rewrite — ordinary divergence.
+    None,
+    /// Local was rewritten; remote has not advanced past the old published tip.
+    /// The old tip H equals R, so force-push-with-lease would be safe.
+    RemoteUnchanged,
+    /// Local was rewritten; remote advanced past the old published tip.
+    /// Force-push would discard remote-only commits.
+    RemoteAdvanced,
+}
+
 #[derive(Debug, Clone)]
 pub struct WorktreeInfo {
     pub path: String,
@@ -241,6 +254,99 @@ pub fn analyze_merge(repo_id: &Path, branch_name: &str) -> Result<MergeAnalysis>
         // neither descends from the other → diverged
         (false, false) => Ok(MergeAnalysis::Diverged),
     }
+}
+
+/// Detect whether a diverged branch has had its local history rewritten
+/// away from already-published commits.
+///
+/// Call this only when `analyze_merge` returns `Diverged`.
+///
+/// Algorithm:
+/// 1. Walk the reflog of the local branch.
+/// 2. For each prior tip H, check:
+///    - H is an ancestor of R (the remote tip)  → H was part of the published lineage
+///    - H is NOT an ancestor of L (current local tip) → local was rewritten away from H
+/// 3. If such an H exists:
+///    - H == R → `RemoteUnchanged` (clean force-push candidate)
+///    - H ancestor-of R, H != R → `RemoteAdvanced` (remote gained commits since)
+pub fn detect_history_rewrite(repo_id: &Path, branch_name: &str) -> Result<HistoryRewrite> {
+    let repo = git2::Repository::open(repo_id)
+        .with_context(|| format!("failed to open repo at {}", repo_id.display()))?;
+
+    let branch = repo
+        .find_branch(branch_name, git2::BranchType::Local)
+        .with_context(|| format!("branch '{}' not found", branch_name))?;
+
+    let local_oid = branch
+        .get()
+        .target()
+        .with_context(|| format!("branch '{}' has no target", branch_name))?;
+
+    let upstream = match branch.upstream() {
+        Ok(u) => u,
+        Err(_) => return Ok(HistoryRewrite::None),
+    };
+
+    let remote_oid = match upstream.get().target() {
+        Some(oid) => oid,
+        None => return Ok(HistoryRewrite::None),
+    };
+
+    // Walk the reflog for refs/heads/<branch_name>
+    let reflog = match repo.reflog(&format!("refs/heads/{}", branch_name)) {
+        Ok(log) => log,
+        Err(_) => return Ok(HistoryRewrite::None), // no reflog → can't tell
+    };
+
+    for i in 0..reflog.len() {
+        let entry = match reflog.get(i) {
+            Some(e) => e,
+            None => continue,
+        };
+
+        // The old OID this entry points to (i.e. where the branch was before this reflog entry)
+        // We want to check the id_old for entries where the branch moved,
+        // plus id_new for the current tip of that entry.
+        // Actually, each reflog entry records (old, new). The prior tips are
+        // the `id_new` values of past entries (and `id_old` of the current entry).
+        // We check `id_new` — each entry's "branch was at this commit".
+        let h = entry.id_new();
+
+        // Skip zero OIDs (initial creation)
+        if h.is_zero() {
+            continue;
+        }
+
+        // Skip if H == current local tip (that's just the current state)
+        if h == local_oid {
+            continue;
+        }
+
+        // H must be an ancestor of R (was part of published lineage)
+        let h_ancestor_of_r = repo.graph_descendant_of(remote_oid, h)
+            .unwrap_or(false) || h == remote_oid;
+
+        if !h_ancestor_of_r {
+            continue;
+        }
+
+        // H must NOT be an ancestor of L (local was rewritten away from H)
+        let h_ancestor_of_l = repo.graph_descendant_of(local_oid, h)
+            .unwrap_or(false) || h == local_oid;
+
+        if h_ancestor_of_l {
+            continue;
+        }
+
+        // Found evidence of history rewrite
+        if h == remote_oid {
+            return Ok(HistoryRewrite::RemoteUnchanged);
+        } else {
+            return Ok(HistoryRewrite::RemoteAdvanced);
+        }
+    }
+
+    Ok(HistoryRewrite::None)
 }
 
 /// List all worktrees (main + linked) for a repo.

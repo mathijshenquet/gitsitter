@@ -685,4 +685,174 @@ mod git_ops_tests {
         // Now the upstream tip is by "other" — should not be owned
         assert!(!git_ops::is_branch_owned_by_user(&repo_id, &branch).unwrap());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_history_rewrite_none_for_normal_divergence() {
+        // Normal divergence: both sides add new commits on top of a shared base.
+        // The reflog shows the branch always advancing forward, so no rewrite is detected.
+        let tmp = temp_dir();
+        let bare_dir = tmp.path().join("bare");
+        let work_dir = tmp.path().join("work");
+
+        let _bare = create_bare_repo(&bare_dir);
+        let work = clone_repo(&bare_dir, &work_dir);
+
+        // Initial commit + push
+        make_commit(&work, "a.txt", "a", "initial");
+        let branch = work.head().unwrap().shorthand().unwrap().to_string();
+        let mut remote = work.find_remote("origin").unwrap();
+        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        drop(remote);
+
+        // Simulate remote advancing: push a commit directly to bare
+        {
+            let bare_repo = git2::Repository::open(&bare_dir).unwrap();
+            let head_oid = bare_repo.head().unwrap().target().unwrap();
+            let head_commit = bare_repo.find_commit(head_oid).unwrap();
+            let tree = head_commit.tree().unwrap();
+            // Create a new blob + tree for the remote commit
+            let blob_oid = bare_repo.blob(b"remote content").unwrap();
+            let mut tb = bare_repo.treebuilder(Some(&tree)).unwrap();
+            tb.insert("remote.txt", blob_oid, 0o100644).unwrap();
+            let new_tree_oid = tb.write().unwrap();
+            let new_tree = bare_repo.find_tree(new_tree_oid).unwrap();
+            let sig = git2::Signature::now("Remote", "remote@example.com").unwrap();
+            bare_repo.commit(
+                Some(&format!("refs/heads/{}", branch)),
+                &sig, &sig,
+                "remote commit",
+                &new_tree,
+                &[&head_commit],
+            ).unwrap();
+        }
+
+        // Add a local commit (normal divergence — local just advances)
+        make_commit(&work, "b.txt", "b", "local commit");
+
+        // Fetch to get the remote advance
+        let mut remote = work.find_remote("origin").unwrap();
+        remote.fetch::<&str>(&[], None, None).unwrap();
+        drop(remote);
+
+        let repo_id = git_ops::discover_repo_id(work_dir.as_path()).unwrap();
+        let analysis = git_ops::analyze_merge(&repo_id, &branch).unwrap();
+        assert_eq!(analysis, git_ops::MergeAnalysis::Diverged);
+
+        let rewrite = git_ops::detect_history_rewrite(&repo_id, &branch).unwrap();
+        assert_eq!(rewrite, git_ops::HistoryRewrite::None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_history_rewrite_remote_unchanged() {
+        // Simulate: user publishes commits, then rewrites local history (e.g. rebase -i).
+        // Remote stays at the old published tip.
+        let tmp = temp_dir();
+        let bare_dir = tmp.path().join("bare");
+        let work_dir = tmp.path().join("work");
+
+        let _bare = create_bare_repo(&bare_dir);
+        let work = clone_repo(&bare_dir, &work_dir);
+
+        // Commit A + push
+        make_commit(&work, "a.txt", "a", "commit A");
+        let branch = work.head().unwrap().shorthand().unwrap().to_string();
+        let mut remote = work.find_remote("origin").unwrap();
+        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        drop(remote);
+
+        // Commit B + push (this is the published tip H that will become R)
+        make_commit(&work, "b.txt", "b", "commit B");
+        let mut remote = work.find_remote("origin").unwrap();
+        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        drop(remote);
+
+        // Now "rewrite" local history: reset to commit A and make a new commit.
+        // This simulates `git rebase -i` that squashed B away.
+        let published_oid = work.head().unwrap().target().unwrap();
+        let commit_a = work.find_commit(published_oid).unwrap()
+            .parent(0).unwrap();
+        work.reset(commit_a.as_object(), git2::ResetType::Hard, None).unwrap();
+        // Make a new, different commit (the rewritten history)
+        make_commit(&work, "c.txt", "c", "rewritten commit C");
+
+        // Fetch to update tracking refs
+        let mut remote = work.find_remote("origin").unwrap();
+        remote.fetch::<&str>(&[], None, None).unwrap();
+        drop(remote);
+
+        let repo_id = git_ops::discover_repo_id(work_dir.as_path()).unwrap();
+        let analysis = git_ops::analyze_merge(&repo_id, &branch).unwrap();
+        assert_eq!(analysis, git_ops::MergeAnalysis::Diverged);
+
+        let rewrite = git_ops::detect_history_rewrite(&repo_id, &branch).unwrap();
+        assert_eq!(rewrite, git_ops::HistoryRewrite::RemoteUnchanged);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_history_rewrite_remote_advanced() {
+        // Simulate: user publishes commits, then rewrites local history,
+        // but remote has also advanced past the old published tip.
+        let tmp = temp_dir();
+        let bare_dir = tmp.path().join("bare");
+        let work_dir = tmp.path().join("work");
+
+        let _bare = create_bare_repo(&bare_dir);
+        let work = clone_repo(&bare_dir, &work_dir);
+
+        // Commit A + push (base)
+        make_commit(&work, "a.txt", "a", "commit A");
+        let branch = work.head().unwrap().shorthand().unwrap().to_string();
+        let mut remote = work.find_remote("origin").unwrap();
+        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        drop(remote);
+
+        let base_oid = work.head().unwrap().target().unwrap();
+
+        // Commit B + push (published tip — this becomes H in the reflog)
+        make_commit(&work, "b.txt", "b", "commit B");
+        let mut remote = work.find_remote("origin").unwrap();
+        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        drop(remote);
+
+        // "Rewrite" local: reset back to A, then create a different commit
+        let commit_a = work.find_commit(base_oid).unwrap();
+        work.reset(commit_a.as_object(), git2::ResetType::Hard, None).unwrap();
+        make_commit(&work, "d.txt", "d", "rewritten commit D");
+
+        // Simulate remote advancing past the published tip B
+        {
+            let bare_repo = git2::Repository::open(&bare_dir).unwrap();
+            let head_oid = bare_repo.head().unwrap().target().unwrap();
+            let head_commit = bare_repo.find_commit(head_oid).unwrap();
+            let tree = head_commit.tree().unwrap();
+            let blob_oid = bare_repo.blob(b"remote extra").unwrap();
+            let mut tb = bare_repo.treebuilder(Some(&tree)).unwrap();
+            tb.insert("remote_extra.txt", blob_oid, 0o100644).unwrap();
+            let new_tree_oid = tb.write().unwrap();
+            let new_tree = bare_repo.find_tree(new_tree_oid).unwrap();
+            let sig = git2::Signature::now("Remote", "remote@example.com").unwrap();
+            bare_repo.commit(
+                Some(&format!("refs/heads/{}", branch)),
+                &sig, &sig,
+                "remote advance",
+                &new_tree,
+                &[&head_commit],
+            ).unwrap();
+        }
+
+        // Fetch
+        let mut remote = work.find_remote("origin").unwrap();
+        remote.fetch::<&str>(&[], None, None).unwrap();
+        drop(remote);
+
+        let repo_id = git_ops::discover_repo_id(work_dir.as_path()).unwrap();
+        let analysis = git_ops::analyze_merge(&repo_id, &branch).unwrap();
+        assert_eq!(analysis, git_ops::MergeAnalysis::Diverged);
+
+        let rewrite = git_ops::detect_history_rewrite(&repo_id, &branch).unwrap();
+        assert_eq!(rewrite, git_ops::HistoryRewrite::RemoteAdvanced);
+    }
 }
