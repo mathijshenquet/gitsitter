@@ -63,8 +63,8 @@ fn parse_duration(s: &str) -> Result<Duration> {
     if s.is_empty() {
         anyhow::bail!("empty duration string");
     }
-    let (num, unit) = if s.ends_with("ms") {
-        (&s[..s.len() - 2], "ms")
+    let (num, unit) = if let Some(stripped) = s.strip_suffix("ms") {
+        (stripped, "ms")
     } else {
         (&s[..s.len() - 1], &s[s.len() - 1..])
     };
@@ -84,9 +84,9 @@ fn format_duration(d: &Duration) -> String {
         let ms = d.as_millis();
         return format!("{ms}ms");
     }
-    if secs % 3600 == 0 {
+    if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")
@@ -195,7 +195,7 @@ struct RawInRepoConfig {
 // Public data structures
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UserConfig {
     pub global: GlobalSettings,
     pub trusted_hosts: HashSet<String>,
@@ -306,16 +306,6 @@ impl Default for GlobalSettings {
             on_conflict: OnConflict::Auto,
             resolve_agent: None,
             resolve_agent_path: None,
-        }
-    }
-}
-
-impl Default for UserConfig {
-    fn default() -> Self {
-        Self {
-            global: GlobalSettings::default(),
-            trusted_hosts: HashSet::new(),
-            repos: HashMap::new(),
         }
     }
 }
@@ -528,17 +518,16 @@ fn save_repos_toml(path: &Path, repos: &HashMap<String, RepoConfig>) -> Result<(
 
 /// Check if a file is a nix-store symlink and bail if so.
 fn check_nix_managed(path: &Path) -> Result<()> {
-    if path.is_symlink() {
-        if let Ok(target) = std::fs::read_link(path) {
-            if target.to_string_lossy().starts_with("/nix/store/") {
-                anyhow::bail!(
-                    "{} is managed by nix (symlink to {}). \
+    if path.is_symlink()
+        && let Ok(target) = std::fs::read_link(path)
+        && target.to_string_lossy().starts_with("/nix/store/")
+    {
+        anyhow::bail!(
+            "{} is managed by nix (symlink to {}). \
                      Edit your nix configuration instead.",
-                    path.display(),
-                    target.display()
-                );
-            }
-        }
+            path.display(),
+            target.display()
+        );
     }
     Ok(())
 }
@@ -644,7 +633,7 @@ impl UserConfig {
         self.repos
             .get(repo_path)
             .and_then(|r| r.disabled.as_ref())
-            .map_or(false, |d| d.is_remote_disabled(remote_name))
+            .is_some_and(|d| d.is_remote_disabled(remote_name))
     }
 
     /// Check if a repo is explicitly disabled in user config.
@@ -652,7 +641,7 @@ impl UserConfig {
         self.repos
             .get(repo_path)
             .and_then(|r| r.disabled.as_ref())
-            .map_or(false, |d| d.is_repo_disabled())
+            .is_some_and(|d| d.is_repo_disabled())
     }
 
     /// Get the effective refresh interval for a repo.
@@ -662,15 +651,15 @@ impl UserConfig {
         repo_path: &str,
         in_repo_config: Option<&InRepoConfig>,
     ) -> Duration {
-        if let Some(repo_cfg) = self.repos.get(repo_path) {
-            if let Some(d) = repo_cfg.refresh_interval {
-                return d;
-            }
+        if let Some(repo_cfg) = self.repos.get(repo_path)
+            && let Some(d) = repo_cfg.refresh_interval
+        {
+            return d;
         }
-        if let Some(irc) = in_repo_config {
-            if let Some(d) = irc.refresh_interval {
-                return d;
-            }
+        if let Some(irc) = in_repo_config
+            && let Some(d) = irc.refresh_interval
+        {
+            return d;
         }
         self.global.refresh_interval
     }

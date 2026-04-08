@@ -50,10 +50,8 @@ pub fn parse_github_remote(url: &str) -> Option<GitHubRepo> {
         Some(rest)
     } else if let Some(rest) = url.strip_prefix("http://github.com/") {
         Some(rest)
-    } else if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
-        Some(rest)
     } else {
-        None
+        url.strip_prefix("ssh://git@github.com/")
     };
 
     if let Some(path) = path {
@@ -121,11 +119,18 @@ pub struct ForgeCache {
     user_info: Mutex<Option<(String, Vec<String>, Instant)>>,
     /// Cached PR ownership lookups.
     /// Key: (owner, repo, branch) -> (is_owned, fetched_at)
+    #[allow(clippy::type_complexity)]
     pr_cache: Mutex<HashMap<(String, String, String), (bool, Instant)>>,
 }
 
 const USER_INFO_TTL: Duration = Duration::from_secs(3600); // 1 hour
 const PR_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
+
+impl Default for ForgeCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ForgeCache {
     pub fn new() -> Self {
@@ -162,10 +167,10 @@ impl ForgeCache {
         // Check cache
         {
             let cached = self.user_info.lock().unwrap();
-            if let Some((ref username, ref emails, fetched_at)) = *cached {
-                if fetched_at.elapsed() < USER_INFO_TTL {
-                    return Ok((username.clone(), emails.clone()));
-                }
+            if let Some((ref username, ref emails, fetched_at)) = *cached
+                && fetched_at.elapsed() < USER_INFO_TTL
+            {
+                return Ok((username.clone(), emails.clone()));
             }
         }
 
@@ -229,10 +234,10 @@ impl ForgeCache {
         );
         {
             let cache = self.pr_cache.lock().unwrap();
-            if let Some((is_owned, fetched_at)) = cache.get(&cache_key) {
-                if fetched_at.elapsed() < PR_CACHE_TTL {
-                    return *is_owned;
-                }
+            if let Some((is_owned, fetched_at)) = cache.get(&cache_key)
+                && fetched_at.elapsed() < PR_CACHE_TTL
+            {
+                return *is_owned;
             }
         }
 

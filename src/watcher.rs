@@ -66,13 +66,13 @@ pub async fn run(daemon: Arc<Daemon>, mut shutdown_rx: watch::Receiver<bool>) {
 
     // Watch config.toml for changes.
     let config_path = daemon.paths.config_file.clone();
-    if let Some(config_dir) = config_path.parent() {
-        if config_dir.exists() {
-            if let Err(e) = watcher.watch(config_dir, RecursiveMode::NonRecursive) {
-                warn!("🔍  failed to watch config dir: {:#}", e);
-            } else {
-                info!("👁️  watching config {}", config_path.display());
-            }
+    if let Some(config_dir) = config_path.parent()
+        && config_dir.exists()
+    {
+        if let Err(e) = watcher.watch(config_dir, RecursiveMode::NonRecursive) {
+            warn!("🔍  failed to watch config dir: {:#}", e);
+        } else {
+            info!("👁️  watching config {}", config_path.display());
         }
     }
 
@@ -147,11 +147,10 @@ pub async fn run(daemon: Arc<Daemon>, mut shutdown_rx: watch::Receiver<bool>) {
                 // Check for newly registered repos that aren't watched yet.
                 let repos = daemon.repos.read().await;
                 for repo_id in repos.keys() {
-                    if !watched_repos.contains_key(repo_id) {
-                        if let Err(e) = add_repo_watches(&mut watcher, repo_id, &mut watched_repos) {
+                    if !watched_repos.contains_key(repo_id)
+                        && let Err(e) = add_repo_watches(&mut watcher, repo_id, &mut watched_repos) {
                             warn!("🔍  failed to watch {}: {:#}", repo_id, e);
                         }
-                    }
                 }
                 // Remove watches for repos that are no longer registered.
                 let to_remove: Vec<String> = watched_repos

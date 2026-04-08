@@ -244,7 +244,7 @@ async fn handle_status_global(
                 let disabled = repo_cfg
                     .disabled
                     .as_ref()
-                    .map_or(false, |d| d.is_repo_disabled());
+                    .is_some_and(|d| d.is_repo_disabled());
                 let sync = if disabled {
                     "never synced, disabled"
                 } else {
@@ -321,16 +321,16 @@ fn print_untrusted_remote_warnings(repo_id: &Path, cfg: &UserConfig, opts: Displ
     let remote_urls = git_ops::get_all_remote_urls(repo_id).unwrap_or_default();
     let repo_id_str = repo_id.to_string_lossy();
     for (name, url) in &remote_urls {
-        if !cfg.is_remote_trusted(url) {
-            if let Some(host) = config::extract_host(url) {
-                println!(
-                    "  {} remote '{}' ({}) is not trusted — won't sync",
-                    cli_ui::warning_icon(opts),
-                    name,
-                    host
-                );
-                println!("  Add with: gitsitter trust {}", host);
-            }
+        if !cfg.is_remote_trusted(url)
+            && let Some(host) = config::extract_host(url)
+        {
+            println!(
+                "  {} remote '{}' ({}) is not trusted — won't sync",
+                cli_ui::warning_icon(opts),
+                name,
+                host
+            );
+            println!("  Add with: gitsitter trust {}", host);
         }
         if cfg.is_remote_disabled(&repo_id_str, name) {
             println!(
@@ -524,10 +524,10 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                     repo_path: Some(repo.display_path.clone()),
                     global: false,
                 };
-                if let Ok(resp) = roundtrip(&mut stream, &req).await {
-                    if let Response::Status { data } = resp {
-                        all.push(data);
-                    }
+                if let Ok(resp) = roundtrip(&mut stream, &req).await
+                    && let Response::Status { data } = resp
+                {
+                    all.push(data);
                 }
             }
             all
@@ -574,7 +574,8 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                     match prompt_choice(3) {
                         1 => {
                             let branch_remote = upstream.split('/').next().unwrap_or("origin");
-                            let remote_ref = upstream.splitn(2, '/').nth(1).unwrap_or(&b.name);
+                            let remote_ref =
+                                upstream.split_once('/').map(|x| x.1).unwrap_or(&b.name);
                             match git_ops::git_push(
                                 &repo_id_path,
                                 branch_remote,
@@ -619,7 +620,12 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                                                     "update-ref",
                                                     &format!("refs/heads/{}", b.name),
                                                 ])
-                                                .arg(remote_oid.split('/').last().unwrap_or("HEAD"))
+                                                .arg(
+                                                    remote_oid
+                                                        .split('/')
+                                                        .next_back()
+                                                        .unwrap_or("HEAD"),
+                                                )
                                                 .output();
                                         }
                                     }
@@ -641,7 +647,8 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                     match prompt_choice(3) {
                         1 => {
                             let branch_remote = upstream.split('/').next().unwrap_or("origin");
-                            let remote_ref = upstream.splitn(2, '/').nth(1).unwrap_or(&b.name);
+                            let remote_ref =
+                                upstream.split_once('/').map(|x| x.1).unwrap_or(&b.name);
                             let upstream_ref = format!("{}/{}", branch_remote, remote_ref);
                             match git_ops::git_rebase(&repo_id_path, &upstream_ref, None, 30).await
                             {
@@ -945,10 +952,11 @@ fn prompt_choice(max: usize) -> usize {
         if io::stdin().read_line(&mut input).is_err() {
             return max; // default to skip on error
         }
-        if let Ok(n) = input.trim().parse::<usize>() {
-            if n >= 1 && n <= max {
-                return n;
-            }
+        if let Ok(n) = input.trim().parse::<usize>()
+            && n >= 1
+            && n <= max
+        {
+            return n;
         }
         println!("  Please enter a number between 1 and {}", max);
     }
@@ -1288,24 +1296,24 @@ pub async fn handle_daemon_start(paths: &Paths) -> Result<()> {
     {
         let plist_path =
             dirs::home_dir().map(|h| h.join("Library/LaunchAgents/com.gitsitter.daemon.plist"));
-        if let Some(ref p) = plist_path {
-            if p.exists() {
-                let domain_target = format!("gui/{}", unsafe { libc::getuid() });
-                let result = tokio::process::Command::new("launchctl")
-                    .args(["bootstrap", &domain_target, &p.display().to_string()])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::piped())
-                    .status()
-                    .await;
-                if let Ok(status) = result {
-                    if status.success() {
-                        if wait_for_daemon_ready(paths, std::time::Duration::from_secs(3)).await {
-                            println!("\u{2713} Daemon started via launchd");
-                            return Ok(());
-                        }
-                        bail!("launchd accepted the job, but the daemon socket did not appear");
-                    }
+        if let Some(ref p) = plist_path
+            && p.exists()
+        {
+            let domain_target = format!("gui/{}", unsafe { libc::getuid() });
+            let result = tokio::process::Command::new("launchctl")
+                .args(["bootstrap", &domain_target, &p.display().to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .status()
+                .await;
+            if let Ok(status) = result
+                && status.success()
+            {
+                if wait_for_daemon_ready(paths, std::time::Duration::from_secs(3)).await {
+                    println!("\u{2713} Daemon started via launchd");
+                    return Ok(());
                 }
+                bail!("launchd accepted the job, but the daemon socket did not appear");
             }
         }
     }
@@ -1415,13 +1423,13 @@ pub async fn handle_daemon_stop(paths: &Paths) -> Result<()> {
 
 pub async fn handle_daemon_restart(paths: &Paths) -> Result<()> {
     // Stop if running
-    if transport::is_daemon_running(&paths.socket_path) {
-        if let Ok(mut stream) = transport::connect_to_daemon(&paths.socket_path).await {
-            let req = Request::Shutdown;
-            let _ = roundtrip(&mut stream, &req).await;
-            // Give it a moment to shut down
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
+    if transport::is_daemon_running(&paths.socket_path)
+        && let Ok(mut stream) = transport::connect_to_daemon(&paths.socket_path).await
+    {
+        let req = Request::Shutdown;
+        let _ = roundtrip(&mut stream, &req).await;
+        // Give it a moment to shut down
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     // Start
     handle_daemon_start(paths).await
@@ -1445,16 +1453,16 @@ fn build_daemon_path() -> String {
 
     let mut dirs = Vec::new();
     for tool in ["git", "ssh", "gh", "claude"] {
-        if let Ok(output) = std::process::Command::new(WHICH_CMD).arg(tool).output() {
-            if output.status.success() {
-                // `where.exe` may return multiple lines; take the first
-                let stdout = std::str::from_utf8(&output.stdout).unwrap_or("");
-                let line = stdout.lines().next().unwrap_or("").trim();
-                if let Some(dir) = std::path::Path::new(line).parent() {
-                    let d = dir.to_string_lossy().to_string();
-                    if !dirs.contains(&d) {
-                        dirs.push(d);
-                    }
+        if let Ok(output) = std::process::Command::new(WHICH_CMD).arg(tool).output()
+            && output.status.success()
+        {
+            // `where.exe` may return multiple lines; take the first
+            let stdout = std::str::from_utf8(&output.stdout).unwrap_or("");
+            let line = stdout.lines().next().unwrap_or("").trim();
+            if let Some(dir) = std::path::Path::new(line).parent() {
+                let d = dir.to_string_lossy().to_string();
+                if !dirs.contains(&d) {
+                    dirs.push(d);
                 }
             }
         }

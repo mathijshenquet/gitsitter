@@ -248,7 +248,7 @@ pub async fn run_daemon(paths: &Paths) -> Result<()> {
         if repo_cfg
             .disabled
             .as_ref()
-            .map_or(false, |d| d.is_repo_disabled())
+            .is_some_and(|d| d.is_repo_disabled())
         {
             continue;
         }
@@ -418,10 +418,10 @@ async fn handle_connection(
 
 fn is_eof(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-            if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
-                return true;
-            }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+            && io_err.kind() == std::io::ErrorKind::UnexpectedEof
+        {
+            return true;
         }
     }
     false
@@ -597,11 +597,9 @@ async fn handle_prompt_check(daemon: &SharedDaemon, repo_path: &str) -> Response
 
     let resp = handle_status(daemon, Some(repo_id_str)).await;
 
-    if !already_tracked {
-        if let Response::Status { mut data } = resp {
-            data.newly_registered = true;
-            return Response::Status { data };
-        }
+    if !already_tracked && let Response::Status { mut data } = resp {
+        data.newly_registered = true;
+        return Response::Status { data };
     }
 
     resp
@@ -634,7 +632,7 @@ pub(crate) async fn reload_config(daemon: &SharedDaemon) {
             if repo_cfg
                 .disabled
                 .as_ref()
-                .map_or(false, |d| d.is_repo_disabled())
+                .is_some_and(|d| d.is_repo_disabled())
             {
                 continue;
             }
@@ -704,10 +702,10 @@ fn build_status_data(tr: &TrackedRepo, config: &UserConfig) -> StatusData {
     for (remote_name, remote_url) in &tr.remote_urls {
         if !config.is_remote_trusted(remote_url) {
             untrusted_remotes.push(remote_name.clone());
-            if let Some(host) = crate::config::extract_host(remote_url) {
-                if !untrusted_hosts.contains(&host) {
-                    untrusted_hosts.push(host);
-                }
+            if let Some(host) = crate::config::extract_host(remote_url)
+                && !untrusted_hosts.contains(&host)
+            {
+                untrusted_hosts.push(host);
             }
         }
         if config.is_remote_disabled(&tr.repo_id, remote_name) {
@@ -947,12 +945,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 .collect();
             if remotes.is_empty() && !remote_urls.is_empty() {
                 // Only add "origin" fallback if there are actual remotes configured
-                if let Some(url) = remote_urls.get("origin") {
-                    if config.is_remote_trusted(url)
-                        && !config.is_remote_disabled(repo_id, "origin")
-                    {
-                        remotes.push("origin".to_string());
-                    }
+                if let Some(url) = remote_urls.get("origin")
+                    && config.is_remote_trusted(url)
+                    && !config.is_remote_disabled(repo_id, "origin")
+                {
+                    remotes.push("origin".to_string());
                 }
             }
 
