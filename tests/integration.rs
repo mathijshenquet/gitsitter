@@ -84,7 +84,6 @@ fn make_commit_as(
 }
 
 /// Build test Paths from a temp base directory.
-#[cfg(unix)]
 fn test_paths(base: &Path) -> Paths {
     let config_dir = base.join("config");
     let state_dir = base.join("state");
