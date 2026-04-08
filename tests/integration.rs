@@ -701,7 +701,9 @@ mod git_ops_tests {
         make_commit(&work, "a.txt", "a", "initial");
         let branch = work.head().unwrap().shorthand().unwrap().to_string();
         let mut remote = work.find_remote("origin").unwrap();
-        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        remote
+            .push(&[&format!("refs/heads/{}", branch)], None)
+            .unwrap();
         drop(remote);
 
         // Simulate remote advancing: push a commit directly to bare
@@ -717,13 +719,16 @@ mod git_ops_tests {
             let new_tree_oid = tb.write().unwrap();
             let new_tree = bare_repo.find_tree(new_tree_oid).unwrap();
             let sig = git2::Signature::now("Remote", "remote@example.com").unwrap();
-            bare_repo.commit(
-                Some(&format!("refs/heads/{}", branch)),
-                &sig, &sig,
-                "remote commit",
-                &new_tree,
-                &[&head_commit],
-            ).unwrap();
+            bare_repo
+                .commit(
+                    Some(&format!("refs/heads/{}", branch)),
+                    &sig,
+                    &sig,
+                    "remote commit",
+                    &new_tree,
+                    &[&head_commit],
+                )
+                .unwrap();
         }
 
         // Add a local commit (normal divergence — local just advances)
@@ -758,21 +763,25 @@ mod git_ops_tests {
         make_commit(&work, "a.txt", "a", "commit A");
         let branch = work.head().unwrap().shorthand().unwrap().to_string();
         let mut remote = work.find_remote("origin").unwrap();
-        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        remote
+            .push(&[&format!("refs/heads/{}", branch)], None)
+            .unwrap();
         drop(remote);
 
         // Commit B + push (this is the published tip H that will become R)
         make_commit(&work, "b.txt", "b", "commit B");
         let mut remote = work.find_remote("origin").unwrap();
-        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        remote
+            .push(&[&format!("refs/heads/{}", branch)], None)
+            .unwrap();
         drop(remote);
 
         // Now "rewrite" local history: reset to commit A and make a new commit.
         // This simulates `git rebase -i` that squashed B away.
         let published_oid = work.head().unwrap().target().unwrap();
-        let commit_a = work.find_commit(published_oid).unwrap()
-            .parent(0).unwrap();
-        work.reset(commit_a.as_object(), git2::ResetType::Hard, None).unwrap();
+        let commit_a = work.find_commit(published_oid).unwrap().parent(0).unwrap();
+        work.reset(commit_a.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
         // Make a new, different commit (the rewritten history)
         make_commit(&work, "c.txt", "c", "rewritten commit C");
 
@@ -805,7 +814,9 @@ mod git_ops_tests {
         make_commit(&work, "a.txt", "a", "commit A");
         let branch = work.head().unwrap().shorthand().unwrap().to_string();
         let mut remote = work.find_remote("origin").unwrap();
-        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        remote
+            .push(&[&format!("refs/heads/{}", branch)], None)
+            .unwrap();
         drop(remote);
 
         let base_oid = work.head().unwrap().target().unwrap();
@@ -813,12 +824,15 @@ mod git_ops_tests {
         // Commit B + push (published tip — this becomes H in the reflog)
         make_commit(&work, "b.txt", "b", "commit B");
         let mut remote = work.find_remote("origin").unwrap();
-        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        remote
+            .push(&[&format!("refs/heads/{}", branch)], None)
+            .unwrap();
         drop(remote);
 
         // "Rewrite" local: reset back to A, then create a different commit
         let commit_a = work.find_commit(base_oid).unwrap();
-        work.reset(commit_a.as_object(), git2::ResetType::Hard, None).unwrap();
+        work.reset(commit_a.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
         make_commit(&work, "d.txt", "d", "rewritten commit D");
 
         // Simulate remote advancing past the published tip B
@@ -833,13 +847,16 @@ mod git_ops_tests {
             let new_tree_oid = tb.write().unwrap();
             let new_tree = bare_repo.find_tree(new_tree_oid).unwrap();
             let sig = git2::Signature::now("Remote", "remote@example.com").unwrap();
-            bare_repo.commit(
-                Some(&format!("refs/heads/{}", branch)),
-                &sig, &sig,
-                "remote advance",
-                &new_tree,
-                &[&head_commit],
-            ).unwrap();
+            bare_repo
+                .commit(
+                    Some(&format!("refs/heads/{}", branch)),
+                    &sig,
+                    &sig,
+                    "remote advance",
+                    &new_tree,
+                    &[&head_commit],
+                )
+                .unwrap();
         }
 
         // Fetch

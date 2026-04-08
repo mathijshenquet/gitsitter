@@ -68,7 +68,9 @@ pub fn branch_status_icon(status: &str, opts: DisplayOpts) -> &'static str {
             "local_ahead" => "\u{2B06}\u{FE0F}",
             "fast_forward" | "remote_ahead" => "\u{2B07}\u{FE0F}",
             "diverged" | "diverged_yours" => "\u{26A0}\u{FE0F}",
-            "history_rewritten_remote_unchanged" | "history_rewritten_remote_advanced" => "\u{270D}\u{FE0F}",
+            "history_rewritten_remote_unchanged" | "history_rewritten_remote_advanced" => {
+                "\u{270D}\u{FE0F}"
+            }
             "pending_dirty" => "\u{270F}\u{FE0F}",
             "merge_conflict" => "\u{1F527}",
             "error" => "\u{274C}",

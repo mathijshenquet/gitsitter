@@ -31,9 +31,7 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 use crate::config::{EffectiveConflictAction, InRepoConfig, UserConfig};
 use crate::forge::ForgeCache;
-use crate::git_ops::{
-    self, HistoryRewrite, MergeAnalysis, PushResult,
-};
+use crate::git_ops::{self, HistoryRewrite, MergeAnalysis, PushResult};
 use crate::paths::Paths;
 use crate::transport::{self, BranchStatusData, RepoStatusData, Request, Response, StatusData};
 
@@ -1450,7 +1448,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
 
                 match rewrite {
                     HistoryRewrite::RemoteUnchanged => {
-                        repo_info!(repo_label, "history rewritten (remote unchanged) :{}", branch.name);
+                        repo_info!(
+                            repo_label,
+                            "history rewritten (remote unchanged) :{}",
+                            branch.name
+                        );
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.set_branch(
@@ -1470,7 +1472,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         continue;
                     }
                     HistoryRewrite::RemoteAdvanced => {
-                        repo_info!(repo_label, "history rewritten (remote advanced) :{}", branch.name);
+                        repo_info!(
+                            repo_label,
+                            "history rewritten (remote advanced) :{}",
+                            branch.name
+                        );
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.set_branch(

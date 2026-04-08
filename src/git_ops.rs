@@ -323,16 +323,16 @@ pub fn detect_history_rewrite(repo_id: &Path, branch_name: &str) -> Result<Histo
         }
 
         // H must be an ancestor of R (was part of published lineage)
-        let h_ancestor_of_r = repo.graph_descendant_of(remote_oid, h)
-            .unwrap_or(false) || h == remote_oid;
+        let h_ancestor_of_r =
+            repo.graph_descendant_of(remote_oid, h).unwrap_or(false) || h == remote_oid;
 
         if !h_ancestor_of_r {
             continue;
         }
 
         // H must NOT be an ancestor of L (local was rewritten away from H)
-        let h_ancestor_of_l = repo.graph_descendant_of(local_oid, h)
-            .unwrap_or(false) || h == local_oid;
+        let h_ancestor_of_l =
+            repo.graph_descendant_of(local_oid, h).unwrap_or(false) || h == local_oid;
 
         if h_ancestor_of_l {
             continue;
