@@ -29,7 +29,7 @@ macro_rules! repo_error {
 }
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 
-use crate::config::{EffectiveConflictAction, UserConfig};
+use crate::config::{EffectiveConflictAction, InRepoConfig, UserConfig};
 use crate::forge::ForgeCache;
 use crate::git_ops::{
     self, MergeAnalysis, PushResult,
@@ -776,9 +776,14 @@ async fn sync_loop(daemon: SharedDaemon, mut shutdown_rx: watch::Receiver<bool>)
                     continue;
                 }
 
+                let in_repo_config = InRepoConfig::load(Path::new(&tracked.display_path))
+                    .unwrap_or_else(|e| {
+                        repo_warn!(repo_log_label(repo_id), "failed to load .gitsitter.toml: {:#}", e);
+                        None
+                    });
                 let refresh_interval = config.effective_refresh_interval(
                     repo_id,
-                    None, // in-repo config loaded per-sync
+                    in_repo_config.as_ref(),
                 );
 
                 // sync_reason is set by CLI sync / watcher to bypass the timer
