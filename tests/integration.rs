@@ -3,9 +3,7 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
-use gitsitter::config::{
-    self, InRepoConfig, RepoConfig, UserConfig,
-};
+use gitsitter::config::{self, InRepoConfig, RepoConfig, UserConfig};
 use gitsitter::paths::Paths;
 use gitsitter::transport::{self, BranchStatusData, Request, Response};
 
@@ -58,7 +56,14 @@ fn make_commit(repo: &git2::Repository, filename: &str, content: &str, message: 
         .unwrap();
 }
 
-fn make_commit_as(repo: &git2::Repository, filename: &str, content: &str, message: &str, name: &str, email: &str) {
+fn make_commit_as(
+    repo: &git2::Repository,
+    filename: &str,
+    content: &str,
+    message: &str,
+    name: &str,
+    email: &str,
+) {
     let workdir = repo.workdir().expect("not a bare repo");
     let file_path = workdir.join(filename);
     std::fs::write(&file_path, content).unwrap();
@@ -186,7 +191,11 @@ refresh_interval = "5m"
     #[test]
     fn duration_parsing_60s() {
         let tmp = temp_dir();
-        std::fs::write(tmp.path().join(".gitsitter.toml"), "refresh_interval = \"60s\"").unwrap();
+        std::fs::write(
+            tmp.path().join(".gitsitter.toml"),
+            "refresh_interval = \"60s\"",
+        )
+        .unwrap();
         let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
         assert_eq!(irc.refresh_interval, Some(Duration::from_secs(60)));
     }
@@ -194,7 +203,11 @@ refresh_interval = "5m"
     #[test]
     fn duration_parsing_5m() {
         let tmp = temp_dir();
-        std::fs::write(tmp.path().join(".gitsitter.toml"), "refresh_interval = \"5m\"").unwrap();
+        std::fs::write(
+            tmp.path().join(".gitsitter.toml"),
+            "refresh_interval = \"5m\"",
+        )
+        .unwrap();
         let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
         assert_eq!(irc.refresh_interval, Some(Duration::from_secs(300)));
     }
@@ -202,7 +215,11 @@ refresh_interval = "5m"
     #[test]
     fn duration_parsing_1h() {
         let tmp = temp_dir();
-        std::fs::write(tmp.path().join(".gitsitter.toml"), "refresh_interval = \"1h\"").unwrap();
+        std::fs::write(
+            tmp.path().join(".gitsitter.toml"),
+            "refresh_interval = \"1h\"",
+        )
+        .unwrap();
         let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
         assert_eq!(irc.refresh_interval, Some(Duration::from_secs(3600)));
     }
@@ -210,7 +227,11 @@ refresh_interval = "5m"
     #[test]
     fn duration_parsing_500ms() {
         let tmp = temp_dir();
-        std::fs::write(tmp.path().join(".gitsitter.toml"), "refresh_interval = \"500ms\"").unwrap();
+        std::fs::write(
+            tmp.path().join(".gitsitter.toml"),
+            "refresh_interval = \"500ms\"",
+        )
+        .unwrap();
         let irc = InRepoConfig::load(tmp.path()).unwrap().unwrap();
         assert_eq!(irc.refresh_interval, Some(Duration::from_millis(500)));
     }
@@ -339,7 +360,8 @@ refresh_interval = "5m"
 
         UserConfig::update_repo(&paths, "/home/user/project", |repo| {
             repo.refresh_interval = Some(Duration::from_secs(30));
-        }).unwrap();
+        })
+        .unwrap();
 
         let cfg = UserConfig::load(&paths).unwrap();
         let repo = cfg.repos.get("/home/user/project").unwrap();
@@ -591,7 +613,10 @@ mod git_ops_tests {
     fn get_current_user_email_reads_config() {
         let tmp = temp_dir();
         let repo = git2::Repository::init(tmp.path()).unwrap();
-        repo.config().unwrap().set_str("user.email", "me@example.com").unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("user.email", "me@example.com")
+            .unwrap();
 
         let repo_id = git_ops::discover_repo_id(tmp.path()).unwrap();
         let email = git_ops::get_current_user_email(&repo_id).unwrap();
@@ -610,14 +635,26 @@ mod git_ops_tests {
         let work = clone_repo(&bare_dir, &work_dir);
 
         // Configure user email in the working repo
-        work.config().unwrap().set_str("user.email", "me@example.com").unwrap();
+        work.config()
+            .unwrap()
+            .set_str("user.email", "me@example.com")
+            .unwrap();
 
         // Make a commit as "me" and push
-        make_commit_as(&work, "file.txt", "content", "my commit", "Me", "me@example.com");
+        make_commit_as(
+            &work,
+            "file.txt",
+            "content",
+            "my commit",
+            "Me",
+            "me@example.com",
+        );
         // Push to origin
         let mut remote = work.find_remote("origin").unwrap();
         let branch = work.head().unwrap().shorthand().unwrap().to_string();
-        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        remote
+            .push(&[&format!("refs/heads/{}", branch)], None)
+            .unwrap();
         drop(remote);
 
         // Fetch to update remote tracking refs
@@ -628,9 +665,18 @@ mod git_ops_tests {
         assert!(git_ops::is_branch_owned_by_user(&repo_id, &branch).unwrap());
 
         // Now push a commit from a different user
-        make_commit_as(&work, "file2.txt", "other", "their commit", "Other", "other@example.com");
+        make_commit_as(
+            &work,
+            "file2.txt",
+            "other",
+            "their commit",
+            "Other",
+            "other@example.com",
+        );
         let mut remote = work.find_remote("origin").unwrap();
-        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        remote
+            .push(&[&format!("refs/heads/{}", branch)], None)
+            .unwrap();
         drop(remote);
 
         let mut remote = work.find_remote("origin").unwrap();
@@ -656,7 +702,9 @@ mod git_ops_tests {
         make_commit(&work, "a.txt", "a", "initial");
         let branch = work.head().unwrap().shorthand().unwrap().to_string();
         let mut remote = work.find_remote("origin").unwrap();
-        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        remote
+            .push(&[&format!("refs/heads/{}", branch)], None)
+            .unwrap();
         drop(remote);
 
         // Simulate remote advancing: push a commit directly to bare
@@ -672,13 +720,16 @@ mod git_ops_tests {
             let new_tree_oid = tb.write().unwrap();
             let new_tree = bare_repo.find_tree(new_tree_oid).unwrap();
             let sig = git2::Signature::now("Remote", "remote@example.com").unwrap();
-            bare_repo.commit(
-                Some(&format!("refs/heads/{}", branch)),
-                &sig, &sig,
-                "remote commit",
-                &new_tree,
-                &[&head_commit],
-            ).unwrap();
+            bare_repo
+                .commit(
+                    Some(&format!("refs/heads/{}", branch)),
+                    &sig,
+                    &sig,
+                    "remote commit",
+                    &new_tree,
+                    &[&head_commit],
+                )
+                .unwrap();
         }
 
         // Add a local commit (normal divergence — local just advances)
@@ -713,21 +764,25 @@ mod git_ops_tests {
         make_commit(&work, "a.txt", "a", "commit A");
         let branch = work.head().unwrap().shorthand().unwrap().to_string();
         let mut remote = work.find_remote("origin").unwrap();
-        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        remote
+            .push(&[&format!("refs/heads/{}", branch)], None)
+            .unwrap();
         drop(remote);
 
         // Commit B + push (this is the published tip H that will become R)
         make_commit(&work, "b.txt", "b", "commit B");
         let mut remote = work.find_remote("origin").unwrap();
-        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        remote
+            .push(&[&format!("refs/heads/{}", branch)], None)
+            .unwrap();
         drop(remote);
 
         // Now "rewrite" local history: reset to commit A and make a new commit.
         // This simulates `git rebase -i` that squashed B away.
         let published_oid = work.head().unwrap().target().unwrap();
-        let commit_a = work.find_commit(published_oid).unwrap()
-            .parent(0).unwrap();
-        work.reset(commit_a.as_object(), git2::ResetType::Hard, None).unwrap();
+        let commit_a = work.find_commit(published_oid).unwrap().parent(0).unwrap();
+        work.reset(commit_a.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
         // Make a new, different commit (the rewritten history)
         make_commit(&work, "c.txt", "c", "rewritten commit C");
 
@@ -760,7 +815,9 @@ mod git_ops_tests {
         make_commit(&work, "a.txt", "a", "commit A");
         let branch = work.head().unwrap().shorthand().unwrap().to_string();
         let mut remote = work.find_remote("origin").unwrap();
-        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        remote
+            .push(&[&format!("refs/heads/{}", branch)], None)
+            .unwrap();
         drop(remote);
 
         let base_oid = work.head().unwrap().target().unwrap();
@@ -768,12 +825,15 @@ mod git_ops_tests {
         // Commit B + push (published tip — this becomes H in the reflog)
         make_commit(&work, "b.txt", "b", "commit B");
         let mut remote = work.find_remote("origin").unwrap();
-        remote.push(&[&format!("refs/heads/{}", branch)], None).unwrap();
+        remote
+            .push(&[&format!("refs/heads/{}", branch)], None)
+            .unwrap();
         drop(remote);
 
         // "Rewrite" local: reset back to A, then create a different commit
         let commit_a = work.find_commit(base_oid).unwrap();
-        work.reset(commit_a.as_object(), git2::ResetType::Hard, None).unwrap();
+        work.reset(commit_a.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
         make_commit(&work, "d.txt", "d", "rewritten commit D");
 
         // Simulate remote advancing past the published tip B
@@ -788,13 +848,16 @@ mod git_ops_tests {
             let new_tree_oid = tb.write().unwrap();
             let new_tree = bare_repo.find_tree(new_tree_oid).unwrap();
             let sig = git2::Signature::now("Remote", "remote@example.com").unwrap();
-            bare_repo.commit(
-                Some(&format!("refs/heads/{}", branch)),
-                &sig, &sig,
-                "remote advance",
-                &new_tree,
-                &[&head_commit],
-            ).unwrap();
+            bare_repo
+                .commit(
+                    Some(&format!("refs/heads/{}", branch)),
+                    &sig,
+                    &sig,
+                    "remote advance",
+                    &new_tree,
+                    &[&head_commit],
+                )
+                .unwrap();
         }
 
         // Fetch

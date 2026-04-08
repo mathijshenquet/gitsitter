@@ -29,7 +29,10 @@ pub fn repo_header(path: &str, opts: DisplayOpts) -> String {
 /// Format the daemon warning line.
 pub fn daemon_warning(opts: DisplayOpts) -> String {
     let icon = if opts.emoji { "\u{26A0}" } else { "!" };
-    let msg = format!("{} Daemon is not running \u{2014} start with: gitsitter daemon start", icon);
+    let msg = format!(
+        "{} Daemon is not running \u{2014} start with: gitsitter daemon start",
+        icon
+    );
     if opts.colors {
         format!("{}", msg.yellow())
     } else {
@@ -65,7 +68,9 @@ pub fn branch_status_icon(status: &str, opts: DisplayOpts) -> &'static str {
             "local_ahead" => "\u{2B06}\u{FE0F}",
             "fast_forward" | "remote_ahead" => "\u{2B07}\u{FE0F}",
             "diverged" | "diverged_yours" => "\u{26A0}\u{FE0F}",
-            "history_rewritten_remote_unchanged" | "history_rewritten_remote_advanced" => "\u{270D}\u{FE0F}",
+            "history_rewritten_remote_unchanged" | "history_rewritten_remote_advanced" => {
+                "\u{270D}\u{FE0F}"
+            }
             "pending_dirty" => "\u{270F}\u{FE0F}",
             "merge_conflict" => "\u{1F527}",
             "error" => "\u{274C}",

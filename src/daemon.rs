@@ -31,14 +31,9 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 use crate::config::{EffectiveConflictAction, UserConfig};
 use crate::forge::ForgeCache;
-use crate::git_ops::{
-    self, HistoryRewrite, MergeAnalysis, PushResult,
-};
+use crate::git_ops::{self, HistoryRewrite, MergeAnalysis, PushResult};
 use crate::paths::Paths;
-use crate::transport::{
-    self, BranchStatusData,
-    RepoStatusData, StatusData, Request, Response,
-};
+use crate::transport::{self, BranchStatusData, RepoStatusData, Request, Response, StatusData};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -202,7 +197,8 @@ impl TrackedRepo {
 
     #[allow(dead_code)]
     fn record_notification(&mut self, key: &str) {
-        self.notification_cooldowns.insert(key.to_string(), Instant::now());
+        self.notification_cooldowns
+            .insert(key.to_string(), Instant::now());
     }
 }
 
@@ -221,7 +217,10 @@ pub async fn run_daemon(paths: &Paths) -> Result<()> {
         .with_context(|| format!("failed to write PID file at {}", paths.daemon_pid.display()))?;
 
     // 3. Set up tracing — write to both stderr (for service managers) and daemon.log
-    let log_dir = paths.daemon_log.parent().expect("daemon_log has parent dir");
+    let log_dir = paths
+        .daemon_log
+        .parent()
+        .expect("daemon_log has parent dir");
     let file_appender = tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
         .filename_prefix("daemon.log")
@@ -246,7 +245,11 @@ pub async fn run_daemon(paths: &Paths) -> Result<()> {
     // 5. Seed repos from config.toml
     let mut repo_states: HashMap<String, TrackedRepo> = HashMap::new();
     for (repo_path, repo_cfg) in &config.repos {
-        if repo_cfg.disabled.as_ref().map_or(false, |d| d.is_repo_disabled()) {
+        if repo_cfg
+            .disabled
+            .as_ref()
+            .map_or(false, |d| d.is_repo_disabled())
+        {
             continue;
         }
         let repo_id_path = PathBuf::from(repo_path);
@@ -345,15 +348,12 @@ pub async fn run_daemon(paths: &Paths) -> Result<()> {
     let _ = daemon.shutdown_tx.send(true);
 
     // Give tasks a moment to finish
-    let _ = tokio::time::timeout(
-        Duration::from_secs(5),
-        async {
-            let _ = socket_task.await;
-            let _ = sync_task.await;
-            let _ = watcher_task.await;
-            let _ = update_task.await;
-        },
-    )
+    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+        let _ = socket_task.await;
+        let _ = sync_task.await;
+        let _ = watcher_task.await;
+        let _ = update_task.await;
+    })
     .await;
 
     // 14. Cleanup: remove endpoint and PID file
@@ -400,7 +400,10 @@ async fn socket_accept_loop(
     }
 }
 
-async fn handle_connection(daemon: SharedDaemon, mut stream: transport::DaemonStream) -> Result<()> {
+async fn handle_connection(
+    daemon: SharedDaemon,
+    mut stream: transport::DaemonStream,
+) -> Result<()> {
     let request = match transport::recv_request(&mut stream).await {
         Ok(req) => req,
         Err(e) if is_eof(&e) => return Ok(()), // probe or client disconnected
@@ -482,10 +485,14 @@ async fn handle_global_status(daemon: &SharedDaemon) -> Response {
     let mut result = Vec::with_capacity(repos.len());
     for tr in repos.values() {
         let total = tr.branches.len();
-        let synced = tr.branches.values()
+        let synced = tr
+            .branches
+            .values()
             .filter(|b| b.sync_status == "synced" || b.sync_status == "up_to_date")
             .count();
-        let diverged = tr.branches.values()
+        let diverged = tr
+            .branches
+            .values()
             .filter(|b| b.sync_status == "diverged")
             .count();
 
@@ -508,11 +515,7 @@ async fn handle_global_status(daemon: &SharedDaemon) -> Response {
     Response::GlobalStatus { repos: result }
 }
 
-async fn handle_sync(
-    daemon: &SharedDaemon,
-    repo_path: Option<String>,
-    all: bool,
-) -> Response {
+async fn handle_sync(daemon: &SharedDaemon, repo_path: Option<String>, all: bool) -> Response {
     if all {
         let mut repos = daemon.repos.write().await;
         for tr in repos.values_mut() {
@@ -530,7 +533,10 @@ async fn handle_sync(
                 let repo_id_str = repo_id.to_string_lossy().to_string();
                 let mut repos = daemon.repos.write().await;
                 if let Some(tr) = repos.get_mut(&repo_id_str) {
-                    tr.sync_reason = Some(format!("cli sync requested ({})", display_repo_label(&tr.display_path)));
+                    tr.sync_reason = Some(format!(
+                        "cli sync requested ({})",
+                        display_repo_label(&tr.display_path)
+                    ));
                     drop(repos);
                     repo_info!(display_repo_label(&path), "⚡ cli sync requested");
                     daemon.sync_notify.notify_one();
@@ -625,7 +631,11 @@ pub(crate) async fn reload_config(daemon: &SharedDaemon) {
         let mut repos = daemon.repos.write().await;
         // Add new repos from config
         for (repo_path, repo_cfg) in &new_config.repos {
-            if repo_cfg.disabled.as_ref().map_or(false, |d| d.is_repo_disabled()) {
+            if repo_cfg
+                .disabled
+                .as_ref()
+                .map_or(false, |d| d.is_repo_disabled())
+            {
                 continue;
             }
             if !repos.contains_key(repo_path) {
@@ -642,7 +652,8 @@ pub(crate) async fn reload_config(daemon: &SharedDaemon) {
             }
         }
         // Remove repos no longer in config
-        let to_remove: Vec<String> = repos.keys()
+        let to_remove: Vec<String> = repos
+            .keys()
             .filter(|id| !new_config.repos.contains_key(*id))
             .cloned()
             .collect();
@@ -711,12 +722,16 @@ fn build_status_data(tr: &TrackedRepo, config: &UserConfig) -> StatusData {
         .filter_map(|b| b.upstream_name.as_deref().map(|u| (b.name.as_str(), u)))
         .collect();
 
-    let branches = tr.branches.iter()
+    let branches = tr
+        .branches
+        .iter()
         .map(|(name, bs)| BranchStatusData {
             name: name.clone(),
             upstream: upstream_map.get(name.as_str()).map(|s| s.to_string()),
             status: bs.sync_status.clone(),
-            last_action: bs.last_pull_at.as_ref()
+            last_action: bs
+                .last_pull_at
+                .as_ref()
                 .or(bs.last_push_at.as_ref())
                 .cloned(),
         })
@@ -734,7 +749,6 @@ fn build_status_data(tr: &TrackedRepo, config: &UserConfig) -> StatusData {
         newly_registered: false,
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Sync loop
@@ -780,8 +794,7 @@ async fn sync_loop(daemon: SharedDaemon, mut shutdown_rx: watch::Receiver<bool>)
                 }
 
                 let refresh_interval = config.effective_refresh_interval(
-                    repo_id,
-                    None, // in-repo config loaded per-sync
+                    repo_id, None, // in-repo config loaded per-sync
                 );
 
                 // sync_reason is set by CLI sync / watcher to bypass the timer
@@ -888,10 +901,8 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
     let git_path_ref = git_path.as_deref();
 
     // 3. Discover worktrees and build branch occupancy map
-    let worktrees = git_ops::list_worktrees(&repo_path)
-        .unwrap_or_default();
-    let occupancy = git_ops::branch_occupancy(&repo_path)
-        .unwrap_or_default();
+    let worktrees = git_ops::list_worktrees(&repo_path).unwrap_or_default();
+    let occupancy = git_ops::branch_occupancy(&repo_path).unwrap_or_default();
 
     // 4. List branches (needed to determine remotes for fetch)
     let branches = git_ops::list_branches(&repo_path).unwrap_or_default();
@@ -937,7 +948,9 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
             if remotes.is_empty() && !remote_urls.is_empty() {
                 // Only add "origin" fallback if there are actual remotes configured
                 if let Some(url) = remote_urls.get("origin") {
-                    if config.is_remote_trusted(url) && !config.is_remote_disabled(repo_id, "origin") {
+                    if config.is_remote_trusted(url)
+                        && !config.is_remote_disabled(repo_id, "origin")
+                    {
                         remotes.push("origin".to_string());
                     }
                 }
@@ -998,7 +1011,10 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                             repo_info!(
                                 repo_label,
                                 "skipping :{} — also tracks {}/{} which is canonical via :{}",
-                                branches[i].name, remote, remote_ref, branches[canon].name
+                                branches[i].name,
+                                remote,
+                                remote_ref,
+                                branches[canon].name
                             );
                         }
                     }
@@ -1008,7 +1024,9 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         repo_warn!(
                             repo_label,
                             "skipping :{} — multiple branches track {}/{} with no name match",
-                            branches[i].name, remote, remote_ref
+                            branches[i].name,
+                            remote,
+                            remote_ref
                         );
                     }
                 }
@@ -1032,7 +1050,12 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         let analysis = match git_ops::analyze_merge(&repo_path, &branch.name) {
             Ok(a) => a,
             Err(e) => {
-                repo_warn!(repo_label, "merge analysis failed for :{}: {:#}", branch.name, e);
+                repo_warn!(
+                    repo_label,
+                    "merge analysis failed for :{}: {:#}",
+                    branch.name,
+                    e
+                );
                 continue;
             }
         };
@@ -1045,14 +1068,17 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 repo_info!(repo_label, "upstream gone :{}", branch.name);
                 let mut repos = daemon.repos.write().await;
                 if let Some(tr) = repos.get_mut(repo_id) {
-                    tr.set_branch(&branch.name, BranchRuntimeState {
-                        sync_status: "upstream_gone".into(),
-                        last_pull_at: None,
-                        last_push_at: None,
-                        local_oid: Some(branch.local_oid.clone()),
-                        remote_oid: None,
-                        error_message: Some("upstream ref deleted".into()),
-                    });
+                    tr.set_branch(
+                        &branch.name,
+                        BranchRuntimeState {
+                            sync_status: "upstream_gone".into(),
+                            last_pull_at: None,
+                            last_push_at: None,
+                            local_oid: Some(branch.local_oid.clone()),
+                            remote_oid: None,
+                            error_message: Some("upstream ref deleted".into()),
+                        },
+                    );
                 }
             }
 
@@ -1060,14 +1086,17 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
             MergeAnalysis::UpToDate => {
                 let mut repos = daemon.repos.write().await;
                 if let Some(tr) = repos.get_mut(repo_id) {
-                    tr.set_branch(&branch.name, BranchRuntimeState {
-                        sync_status: "synced".into(),
-                        last_pull_at: None,
-                        last_push_at: None,
-                        local_oid: Some(branch.local_oid.clone()),
-                        remote_oid: branch.remote_oid.clone(),
-                        error_message: None,
-                    });
+                    tr.set_branch(
+                        &branch.name,
+                        BranchRuntimeState {
+                            sync_status: "synced".into(),
+                            last_pull_at: None,
+                            last_push_at: None,
+                            local_oid: Some(branch.local_oid.clone()),
+                            remote_oid: branch.remote_oid.clone(),
+                            error_message: None,
+                        },
+                    );
                 }
             }
 
@@ -1088,14 +1117,19 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         repo_info!(repo_label, "skipping ff :{} — worktree dirty", branch.name);
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
-                            tr.set_branch(&branch.name, BranchRuntimeState {
-                                sync_status: "pending_dirty".into(),
-                                last_pull_at: None,
-                                last_push_at: None,
-                                local_oid: Some(branch.local_oid.clone()),
-                                remote_oid: Some(remote_oid),
-                                error_message: Some("dirty worktree — commit or stash to sync".into()),
-                            });
+                            tr.set_branch(
+                                &branch.name,
+                                BranchRuntimeState {
+                                    sync_status: "pending_dirty".into(),
+                                    last_pull_at: None,
+                                    last_push_at: None,
+                                    local_oid: Some(branch.local_oid.clone()),
+                                    remote_oid: Some(remote_oid),
+                                    error_message: Some(
+                                        "dirty worktree — commit or stash to sync".into(),
+                                    ),
+                                },
+                            );
                         }
                         continue;
                     }
@@ -1115,28 +1149,34 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                             let now = chrono::Utc::now().to_rfc3339();
                             let mut repos = daemon.repos.write().await;
                             if let Some(tr) = repos.get_mut(repo_id) {
-                                tr.set_branch(&branch.name, BranchRuntimeState {
-                                    sync_status: "synced".into(),
-                                    last_pull_at: Some(now),
-                                    last_push_at: None,
-                                    local_oid: Some(remote_oid.clone()),
-                                    remote_oid: Some(remote_oid),
-                                    error_message: None,
-                                });
+                                tr.set_branch(
+                                    &branch.name,
+                                    BranchRuntimeState {
+                                        sync_status: "synced".into(),
+                                        last_pull_at: Some(now),
+                                        last_push_at: None,
+                                        local_oid: Some(remote_oid.clone()),
+                                        remote_oid: Some(remote_oid),
+                                        error_message: None,
+                                    },
+                                );
                             }
                         }
                         Err(e) => {
                             repo_warn!(repo_label, "ff-merge failed :{}: {:#}", branch.name, e);
                             let mut repos = daemon.repos.write().await;
                             if let Some(tr) = repos.get_mut(repo_id) {
-                                tr.set_branch(&branch.name, BranchRuntimeState {
-                                    sync_status: "error".into(),
-                                    last_pull_at: None,
-                                    last_push_at: None,
-                                    local_oid: Some(branch.local_oid.clone()),
-                                    remote_oid: Some(remote_oid),
-                                    error_message: Some(format!("{:#}", e)),
-                                });
+                                tr.set_branch(
+                                    &branch.name,
+                                    BranchRuntimeState {
+                                        sync_status: "error".into(),
+                                        last_pull_at: None,
+                                        last_push_at: None,
+                                        local_oid: Some(branch.local_oid.clone()),
+                                        remote_oid: Some(remote_oid),
+                                        error_message: Some(format!("{:#}", e)),
+                                    },
+                                );
                             }
                         }
                     }
@@ -1157,14 +1197,17 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                             let now = chrono::Utc::now().to_rfc3339();
                             let mut repos = daemon.repos.write().await;
                             if let Some(tr) = repos.get_mut(repo_id) {
-                                tr.set_branch(&branch.name, BranchRuntimeState {
-                                    sync_status: "synced".into(),
-                                    last_pull_at: Some(now),
-                                    last_push_at: None,
-                                    local_oid: Some(remote_oid.clone()),
-                                    remote_oid: Some(remote_oid),
-                                    error_message: None,
-                                });
+                                tr.set_branch(
+                                    &branch.name,
+                                    BranchRuntimeState {
+                                        sync_status: "synced".into(),
+                                        last_pull_at: Some(now),
+                                        last_push_at: None,
+                                        local_oid: Some(remote_oid.clone()),
+                                        remote_oid: Some(remote_oid),
+                                        error_message: None,
+                                    },
+                                );
                             }
                         }
                         Err(e) => {
@@ -1187,8 +1230,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 .await
                 .unwrap_or(false);
                 let is_merge_of_remote = !is_owner
-                    && git_ops::is_local_merge_of_remote(&repo_path, &branch.name)
-                        .unwrap_or(false);
+                    && git_ops::is_local_merge_of_remote(&repo_path, &branch.name).unwrap_or(false);
 
                 if !is_owner && !is_merge_of_remote {
                     // User doesn't own this branch — nag, don't push
@@ -1241,14 +1283,17 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.reset_push_backoff(&ref_name);
-                            tr.set_branch(&branch.name, BranchRuntimeState {
-                                sync_status: "synced".into(),
-                                last_pull_at: None,
-                                last_push_at: Some(now),
-                                local_oid: Some(branch.local_oid.clone()),
-                                remote_oid: Some(branch.local_oid.clone()),
-                                error_message: None,
-                            });
+                            tr.set_branch(
+                                &branch.name,
+                                BranchRuntimeState {
+                                    sync_status: "synced".into(),
+                                    last_pull_at: None,
+                                    last_push_at: Some(now),
+                                    local_oid: Some(branch.local_oid.clone()),
+                                    remote_oid: Some(branch.local_oid.clone()),
+                                    error_message: None,
+                                },
+                            );
                         }
                     }
                     Ok(PushResult::Rejected(msg)) => {
@@ -1256,14 +1301,17 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_push_failure(&ref_name);
-                            tr.set_branch(&branch.name, BranchRuntimeState {
-                                sync_status: "push_rejected".into(),
-                                last_pull_at: None,
-                                last_push_at: None,
-                                local_oid: Some(branch.local_oid.clone()),
-                                remote_oid: branch.remote_oid.clone(),
-                                error_message: Some(msg),
-                            });
+                            tr.set_branch(
+                                &branch.name,
+                                BranchRuntimeState {
+                                    sync_status: "push_rejected".into(),
+                                    last_pull_at: None,
+                                    last_push_at: None,
+                                    local_oid: Some(branch.local_oid.clone()),
+                                    remote_oid: branch.remote_oid.clone(),
+                                    error_message: Some(msg),
+                                },
+                            );
                         }
                     }
                     Ok(PushResult::AuthFailed(msg)) => {
@@ -1271,14 +1319,17 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_fetch_failure();
-                            tr.set_branch(&branch.name, BranchRuntimeState {
-                                sync_status: "auth_failed".into(),
-                                last_pull_at: None,
-                                last_push_at: None,
-                                local_oid: Some(branch.local_oid.clone()),
-                                remote_oid: branch.remote_oid.clone(),
-                                error_message: Some(msg),
-                            });
+                            tr.set_branch(
+                                &branch.name,
+                                BranchRuntimeState {
+                                    sync_status: "auth_failed".into(),
+                                    last_pull_at: None,
+                                    last_push_at: None,
+                                    local_oid: Some(branch.local_oid.clone()),
+                                    remote_oid: branch.remote_oid.clone(),
+                                    error_message: Some(msg),
+                                },
+                            );
                         }
                     }
                     Ok(PushResult::NetworkError(msg)) => {
@@ -1286,14 +1337,17 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_fetch_failure();
-                            tr.set_branch(&branch.name, BranchRuntimeState {
-                                sync_status: "network_error".into(),
-                                last_pull_at: None,
-                                last_push_at: None,
-                                local_oid: Some(branch.local_oid.clone()),
-                                remote_oid: branch.remote_oid.clone(),
-                                error_message: Some(msg),
-                            });
+                            tr.set_branch(
+                                &branch.name,
+                                BranchRuntimeState {
+                                    sync_status: "network_error".into(),
+                                    last_pull_at: None,
+                                    last_push_at: None,
+                                    local_oid: Some(branch.local_oid.clone()),
+                                    remote_oid: branch.remote_oid.clone(),
+                                    error_message: Some(msg),
+                                },
+                            );
                         }
                     }
                     Ok(PushResult::HookTimeout) => {
@@ -1301,14 +1355,17 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         let mut repos = daemon.repos.write().await;
                         if let Some(tr) = repos.get_mut(repo_id) {
                             tr.backoff.record_push_failure(&ref_name);
-                            tr.set_branch(&branch.name, BranchRuntimeState {
-                                sync_status: "push_blocked_hook_timeout".into(),
-                                last_pull_at: None,
-                                last_push_at: None,
-                                local_oid: Some(branch.local_oid.clone()),
-                                remote_oid: branch.remote_oid.clone(),
-                                error_message: Some("push hook timed out".into()),
-                            });
+                            tr.set_branch(
+                                &branch.name,
+                                BranchRuntimeState {
+                                    sync_status: "push_blocked_hook_timeout".into(),
+                                    last_pull_at: None,
+                                    last_push_at: None,
+                                    local_oid: Some(branch.local_oid.clone()),
+                                    remote_oid: branch.remote_oid.clone(),
+                                    error_message: Some("push hook timed out".into()),
+                                },
+                            );
                         }
                     }
                     Err(e) => {
@@ -1337,7 +1394,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
 
                     match rewrite {
                         HistoryRewrite::RemoteUnchanged => {
-                            repo_info!(repo_label, "history rewritten (remote unchanged) :{}", branch.name);
+                            repo_info!(
+                                repo_label,
+                                "history rewritten (remote unchanged) :{}",
+                                branch.name
+                            );
                             let mut repos = daemon.repos.write().await;
                             if let Some(tr) = repos.get_mut(repo_id) {
                                 tr.set_branch(&branch.name, BranchRuntimeState {
@@ -1354,7 +1415,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                             continue;
                         }
                         HistoryRewrite::RemoteAdvanced => {
-                            repo_info!(repo_label, "history rewritten (remote advanced) :{}", branch.name);
+                            repo_info!(
+                                repo_label,
+                                "history rewritten (remote advanced) :{}",
+                                branch.name
+                            );
                             let mut repos = daemon.repos.write().await;
                             if let Some(tr) = repos.get_mut(repo_id) {
                                 tr.set_branch(&branch.name, BranchRuntimeState {
@@ -1385,17 +1450,26 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                     if let Some(wt_path) = occupancy.get(&branch.name) {
                         let wt_path_buf = PathBuf::from(wt_path);
                         if git_ops::is_worktree_dirty(&wt_path_buf).unwrap_or(false) {
-                            repo_info!(repo_label, "skipping rebase :{} — worktree dirty", branch.name);
+                            repo_info!(
+                                repo_label,
+                                "skipping rebase :{} — worktree dirty",
+                                branch.name
+                            );
                             let mut repos = daemon.repos.write().await;
                             if let Some(tr) = repos.get_mut(repo_id) {
-                                tr.set_branch(&branch.name, BranchRuntimeState {
-                                    sync_status: "pending_dirty".into(),
-                                    last_pull_at: None,
-                                    last_push_at: None,
-                                    local_oid: Some(branch.local_oid.clone()),
-                                    remote_oid: branch.remote_oid.clone(),
-                                    error_message: Some("dirty worktree — commit or stash to sync".into()),
-                                });
+                                tr.set_branch(
+                                    &branch.name,
+                                    BranchRuntimeState {
+                                        sync_status: "pending_dirty".into(),
+                                        last_pull_at: None,
+                                        last_push_at: None,
+                                        local_oid: Some(branch.local_oid.clone()),
+                                        remote_oid: branch.remote_oid.clone(),
+                                        error_message: Some(
+                                            "dirty worktree — commit or stash to sync".into(),
+                                        ),
+                                    },
+                                );
                             }
                             continue;
                         }
@@ -1436,14 +1510,17 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                 let mut repos = daemon.repos.write().await;
                                 if let Some(tr) = repos.get_mut(repo_id) {
                                     tr.backoff.reset_push_backoff(&ref_name);
-                                    tr.set_branch(&branch.name, BranchRuntimeState {
-                                        sync_status: "synced".into(),
-                                        last_pull_at: None,
-                                        last_push_at: Some(now),
-                                        local_oid: Some(branch.local_oid.clone()),
-                                        remote_oid: Some(branch.local_oid.clone()),
-                                        error_message: None,
-                                    });
+                                    tr.set_branch(
+                                        &branch.name,
+                                        BranchRuntimeState {
+                                            sync_status: "synced".into(),
+                                            last_pull_at: None,
+                                            last_push_at: Some(now),
+                                            local_oid: Some(branch.local_oid.clone()),
+                                            remote_oid: Some(branch.local_oid.clone()),
+                                            error_message: None,
+                                        },
+                                    );
                                 }
                             }
                             _ => {
@@ -1451,14 +1528,19 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                 let mut repos = daemon.repos.write().await;
                                 if let Some(tr) = repos.get_mut(repo_id) {
                                     tr.backoff.record_push_failure(&ref_name);
-                                    tr.set_branch(&branch.name, BranchRuntimeState {
-                                        sync_status: "diverged_yours".into(),
-                                        last_pull_at: None,
-                                        last_push_at: None,
-                                        local_oid: Some(branch.local_oid.clone()),
-                                        remote_oid: branch.remote_oid.clone(),
-                                        error_message: Some("rebased but push failed — will retry".into()),
-                                    });
+                                    tr.set_branch(
+                                        &branch.name,
+                                        BranchRuntimeState {
+                                            sync_status: "diverged_yours".into(),
+                                            last_pull_at: None,
+                                            last_push_at: None,
+                                            local_oid: Some(branch.local_oid.clone()),
+                                            remote_oid: branch.remote_oid.clone(),
+                                            error_message: Some(
+                                                "rebased but push failed — will retry".into(),
+                                            ),
+                                        },
+                                    );
                                 }
                             }
                         }
@@ -1471,18 +1553,27 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         match action {
                             EffectiveConflictAction::Revert => {
                                 let _ = git_ops::git_rebase_abort(
-                                    &rebase_path, git_path_ref, GIT_TIMEOUT_SECS,
-                                ).await;
+                                    &rebase_path,
+                                    git_path_ref,
+                                    GIT_TIMEOUT_SECS,
+                                )
+                                .await;
                                 let mut repos = daemon.repos.write().await;
                                 if let Some(tr) = repos.get_mut(repo_id) {
-                                    tr.set_branch(&branch.name, BranchRuntimeState {
-                                        sync_status: "diverged_yours".into(),
-                                        last_pull_at: None,
-                                        last_push_at: None,
-                                        local_oid: Some(branch.local_oid.clone()),
-                                        remote_oid: branch.remote_oid.clone(),
-                                        error_message: Some("diverged — rebase has conflicts, resolve manually".into()),
-                                    });
+                                    tr.set_branch(
+                                        &branch.name,
+                                        BranchRuntimeState {
+                                            sync_status: "diverged_yours".into(),
+                                            last_pull_at: None,
+                                            last_push_at: None,
+                                            local_oid: Some(branch.local_oid.clone()),
+                                            remote_oid: branch.remote_oid.clone(),
+                                            error_message: Some(
+                                                "diverged — rebase has conflicts, resolve manually"
+                                                    .into(),
+                                            ),
+                                        },
+                                    );
                                 }
                             }
                             EffectiveConflictAction::Leave => {
@@ -1499,16 +1590,31 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                 }
                             }
                             EffectiveConflictAction::ResolveAgent => {
-                                let agent = config.global.resolve_agent.as_deref().unwrap_or("claude");
+                                let agent =
+                                    config.global.resolve_agent.as_deref().unwrap_or("claude");
                                 let agent_path = config.global.resolve_agent_path.as_deref();
-                                repo_info!(repo_label, "running resolve agent '{}' :{}", agent, branch.name);
+                                repo_info!(
+                                    repo_label,
+                                    "running resolve agent '{}' :{}",
+                                    agent,
+                                    branch.name
+                                );
 
                                 const RESOLVE_TIMEOUT_SECS: u64 = 180;
                                 match git_ops::run_resolve_agent(
-                                    &rebase_path, agent, agent_path, RESOLVE_TIMEOUT_SECS,
-                                ).await {
+                                    &rebase_path,
+                                    agent,
+                                    agent_path,
+                                    RESOLVE_TIMEOUT_SECS,
+                                )
+                                .await
+                                {
                                     Ok(result) if result.completed => {
-                                        repo_info!(repo_label, "resolve agent succeeded :{}", branch.name);
+                                        repo_info!(
+                                            repo_label,
+                                            "resolve agent succeeded :{}",
+                                            branch.name
+                                        );
                                         // Push the resolved rebase
                                         match git_ops::git_push(
                                             &rebase_path,
@@ -1517,26 +1623,43 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                             &branch.remote_ref,
                                             git_path_ref,
                                             GIT_TIMEOUT_SECS,
-                                        ).await {
+                                        )
+                                        .await
+                                        {
                                             Ok(PushResult::Success) => {
                                                 had_activity = true;
-                                                repo_info!(repo_label, "pushed (after resolve agent) :{}", branch.name);
+                                                repo_info!(
+                                                    repo_label,
+                                                    "pushed (after resolve agent) :{}",
+                                                    branch.name
+                                                );
                                                 let now = chrono::Utc::now().to_rfc3339();
                                                 let mut repos = daemon.repos.write().await;
                                                 if let Some(tr) = repos.get_mut(repo_id) {
                                                     tr.backoff.reset_push_backoff(&ref_name);
-                                                    tr.set_branch(&branch.name, BranchRuntimeState {
-                                                        sync_status: "synced".into(),
-                                                        last_pull_at: None,
-                                                        last_push_at: Some(now),
-                                                        local_oid: Some(branch.local_oid.clone()),
-                                                        remote_oid: Some(branch.local_oid.clone()),
-                                                        error_message: None,
-                                                    });
+                                                    tr.set_branch(
+                                                        &branch.name,
+                                                        BranchRuntimeState {
+                                                            sync_status: "synced".into(),
+                                                            last_pull_at: None,
+                                                            last_push_at: Some(now),
+                                                            local_oid: Some(
+                                                                branch.local_oid.clone(),
+                                                            ),
+                                                            remote_oid: Some(
+                                                                branch.local_oid.clone(),
+                                                            ),
+                                                            error_message: None,
+                                                        },
+                                                    );
                                                 }
                                             }
                                             _ => {
-                                                repo_warn!(repo_label, "push after resolve agent failed :{}", branch.name);
+                                                repo_warn!(
+                                                    repo_label,
+                                                    "push after resolve agent failed :{}",
+                                                    branch.name
+                                                );
                                                 let mut repos = daemon.repos.write().await;
                                                 if let Some(tr) = repos.get_mut(repo_id) {
                                                     tr.backoff.record_push_failure(&ref_name);
@@ -1554,12 +1677,17 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                     }
                                     Ok(result) => {
                                         // Agent ran but didn't fully resolve — leave conflicts
-                                        repo_warn!(repo_label, "resolve agent did not complete :{}", branch.name);
+                                        repo_warn!(
+                                            repo_label,
+                                            "resolve agent did not complete :{}",
+                                            branch.name
+                                        );
                                         let msg = if result.agent_output.is_empty() {
                                             "resolve agent could not fully resolve conflicts — finish manually or run `gitsitter auto-resolve`".to_string()
                                         } else {
                                             // Trim to last meaningful line(s) from agent output
-                                            let trimmed: String = result.agent_output
+                                            let trimmed: String = result
+                                                .agent_output
                                                 .lines()
                                                 .rev()
                                                 .take(3)
@@ -1572,29 +1700,43 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                         };
                                         let mut repos = daemon.repos.write().await;
                                         if let Some(tr) = repos.get_mut(repo_id) {
-                                            tr.set_branch(&branch.name, BranchRuntimeState {
-                                                sync_status: "merge_conflict".into(),
-                                                last_pull_at: None,
-                                                last_push_at: None,
-                                                local_oid: Some(branch.local_oid.clone()),
-                                                remote_oid: branch.remote_oid.clone(),
-                                                error_message: Some(msg),
-                                            });
+                                            tr.set_branch(
+                                                &branch.name,
+                                                BranchRuntimeState {
+                                                    sync_status: "merge_conflict".into(),
+                                                    last_pull_at: None,
+                                                    last_push_at: None,
+                                                    local_oid: Some(branch.local_oid.clone()),
+                                                    remote_oid: branch.remote_oid.clone(),
+                                                    error_message: Some(msg),
+                                                },
+                                            );
                                         }
                                     }
                                     Err(e) => {
-                                        repo_warn!(repo_label, "resolve agent failed :{}: {:#}", branch.name, e);
+                                        repo_warn!(
+                                            repo_label,
+                                            "resolve agent failed :{}: {:#}",
+                                            branch.name,
+                                            e
+                                        );
                                         // Leave conflicts in place
                                         let mut repos = daemon.repos.write().await;
                                         if let Some(tr) = repos.get_mut(repo_id) {
-                                            tr.set_branch(&branch.name, BranchRuntimeState {
-                                                sync_status: "merge_conflict".into(),
-                                                last_pull_at: None,
-                                                last_push_at: None,
-                                                local_oid: Some(branch.local_oid.clone()),
-                                                remote_oid: branch.remote_oid.clone(),
-                                                error_message: Some(format!("resolve agent error: {:#}", e)),
-                                            });
+                                            tr.set_branch(
+                                                &branch.name,
+                                                BranchRuntimeState {
+                                                    sync_status: "merge_conflict".into(),
+                                                    last_pull_at: None,
+                                                    last_push_at: None,
+                                                    local_oid: Some(branch.local_oid.clone()),
+                                                    remote_oid: branch.remote_oid.clone(),
+                                                    error_message: Some(format!(
+                                                        "resolve agent error: {:#}",
+                                                        e
+                                                    )),
+                                                },
+                                            );
                                         }
                                     }
                                 }
@@ -1605,14 +1747,19 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                     repo_warn!(repo_label, "diverged :{}", branch.name);
                     let mut repos = daemon.repos.write().await;
                     if let Some(tr) = repos.get_mut(repo_id) {
-                        tr.set_branch(&branch.name, BranchRuntimeState {
-                            sync_status: "diverged".into(),
-                            last_pull_at: None,
-                            last_push_at: None,
-                            local_oid: Some(branch.local_oid.clone()),
-                            remote_oid: branch.remote_oid.clone(),
-                            error_message: Some("diverged (last remote commit by someone else)".into()),
-                        });
+                        tr.set_branch(
+                            &branch.name,
+                            BranchRuntimeState {
+                                sync_status: "diverged".into(),
+                                last_pull_at: None,
+                                last_push_at: None,
+                                local_oid: Some(branch.local_oid.clone()),
+                                remote_oid: branch.remote_oid.clone(),
+                                error_message: Some(
+                                    "diverged (last remote commit by someone else)".into(),
+                                ),
+                            },
+                        );
                     }
                 }
             }
@@ -1637,10 +1784,32 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
     let branch_count = branches.len();
     let summary = format!("{} remote(s), {} branch(es)", remote_count, branch_count);
     match reason {
-        Some(r) if had_activity => repo_info!(repo_label, "✅ sync completed in {:.1?}, {} ({})", elapsed, summary, r),
-        Some(r) => repo_info!(repo_label, "• scan completed in {:.1?}, {} ({})", elapsed, summary, r),
-        None if had_activity => repo_info!(repo_label, "✅ sync completed in {:.1?}, {} (scheduled)", elapsed, summary),
-        None => repo_info!(repo_label, "• scheduled scan completed in {:.1?}, {}", elapsed, summary),
+        Some(r) if had_activity => repo_info!(
+            repo_label,
+            "✅ sync completed in {:.1?}, {} ({})",
+            elapsed,
+            summary,
+            r
+        ),
+        Some(r) => repo_info!(
+            repo_label,
+            "• scan completed in {:.1?}, {} ({})",
+            elapsed,
+            summary,
+            r
+        ),
+        None if had_activity => repo_info!(
+            repo_label,
+            "✅ sync completed in {:.1?}, {} (scheduled)",
+            elapsed,
+            summary
+        ),
+        None => repo_info!(
+            repo_label,
+            "• scheduled scan completed in {:.1?}, {}",
+            elapsed,
+            summary
+        ),
     }
 
     Ok(())
@@ -1657,7 +1826,9 @@ fn resolve_repo_id_from_path(path: &str) -> Result<PathBuf> {
 }
 
 pub(crate) fn display_repo_label(path: &str) -> String {
-    strip_windows_device_prefix(path).trim_end_matches(['\\', '/']).to_string()
+    strip_windows_device_prefix(path)
+        .trim_end_matches(['\\', '/'])
+        .to_string()
 }
 
 pub(crate) fn display_path_label(path: &Path) -> String {
@@ -1669,35 +1840,35 @@ fn repo_log_label(repo_id: &str) -> String {
 }
 
 fn strip_windows_device_prefix(path: &str) -> String {
-    path.strip_prefix(r"\\?\").unwrap_or(path).replace('\\', "/")
+    path.strip_prefix(r"\\?\")
+        .unwrap_or(path)
+        .replace('\\', "/")
 }
 
 async fn wait_for_shutdown_signal(shutdown_rx: &mut watch::Receiver<bool>) -> Result<()> {
     #[cfg(unix)]
     {
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .context("failed to register SIGTERM handler")?;
-    let mut sigint =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .context("failed to register SIGINT handler")?;
 
-    tokio::select! {
-        _ = sigterm.recv() => info!("received SIGTERM"),
-        _ = sigint.recv() => info!("received SIGINT"),
-        _ = shutdown_rx.changed() => info!("shutdown requested via socket"),
-    }
+        tokio::select! {
+            _ = sigterm.recv() => info!("received SIGTERM"),
+            _ = sigint.recv() => info!("received SIGINT"),
+            _ = shutdown_rx.changed() => info!("shutdown requested via socket"),
+        }
 
-    Ok(())
+        Ok(())
     }
 
     #[cfg(windows)]
     {
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => info!("received Ctrl-C"),
-        _ = shutdown_rx.changed() => info!("shutdown requested via socket"),
-    }
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("received Ctrl-C"),
+            _ = shutdown_rx.changed() => info!("shutdown requested via socket"),
+        }
 
-    Ok(())
+        Ok(())
     }
 }

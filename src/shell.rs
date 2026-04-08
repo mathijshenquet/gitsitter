@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 const HOOK_START_MARKER: &str = "# >>> gitsitter hook >>>";
 const HOOK_END_MARKER: &str = "# <<< gitsitter hook <<<";
@@ -24,7 +24,10 @@ pub fn generate_hook(shell: &str) -> Result<String> {
         "zsh" => Ok(ZSH_HOOK.to_string()),
         "fish" => Ok(FISH_HOOK.to_string()),
         "powershell" | "pwsh" => Ok(POWERSHELL_HOOK.to_string()),
-        _ => bail!("unsupported shell: {shell} (supported: {})", supported_shells().join(", ")),
+        _ => bail!(
+            "unsupported shell: {shell} (supported: {})",
+            supported_shells().join(", ")
+        ),
     }
 }
 
@@ -43,7 +46,10 @@ pub fn shell_config_path(shell: &str) -> Result<PathBuf> {
             .join("Documents")
             .join("PowerShell")
             .join("Microsoft.PowerShell_profile.ps1")),
-        _ => bail!("unsupported shell: {shell} (supported: {})", supported_shells().join(", ")),
+        _ => bail!(
+            "unsupported shell: {shell} (supported: {})",
+            supported_shells().join(", ")
+        ),
     }
 }
 
@@ -66,8 +72,7 @@ pub fn install_hook(shell: &str) -> Result<()> {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => {
-            return Err(e)
-                .with_context(|| format!("failed to read {}", config_path.display()));
+            return Err(e).with_context(|| format!("failed to read {}", config_path.display()));
         }
     };
 
@@ -79,7 +84,11 @@ pub fn install_hook(shell: &str) -> Result<()> {
         existing.find(HOOK_END_MARKER),
     ) {
         let end = end_pos + HOOK_END_MARKER.len();
-        let end = if existing[end..].starts_with('\n') { end + 1 } else { end };
+        let end = if existing[end..].starts_with('\n') {
+            end + 1
+        } else {
+            end
+        };
         let mut updated = String::with_capacity(existing.len());
         updated.push_str(&existing[..start]);
         updated.push_str(&block);
@@ -115,8 +124,7 @@ pub fn uninstall_hook(shell: &str) -> Result<()> {
         Ok(content) => content,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
-            return Err(e)
-                .with_context(|| format!("failed to read {}", config_path.display()));
+            return Err(e).with_context(|| format!("failed to read {}", config_path.display()));
         }
     };
 
@@ -250,7 +258,10 @@ mod tests {
     #[test]
     fn shell_config_path_powershell() {
         let path = shell_config_path("powershell").unwrap();
-        assert_eq!(path.file_name().unwrap(), "Microsoft.PowerShell_profile.ps1");
+        assert_eq!(
+            path.file_name().unwrap(),
+            "Microsoft.PowerShell_profile.ps1"
+        );
     }
 
     #[test]
@@ -312,7 +323,11 @@ mod tests {
         // Simulate uninstall
         let start = content.find(HOOK_START_MARKER).unwrap();
         let end = content.find(HOOK_END_MARKER).unwrap() + HOOK_END_MARKER.len();
-        let end = if content[end..].starts_with('\n') { end + 1 } else { end };
+        let end = if content[end..].starts_with('\n') {
+            end + 1
+        } else {
+            end
+        };
         let start = if start > 0 && content.as_bytes()[start - 1] == b'\n' {
             start - 1
         } else {

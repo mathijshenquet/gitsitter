@@ -54,7 +54,6 @@ impl Disabled {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Duration helpers
 // ---------------------------------------------------------------------------
@@ -109,7 +108,9 @@ fn deserialize_opt_duration<'de, D: Deserializer<'de>>(
     let v: Option<String> = Option::deserialize(de)?;
     match v {
         None => Ok(None),
-        Some(s) => parse_duration(&s).map(Some).map_err(serde::de::Error::custom),
+        Some(s) => parse_duration(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
     }
 }
 
@@ -423,14 +424,15 @@ fn load_config_toml(path: &Path) -> Result<GlobalSettings> {
     }
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
-    let raw: RawConfigToml = toml::from_str(&text).with_context(|| {
-        format!("failed to parse config file: {}", path.display())
-    })?;
+    let raw: RawConfigToml = toml::from_str(&text)
+        .with_context(|| format!("failed to parse config file: {}", path.display()))?;
     Ok(GlobalSettings {
         refresh_interval: raw.refresh_interval.unwrap_or(Duration::from_secs(60)),
         colors: raw.colors.unwrap_or(true),
         emoji: raw.emoji.unwrap_or(true),
-        notification_cooldown: raw.notification_cooldown.unwrap_or(Duration::from_secs(300)),
+        notification_cooldown: raw
+            .notification_cooldown
+            .unwrap_or(Duration::from_secs(300)),
         git_path: raw.git_path,
         watcher_debounce: raw.watcher_debounce,
         on_conflict: OnConflict::from_str_opt(raw.on_conflict.as_deref()),
@@ -462,8 +464,12 @@ fn write_trusted_hosts(path: &Path, hosts: &HashSet<String>) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, &text)
         .with_context(|| format!("failed to write temp trusted hosts: {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("failed to rename trusted hosts into place: {}", path.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "failed to rename trusted hosts into place: {}",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -477,9 +483,8 @@ fn load_repos_toml(path: &Path) -> Result<HashMap<String, RepoConfig>> {
     if text.trim().is_empty() {
         return Ok(HashMap::new());
     }
-    let raw: RawReposToml = toml::from_str(&text).with_context(|| {
-        format!("failed to parse repos file: {}", path.display())
-    })?;
+    let raw: RawReposToml = toml::from_str(&text)
+        .with_context(|| format!("failed to parse repos file: {}", path.display()))?;
     Ok(raw
         .into_iter()
         .map(|(k, v)| {
@@ -566,9 +571,7 @@ fn lock_exclusive(file: &std::fs::File) -> Result<()> {
 #[cfg(windows)]
 fn lock_exclusive(file: &std::fs::File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
     use windows_sys::Win32::System::IO::OVERLAPPED;
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
     let ok = unsafe {

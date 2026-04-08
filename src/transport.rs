@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -71,7 +71,6 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         latest_version: Option<String>,
     },
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,10 +180,7 @@ pub async fn recv_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Reques
 }
 
 /// Serialize and send a [`Response`].
-pub async fn send_response<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    resp: &Response,
-) -> Result<()> {
+pub async fn send_response<W: AsyncWrite + Unpin>(writer: &mut W, resp: &Response) -> Result<()> {
     let json = serde_json::to_vec(resp).context("failed to serialize response")?;
     send_message(writer, &json).await
 }
@@ -292,20 +288,14 @@ mod platform {
             }
         }
 
-        fn poll_flush(
-            self: Pin<&mut Self>,
-            cx: &mut TaskContext<'_>,
-        ) -> Poll<io::Result<()>> {
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
             match self.get_mut() {
                 Self::Client(stream) => Pin::new(stream).poll_flush(cx),
                 Self::Server(stream) => Pin::new(stream).poll_flush(cx),
             }
         }
 
-        fn poll_shutdown(
-            self: Pin<&mut Self>,
-            cx: &mut TaskContext<'_>,
-        ) -> Poll<io::Result<()>> {
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
             match self.get_mut() {
                 Self::Client(stream) => Pin::new(stream).poll_shutdown(cx),
                 Self::Server(stream) => Pin::new(stream).poll_shutdown(cx),
@@ -379,8 +369,8 @@ mod platform {
     }
 }
 
-pub use platform::DaemonStream;
 pub use platform::DaemonListener;
+pub use platform::DaemonStream;
 
 pub fn cleanup_endpoint(socket_path: &std::path::Path) {
     platform::cleanup_endpoint(socket_path);
@@ -399,9 +389,13 @@ pub async fn accept_connection(
     #[allow(unused)] socket_path: &std::path::Path,
 ) -> Result<DaemonStream> {
     #[cfg(unix)]
-    { platform::accept(listener).await }
+    {
+        platform::accept(listener).await
+    }
     #[cfg(windows)]
-    { platform::accept(listener, socket_path).await }
+    {
+        platform::accept(listener, socket_path).await
+    }
 }
 
 /// Quick synchronous check whether the daemon appears to be running.
@@ -416,7 +410,7 @@ pub fn is_daemon_running(socket_path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{duplex, DuplexStream};
+    use tokio::io::{DuplexStream, duplex};
 
     /// Round-trip a raw message through send/recv.
     #[tokio::test]
