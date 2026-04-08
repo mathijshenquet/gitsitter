@@ -46,7 +46,8 @@ pub fn parse_github_remote(url: &str) -> Option<GitHubRepo> {
 
     // HTTPS: https://github.com/owner/repo.git
     // Also handle http:// and ssh://git@github.com/...
-    let path = url.strip_prefix("https://github.com/")
+    let path = url
+        .strip_prefix("https://github.com/")
         .or_else(|| url.strip_prefix("http://github.com/"))
         .or_else(|| url.strip_prefix("ssh://git@github.com/"));
 
@@ -165,9 +166,10 @@ impl ForgeCache {
         {
             let cached = self.user_info.lock().unwrap();
             if let Some((ref username, ref emails, fetched_at)) = *cached
-                && fetched_at.elapsed() < USER_INFO_TTL {
-                    return Ok((username.clone(), emails.clone()));
-                }
+                && fetched_at.elapsed() < USER_INFO_TTL
+            {
+                return Ok((username.clone(), emails.clone()));
+            }
         }
 
         // Fetch username
@@ -217,11 +219,7 @@ impl ForgeCache {
 
     /// Check if the authenticated user owns a PR for the given branch
     /// (is creator or assignee).
-    pub async fn user_owns_pr(
-        &self,
-        gh_repo: &GitHubRepo,
-        branch: &str,
-    ) -> bool {
+    pub async fn user_owns_pr(&self, gh_repo: &GitHubRepo, branch: &str) -> bool {
         if !self.ensure_gh().await {
             return false;
         }
@@ -235,9 +233,10 @@ impl ForgeCache {
         {
             let cache = self.pr_cache.lock().unwrap();
             if let Some((is_owned, fetched_at)) = cache.get(&cache_key)
-                && fetched_at.elapsed() < PR_CACHE_TTL {
-                    return *is_owned;
-                }
+                && fetched_at.elapsed() < PR_CACHE_TTL
+            {
+                return *is_owned;
+            }
         }
 
         let username = match self.get_user_info().await {
@@ -264,15 +263,16 @@ impl ForgeCache {
                         .is_some_and(|l| l.eq_ignore_ascii_case(&username));
 
                     // Check assignees
-                    let is_assignee = pr["assignees"]
-                        .as_array()
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .any(|a| {
-                            a["login"]
-                                .as_str()
-                                .is_some_and(|l| l.eq_ignore_ascii_case(&username))
-                        });
+                    let is_assignee =
+                        pr["assignees"]
+                            .as_array()
+                            .unwrap_or(&vec![])
+                            .iter()
+                            .any(|a| {
+                                a["login"]
+                                    .as_str()
+                                    .is_some_and(|l| l.eq_ignore_ascii_case(&username))
+                            });
 
                     is_creator || is_assignee
                 })

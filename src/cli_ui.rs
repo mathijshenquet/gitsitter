@@ -29,7 +29,10 @@ pub fn repo_header(path: &str, opts: DisplayOpts) -> String {
 /// Format the daemon warning line.
 pub fn daemon_warning(opts: DisplayOpts) -> String {
     let icon = if opts.emoji { "\u{26A0}" } else { "!" };
-    let msg = format!("{} Daemon is not running \u{2014} start with: gitsitter daemon start", icon);
+    let msg = format!(
+        "{} Daemon is not running \u{2014} start with: gitsitter daemon start",
+        icon
+    );
     if opts.colors {
         format!("{}", msg.yellow())
     } else {

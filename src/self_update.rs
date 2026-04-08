@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 const REPO: &str = "mathijshenquet/gitsitter";
@@ -76,13 +76,14 @@ pub async fn check_for_update() -> Result<Option<String>> {
 
     // Don't check if we recently checked
     if let Some(state) = UpdateState::load(&state_path)
-        && !state.is_stale() {
-            return Ok(if is_newer(&state.latest_version, CURRENT_VERSION) {
-                Some(state.latest_version)
-            } else {
-                None
-            });
-        }
+        && !state.is_stale()
+    {
+        return Ok(if is_newer(&state.latest_version, CURRENT_VERSION) {
+            Some(state.latest_version)
+        } else {
+            None
+        });
+    }
 
     let latest = fetch_latest_version().await?;
     let now = SystemTime::now()
@@ -128,9 +129,7 @@ pub async fn self_update() -> Result<()> {
 
     let target = detect_target()?;
     let archive_name = format!("gitsitter-{target}.tar.gz");
-    let url = format!(
-        "https://github.com/{REPO}/releases/download/{latest}/{archive_name}"
-    );
+    let url = format!("https://github.com/{REPO}/releases/download/{latest}/{archive_name}");
 
     // Download to temp dir
     let tmpdir = tempfile::tempdir().context("failed to create temp dir")?;
@@ -219,7 +218,12 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
 
 fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
     let status = std::process::Command::new("tar")
-        .args(["xzf", &archive.display().to_string(), "-C", &dest.display().to_string()])
+        .args([
+            "xzf",
+            &archive.display().to_string(),
+            "-C",
+            &dest.display().to_string(),
+        ])
         .status()
         .context("failed to run tar")?;
 
