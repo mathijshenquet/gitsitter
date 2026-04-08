@@ -54,7 +54,6 @@ impl Disabled {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Duration helpers
 // ---------------------------------------------------------------------------
@@ -109,7 +108,9 @@ fn deserialize_opt_duration<'de, D: Deserializer<'de>>(
     let v: Option<String> = Option::deserialize(de)?;
     match v {
         None => Ok(None),
-        Some(s) => parse_duration(&s).map(Some).map_err(serde::de::Error::custom),
+        Some(s) => parse_duration(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
     }
 }
 
@@ -309,7 +310,6 @@ impl Default for GlobalSettings {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
@@ -414,14 +414,15 @@ fn load_config_toml(path: &Path) -> Result<GlobalSettings> {
     }
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
-    let raw: RawConfigToml = toml::from_str(&text).with_context(|| {
-        format!("failed to parse config file: {}", path.display())
-    })?;
+    let raw: RawConfigToml = toml::from_str(&text)
+        .with_context(|| format!("failed to parse config file: {}", path.display()))?;
     Ok(GlobalSettings {
         refresh_interval: raw.refresh_interval.unwrap_or(Duration::from_secs(60)),
         colors: raw.colors.unwrap_or(true),
         emoji: raw.emoji.unwrap_or(true),
-        notification_cooldown: raw.notification_cooldown.unwrap_or(Duration::from_secs(300)),
+        notification_cooldown: raw
+            .notification_cooldown
+            .unwrap_or(Duration::from_secs(300)),
         git_path: raw.git_path,
         watcher_debounce: raw.watcher_debounce,
         on_conflict: OnConflict::from_str_opt(raw.on_conflict.as_deref()),
@@ -453,8 +454,12 @@ fn write_trusted_hosts(path: &Path, hosts: &HashSet<String>) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, &text)
         .with_context(|| format!("failed to write temp trusted hosts: {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("failed to rename trusted hosts into place: {}", path.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "failed to rename trusted hosts into place: {}",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -468,9 +473,8 @@ fn load_repos_toml(path: &Path) -> Result<HashMap<String, RepoConfig>> {
     if text.trim().is_empty() {
         return Ok(HashMap::new());
     }
-    let raw: RawReposToml = toml::from_str(&text).with_context(|| {
-        format!("failed to parse repos file: {}", path.display())
-    })?;
+    let raw: RawReposToml = toml::from_str(&text)
+        .with_context(|| format!("failed to parse repos file: {}", path.display()))?;
     Ok(raw
         .into_iter()
         .map(|(k, v)| {
@@ -516,14 +520,15 @@ fn save_repos_toml(path: &Path, repos: &HashMap<String, RepoConfig>) -> Result<(
 fn check_nix_managed(path: &Path) -> Result<()> {
     if path.is_symlink()
         && let Ok(target) = std::fs::read_link(path)
-        && target.to_string_lossy().starts_with("/nix/store/") {
-            anyhow::bail!(
-                "{} is managed by nix (symlink to {}). \
+        && target.to_string_lossy().starts_with("/nix/store/")
+    {
+        anyhow::bail!(
+            "{} is managed by nix (symlink to {}). \
                  Edit your nix configuration instead.",
-                path.display(),
-                target.display()
-            );
-        }
+            path.display(),
+            target.display()
+        );
+    }
     Ok(())
 }
 
@@ -555,9 +560,7 @@ fn lock_exclusive(file: &std::fs::File) -> Result<()> {
 #[cfg(windows)]
 fn lock_exclusive(file: &std::fs::File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
     use windows_sys::Win32::System::IO::OVERLAPPED;
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
     let ok = unsafe {
@@ -649,13 +652,15 @@ impl UserConfig {
         in_repo_config: Option<&InRepoConfig>,
     ) -> Duration {
         if let Some(repo_cfg) = self.repos.get(repo_path)
-            && let Some(d) = repo_cfg.refresh_interval {
-                return d;
-            }
+            && let Some(d) = repo_cfg.refresh_interval
+        {
+            return d;
+        }
         if let Some(irc) = in_repo_config
-            && let Some(d) = irc.refresh_interval {
-                return d;
-            }
+            && let Some(d) = irc.refresh_interval
+        {
+            return d;
+        }
         self.global.refresh_interval
     }
 }
@@ -718,4 +723,368 @@ pub fn extract_host(remote_url: &str) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- Duration parsing ---
+
+    #[test]
+    fn parse_duration_seconds() {
+        assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn parse_duration_minutes() {
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn parse_duration_hours() {
+        assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(7200));
+    }
+
+    #[test]
+    fn parse_duration_milliseconds() {
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn parse_duration_with_whitespace() {
+        assert_eq!(parse_duration("  10s  ").unwrap(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn parse_duration_empty_fails() {
+        assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn parse_duration_unknown_unit_fails() {
+        assert!(parse_duration("10d").is_err());
+    }
+
+    #[test]
+    fn parse_duration_no_number_fails() {
+        assert!(parse_duration("s").is_err());
+    }
+
+    // --- Duration formatting ---
+
+    #[test]
+    fn format_duration_seconds() {
+        assert_eq!(format_duration(&Duration::from_secs(45)), "45s");
+    }
+
+    #[test]
+    fn format_duration_minutes() {
+        assert_eq!(format_duration(&Duration::from_secs(120)), "2m");
+    }
+
+    #[test]
+    fn format_duration_hours() {
+        assert_eq!(format_duration(&Duration::from_secs(7200)), "2h");
+    }
+
+    #[test]
+    fn format_duration_millis() {
+        assert_eq!(format_duration(&Duration::from_millis(500)), "500ms");
+    }
+
+    // --- Roundtrip ---
+
+    #[test]
+    fn duration_roundtrip() {
+        for input in &["30s", "5m", "2h", "100ms"] {
+            let d = parse_duration(input).unwrap();
+            let formatted = format_duration(&d);
+            assert_eq!(&formatted, input);
+        }
+    }
+
+    // --- Config TOML parsing ---
+
+    #[test]
+    fn parse_config_toml_defaults() {
+        let toml_str = "";
+        let raw: RawConfigToml = toml::from_str(toml_str).unwrap();
+        assert!(raw.refresh_interval.is_none());
+        assert!(raw.colors.is_none());
+    }
+
+    #[test]
+    fn parse_config_toml_with_values() {
+        let toml_str = r#"
+            refresh_interval = "30s"
+            colors = false
+            emoji = false
+            on_conflict = "revert"
+        "#;
+        let raw: RawConfigToml = toml::from_str(toml_str).unwrap();
+        assert_eq!(raw.refresh_interval, Some(Duration::from_secs(30)));
+        assert_eq!(raw.colors, Some(false));
+        assert_eq!(raw.emoji, Some(false));
+        assert_eq!(raw.on_conflict, Some("revert".to_string()));
+    }
+
+    // --- Repos TOML parsing ---
+
+    #[test]
+    fn parse_repos_toml() {
+        let toml_str = r#"
+            ["/path/to/repo"]
+            refresh_interval = "2m"
+
+            ["/path/to/other"]
+            disabled = true
+        "#;
+        let raw: RawReposToml = toml::from_str(toml_str).unwrap();
+        assert_eq!(raw.len(), 2);
+        assert_eq!(
+            raw["/path/to/repo"].refresh_interval,
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(raw["/path/to/other"].disabled, Some(Disabled::All(true)));
+    }
+
+    #[test]
+    fn parse_repos_disabled_remotes() {
+        let toml_str = r#"
+            ["/path/to/repo"]
+            disabled = ["upstream", "fork"]
+        "#;
+        let raw: RawReposToml = toml::from_str(toml_str).unwrap();
+        let disabled = raw["/path/to/repo"].disabled.as_ref().unwrap();
+        assert_eq!(
+            *disabled,
+            Disabled::Remotes(vec!["upstream".into(), "fork".into()])
+        );
+    }
+
+    // --- OnConflict ---
+
+    #[test]
+    fn on_conflict_from_str() {
+        assert_eq!(OnConflict::from_str_opt(None), OnConflict::Auto);
+        assert_eq!(OnConflict::from_str_opt(Some("revert")), OnConflict::Revert);
+        assert_eq!(OnConflict::from_str_opt(Some("leave")), OnConflict::Leave);
+        assert_eq!(
+            OnConflict::from_str_opt(Some("resolve-agent")),
+            OnConflict::ResolveAgent
+        );
+        assert_eq!(OnConflict::from_str_opt(Some("bogus")), OnConflict::Auto);
+    }
+
+    #[test]
+    fn on_conflict_effective_without_agent() {
+        assert_eq!(
+            OnConflict::Auto.effective(false),
+            EffectiveConflictAction::Leave
+        );
+        assert_eq!(
+            OnConflict::Revert.effective(false),
+            EffectiveConflictAction::Revert
+        );
+        assert_eq!(
+            OnConflict::ResolveAgent.effective(false),
+            EffectiveConflictAction::Leave
+        );
+    }
+
+    #[test]
+    fn on_conflict_effective_with_agent() {
+        assert_eq!(
+            OnConflict::Auto.effective(true),
+            EffectiveConflictAction::ResolveAgent
+        );
+        assert_eq!(
+            OnConflict::Revert.effective(true),
+            EffectiveConflictAction::Revert
+        );
+        assert_eq!(
+            OnConflict::ResolveAgent.effective(true),
+            EffectiveConflictAction::ResolveAgent
+        );
+    }
+
+    // --- Disabled ---
+
+    #[test]
+    fn disabled_all() {
+        let d = Disabled::All(true);
+        assert!(d.is_repo_disabled());
+        assert!(d.is_remote_disabled("origin"));
+    }
+
+    #[test]
+    fn disabled_none() {
+        let d = Disabled::All(false);
+        assert!(!d.is_repo_disabled());
+        assert!(!d.is_remote_disabled("origin"));
+    }
+
+    #[test]
+    fn disabled_specific_remotes() {
+        let d = Disabled::Remotes(vec!["upstream".into()]);
+        assert!(!d.is_repo_disabled());
+        assert!(!d.is_remote_disabled("origin"));
+        assert!(d.is_remote_disabled("upstream"));
+    }
+
+    // --- Remote trust ---
+
+    #[test]
+    fn empty_url_is_trusted() {
+        let config = UserConfig::default();
+        assert!(config.is_remote_trusted(""));
+    }
+
+    #[test]
+    fn file_url_is_trusted() {
+        let config = UserConfig::default();
+        assert!(config.is_remote_trusted("file:///path/to/repo"));
+    }
+
+    #[test]
+    fn untrusted_host() {
+        let config = UserConfig::default();
+        assert!(!config.is_remote_trusted("https://github.com/user/repo"));
+    }
+
+    #[test]
+    fn trusted_host() {
+        let mut config = UserConfig::default();
+        config.trusted_hosts.insert("github.com".to_string());
+        assert!(config.is_remote_trusted("https://github.com/user/repo"));
+        assert!(config.is_remote_trusted("git@github.com:user/repo.git"));
+    }
+
+    // --- Refresh interval priority ---
+
+    #[test]
+    fn effective_refresh_interval_defaults() {
+        let config = UserConfig::default();
+        assert_eq!(
+            config.effective_refresh_interval("some/repo", None),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn effective_refresh_interval_in_repo_overrides_global() {
+        let config = UserConfig::default();
+        let in_repo = InRepoConfig {
+            refresh_interval: Some(Duration::from_secs(30)),
+        };
+        assert_eq!(
+            config.effective_refresh_interval("some/repo", Some(&in_repo)),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn effective_refresh_interval_user_overrides_in_repo() {
+        let mut config = UserConfig::default();
+        config.repos.insert(
+            "some/repo".to_string(),
+            RepoConfig {
+                refresh_interval: Some(Duration::from_secs(10)),
+                ..Default::default()
+            },
+        );
+        let in_repo = InRepoConfig {
+            refresh_interval: Some(Duration::from_secs(30)),
+        };
+        // User per-repo (10s) should win over in-repo (30s)
+        assert_eq!(
+            config.effective_refresh_interval("some/repo", Some(&in_repo)),
+            Duration::from_secs(10)
+        );
+    }
+
+    // --- extract_host ---
+
+    #[test]
+    fn extract_host_https() {
+        assert_eq!(
+            extract_host("https://github.com/user/repo"),
+            Some("github.com".into())
+        );
+    }
+
+    #[test]
+    fn extract_host_ssh_scheme() {
+        assert_eq!(
+            extract_host("ssh://git@github.com/user/repo"),
+            Some("github.com".into())
+        );
+    }
+
+    #[test]
+    fn extract_host_scp() {
+        assert_eq!(
+            extract_host("git@github.com:user/repo.git"),
+            Some("github.com".into())
+        );
+    }
+
+    #[test]
+    fn extract_host_git_scheme() {
+        assert_eq!(
+            extract_host("git://example.com/repo"),
+            Some("example.com".into())
+        );
+    }
+
+    // --- Config loading from temp files ---
+
+    fn test_paths(dir: &std::path::Path) -> Paths {
+        Paths {
+            config_file: dir.join("config.toml"),
+            repos_file: dir.join("repos.toml"),
+            trusted_hosts_file: dir.join("trusted_hosts"),
+            socket_path: dir.join("socket"),
+            daemon_pid: dir.join("pid"),
+            daemon_log: dir.join("daemon.log"),
+        }
+    }
+
+    #[test]
+    fn load_config_missing_files_gives_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = test_paths(dir.path());
+        let config = UserConfig::load(&paths).unwrap();
+        assert_eq!(config.global.refresh_interval, Duration::from_secs(60));
+        assert!(config.trusted_hosts.is_empty());
+        assert!(config.repos.is_empty());
+    }
+
+    #[test]
+    fn load_config_from_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "refresh_interval = \"30s\"\ncolors = false\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("trusted_hosts"), "github.com\ngitlab.com\n").unwrap();
+        std::fs::write(
+            dir.path().join("repos.toml"),
+            "[\"repo-a\"]\nrefresh_interval = \"5m\"\n",
+        )
+        .unwrap();
+
+        let paths = test_paths(dir.path());
+        let config = UserConfig::load(&paths).unwrap();
+        assert_eq!(config.global.refresh_interval, Duration::from_secs(30));
+        assert!(!config.global.colors);
+        assert!(config.trusted_hosts.contains("github.com"));
+        assert!(config.trusted_hosts.contains("gitlab.com"));
+        assert_eq!(
+            config.repos["repo-a"].refresh_interval,
+            Some(Duration::from_secs(300))
+        );
+    }
 }
