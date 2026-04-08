@@ -5,7 +5,7 @@ use tempfile::TempDir;
 
 use gitsitter::config::{self, InRepoConfig, RepoConfig, UserConfig};
 use gitsitter::paths::Paths;
-use gitsitter::transport::{self, BranchStatusData, Request, Response};
+use gitsitter::transport::{self, Request, Response};
 
 // ===========================================================================
 // Helper functions
@@ -631,7 +631,7 @@ mod git_ops_tests {
         let bare_dir = tmp.path().join("bare");
         let work_dir = tmp.path().join("work");
 
-        let bare = create_bare_repo(&bare_dir);
+        let _bare = create_bare_repo(&bare_dir);
         let work = clone_repo(&bare_dir, &work_dir);
 
         // Configure user email in the working repo
