@@ -1394,11 +1394,11 @@ pub async fn handle_daemon_stop(paths: &Paths) -> Result<()> {
     #[cfg(windows)]
     {
         let service_result = sc_command(&["stop", crate::service::SERVICE_NAME]).await;
-        if let Ok(output) = service_result {
-            if output.status.success() {
-                println!("\u{2713} Daemon stopped");
-                return Ok(());
-            }
+        if let Ok(output) = service_result
+            && output.status.success()
+        {
+            println!("\u{2713} Daemon stopped");
+            return Ok(());
         }
     }
 
@@ -1477,6 +1477,7 @@ fn build_daemon_path() -> String {
 
 async fn install_daemon() -> Result<()> {
     let exe = std::env::current_exe()?;
+    #[allow(unused_variables)]
     let daemon_path = build_daemon_path();
     let state_dir = dirs::state_dir()
         .or_else(dirs::data_local_dir)
