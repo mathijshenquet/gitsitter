@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher, Event};
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
 
@@ -25,10 +25,7 @@ const WATCH_SUBDIRS: &[&str] = &["refs/heads", "refs/remotes"];
 const WATCH_FILES: &[&str] = &["HEAD"];
 
 /// Run the file watcher loop. Spawned as a tokio task from the daemon.
-pub async fn run(
-    daemon: Arc<Daemon>,
-    mut shutdown_rx: watch::Receiver<bool>,
-) {
+pub async fn run(daemon: Arc<Daemon>, mut shutdown_rx: watch::Receiver<bool>) {
     let debounce = daemon
         .config
         .read()
@@ -41,8 +38,8 @@ pub async fn run(
 
     // Create the notify watcher — events are forwarded into the tokio channel.
     let tx = event_tx.clone();
-    let mut watcher: RecommendedWatcher = match notify::recommended_watcher(
-        move |res: Result<Event, notify::Error>| {
+    let mut watcher: RecommendedWatcher =
+        match notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             if let Ok(event) = res {
                 // Only react to actual writes — ignore Access events
                 // (e.g. VSCode's git extension constantly reads .git/HEAD).
@@ -54,15 +51,14 @@ pub async fn run(
                     let _ = tx.send((path.clone(), event.clone()));
                 }
             }
-        },
-    ) {
-        Ok(w) => w,
-        Err(e) => {
-            error!("🔍  failed to create file watcher: {:#}", e);
-            warn!("file watching disabled — falling back to polling only");
-            return;
-        }
-    };
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                error!("🔍  failed to create file watcher: {:#}", e);
+                warn!("file watching disabled — falling back to polling only");
+                return;
+            }
+        };
 
     // Track which repos we're watching and per-repo debounce timers.
     let mut watched_repos: HashMap<String, Vec<PathBuf>> = HashMap::new();
@@ -70,15 +66,14 @@ pub async fn run(
 
     // Watch config.toml for changes.
     let config_path = daemon.paths.config_file.clone();
-    if let Some(config_dir) = config_path.parent() {
-        if config_dir.exists() {
+    if let Some(config_dir) = config_path.parent()
+        && config_dir.exists() {
             if let Err(e) = watcher.watch(config_dir, RecursiveMode::NonRecursive) {
                 warn!("🔍  failed to watch config dir: {:#}", e);
             } else {
                 info!("👁️  watching config {}", config_path.display());
             }
         }
-    }
 
     // Initial setup: watch all currently registered repos.
     {
@@ -151,11 +146,10 @@ pub async fn run(
                 // Check for newly registered repos that aren't watched yet.
                 let repos = daemon.repos.read().await;
                 for repo_id in repos.keys() {
-                    if !watched_repos.contains_key(repo_id) {
-                        if let Err(e) = add_repo_watches(&mut watcher, repo_id, &mut watched_repos) {
+                    if !watched_repos.contains_key(repo_id)
+                        && let Err(e) = add_repo_watches(&mut watcher, repo_id, &mut watched_repos) {
                             warn!("🔍  failed to watch {}: {:#}", repo_id, e);
                         }
-                    }
                 }
                 // Remove watches for repos that are no longer registered.
                 let to_remove: Vec<String> = watched_repos
@@ -230,7 +224,10 @@ fn add_repo_watches(
         }
     }
 
-    info!("👁️  watching {}", crate::daemon::display_path_label(&git_dir));
+    info!(
+        "👁️  watching {}",
+        crate::daemon::display_path_label(&git_dir)
+    );
     watched.insert(repo_id.to_string(), paths);
     Ok(())
 }
@@ -279,7 +276,10 @@ fn describe_change(path: &Path) -> String {
         return "HEAD changed".to_string();
     }
 
-    format!("git metadata changed ({})", crate::daemon::display_path_label(path))
+    format!(
+        "git metadata changed ({})",
+        crate::daemon::display_path_label(path)
+    )
 }
 
 /// Check if a path is under refs/remotes/.
@@ -302,4 +302,3 @@ fn resolve_repo_id_for_path(
     }
     None
 }
-

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::process::Command as TokioCommand;
 
 // ---------------------------------------------------------------------------
@@ -82,8 +82,9 @@ pub fn discover_repo_id(path: &Path) -> Result<PathBuf> {
     match common.canonicalize() {
         Ok(canonical) => Ok(canonical),
         Err(_) if cfg!(windows) => Ok(common),
-        Err(err) => Err(err)
-            .with_context(|| format!("failed to canonicalize {}", common.display())),
+        Err(err) => {
+            Err(err).with_context(|| format!("failed to canonicalize {}", common.display()))
+        }
     }
 }
 
@@ -95,10 +96,7 @@ pub fn get_display_path(repo_id: &Path) -> Result<PathBuf> {
         Ok(workdir.to_path_buf())
     } else {
         // Bare repo or similar — fall back to the git dir's parent.
-        Ok(repo_id
-            .parent()
-            .unwrap_or(repo_id)
-            .to_path_buf())
+        Ok(repo_id.parent().unwrap_or(repo_id).to_path_buf())
     }
 }
 
@@ -131,13 +129,11 @@ pub fn get_all_remote_urls(repo_id: &Path) -> Result<HashMap<String, String>> {
     let remote_names = repo.remotes()?;
     let mut map = HashMap::new();
     for i in 0..remote_names.len() {
-        if let Some(name) = remote_names.get(i) {
-            if let Ok(remote) = repo.find_remote(name) {
-                if let Some(url) = remote.url() {
+        if let Some(name) = remote_names.get(i)
+            && let Ok(remote) = repo.find_remote(name)
+                && let Some(url) = remote.url() {
                     map.insert(name.to_string(), url.to_string());
                 }
-            }
-        }
     }
     Ok(map)
 }
@@ -169,13 +165,8 @@ pub fn list_branches(repo_id: &Path) -> Result<Vec<RepoBranch>> {
 
         let (upstream_name, remote_oid) = match branch.upstream() {
             Ok(upstream) => {
-                let uname = upstream
-                    .name()?
-                    .map(|s| s.to_string());
-                let uoid = upstream
-                    .get()
-                    .target()
-                    .map(|oid| oid.to_string());
+                let uname = upstream.name()?.map(|s| s.to_string());
+                let uoid = upstream.get().target().map(|oid| oid.to_string());
                 (uname, uoid)
             }
             Err(_) => (None, None),
@@ -185,18 +176,14 @@ pub fn list_branches(repo_id: &Path) -> Result<Vec<RepoBranch>> {
         let cfg = repo.config().ok();
         let remote = cfg
             .as_ref()
-            .and_then(|c| {
-                c.get_string(&format!("branch.{}.remote", name)).ok()
-            })
+            .and_then(|c| c.get_string(&format!("branch.{}.remote", name)).ok())
             .unwrap_or_else(|| "origin".to_string());
 
         // Read branch.<name>.merge (e.g. "refs/heads/bar") to get the remote-side
         // branch name. Falls back to the local branch name.
         let remote_ref = cfg
             .as_ref()
-            .and_then(|c| {
-                c.get_string(&format!("branch.{}.merge", name)).ok()
-            })
+            .and_then(|c| c.get_string(&format!("branch.{}.merge", name)).ok())
             .and_then(|m| m.strip_prefix("refs/heads/").map(|s| s.to_string()))
             .unwrap_or_else(|| name.clone());
 
@@ -264,16 +251,13 @@ pub fn list_worktrees(repo_id: &Path) -> Result<Vec<WorktreeInfo>> {
 
     // Main worktree
     if let Some(workdir) = repo.workdir() {
-        let head_branch = repo
-            .head()
-            .ok()
-            .and_then(|r| {
-                if r.is_branch() {
-                    r.shorthand().map(|s| s.to_string())
-                } else {
-                    None
-                }
-            });
+        let head_branch = repo.head().ok().and_then(|r| {
+            if r.is_branch() {
+                r.shorthand().map(|s| s.to_string())
+            } else {
+                None
+            }
+        });
         let is_clean = !is_worktree_dirty(workdir).unwrap_or(true);
         result.push(WorktreeInfo {
             path: workdir.to_string_lossy().to_string(),
@@ -298,16 +282,13 @@ pub fn list_worktrees(repo_id: &Path) -> Result<Vec<WorktreeInfo>> {
             Ok(r) => r,
             Err(_) => continue,
         };
-        let head_branch = wt_repo
-            .head()
-            .ok()
-            .and_then(|r| {
-                if r.is_branch() {
-                    r.shorthand().map(|s| s.to_string())
-                } else {
-                    None
-                }
-            });
+        let head_branch = wt_repo.head().ok().and_then(|r| {
+            if r.is_branch() {
+                r.shorthand().map(|s| s.to_string())
+            } else {
+                None
+            }
+        });
         let is_clean = !is_worktree_dirty(wt_path).unwrap_or(true);
         result.push(WorktreeInfo {
             path: wt_path.to_string_lossy().to_string(),
@@ -401,13 +382,10 @@ pub async fn git_fetch(
     let mut cmd = git_command(repo_path, git_path);
     cmd.arg("fetch").arg(remote);
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        cmd.output(),
-    )
-    .await
-    .with_context(|| format!("git fetch timed out after {}s", timeout_secs))?
-    .context("failed to spawn git fetch")?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+        .await
+        .with_context(|| format!("git fetch timed out after {}s", timeout_secs))?
+        .context("failed to spawn git fetch")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -424,15 +402,15 @@ pub async fn git_stash(
     timeout_secs: u64,
 ) -> Result<bool> {
     let mut cmd = git_command(worktree_path, git_path);
-    cmd.arg("stash").arg("push").arg("-m").arg("gitsitter: auto-stash for sync");
+    cmd.arg("stash")
+        .arg("push")
+        .arg("-m")
+        .arg("gitsitter: auto-stash for sync");
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        cmd.output(),
-    )
-    .await
-    .with_context(|| format!("git stash timed out after {}s", timeout_secs))?
-    .context("failed to spawn git stash")?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+        .await
+        .with_context(|| format!("git stash timed out after {}s", timeout_secs))?
+        .context("failed to spawn git stash")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -454,13 +432,10 @@ pub async fn git_stash_pop(
     let mut cmd = git_command(worktree_path, git_path);
     cmd.arg("stash").arg("pop");
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        cmd.output(),
-    )
-    .await
-    .with_context(|| format!("git stash pop timed out after {}s", timeout_secs))?
-    .context("failed to spawn git stash pop")?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+        .await
+        .with_context(|| format!("git stash pop timed out after {}s", timeout_secs))?
+        .context("failed to spawn git stash pop")?;
 
     Ok(output.status.success())
 }
@@ -475,13 +450,10 @@ pub async fn git_ff_merge(
     let mut cmd = git_command(worktree_path, git_path);
     cmd.arg("merge").arg("--ff-only").arg(upstream_ref);
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        cmd.output(),
-    )
-    .await
-    .with_context(|| format!("git merge --ff-only timed out after {}s", timeout_secs))?
-    .context("failed to spawn git merge")?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+        .await
+        .with_context(|| format!("git merge --ff-only timed out after {}s", timeout_secs))?
+        .context("failed to spawn git merge")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -611,7 +583,11 @@ pub fn is_branch_owned_by_user(repo_id: &Path, branch_name: &str) -> Result<bool
     let repo = git2::Repository::open(repo_id)
         .with_context(|| format!("failed to open repo at {}", repo_id.display()))?;
 
-    let user_email = match repo.config().ok().and_then(|c| c.get_string("user.email").ok()) {
+    let user_email = match repo
+        .config()
+        .ok()
+        .and_then(|c| c.get_string("user.email").ok())
+    {
         Some(e) => e,
         None => return Ok(false),
     };
@@ -645,19 +621,17 @@ pub async fn is_branch_owned_by_user_with_forge(
     // 2. Check committer email against forge emails
     if gh_repo.is_some() {
         let repo = git2::Repository::open(repo_id)?;
-        if let Some(committer_email) = get_upstream_committer_email(&repo, branch_name)? {
-            if forge_cache.email_matches_user(&committer_email).await {
+        if let Some(committer_email) = get_upstream_committer_email(&repo, branch_name)?
+            && forge_cache.email_matches_user(&committer_email).await {
                 return Ok(true);
             }
-        }
     }
 
     // 3. Check PR ownership
-    if let Some(ref gh_repo) = gh_repo {
-        if forge_cache.user_owns_pr(gh_repo, branch_name).await {
+    if let Some(ref gh_repo) = gh_repo
+        && forge_cache.user_owns_pr(gh_repo, branch_name).await {
             return Ok(true);
         }
-    }
 
     Ok(false)
 }
@@ -685,9 +659,7 @@ fn get_upstream_committer_email(
         .find_commit(upstream_oid)
         .with_context(|| format!("failed to find upstream commit {}", upstream_oid))?;
 
-    Ok(Some(
-        commit.committer().email().unwrap_or("").to_string(),
-    ))
+    Ok(Some(commit.committer().email().unwrap_or("").to_string()))
 }
 
 /// Rebase the current branch onto its upstream.
@@ -703,13 +675,10 @@ pub async fn git_rebase(
     let mut cmd = git_command(worktree_path, git_path);
     cmd.arg("rebase").arg(upstream_ref);
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        cmd.output(),
-    )
-    .await
-    .with_context(|| format!("git rebase timed out after {}s", timeout_secs))?
-    .context("failed to spawn git rebase")?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+        .await
+        .with_context(|| format!("git rebase timed out after {}s", timeout_secs))?
+        .context("failed to spawn git rebase")?;
 
     Ok(output.status.success())
 }
@@ -722,11 +691,7 @@ pub async fn git_rebase_abort(
 ) -> Result<()> {
     let mut cmd = git_command(worktree_path, git_path);
     cmd.arg("rebase").arg("--abort");
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        cmd.output(),
-    )
-    .await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output()).await;
     Ok(())
 }
 
@@ -772,13 +737,10 @@ pub async fn run_resolve_agent(
         _ => unreachable!(),
     }
 
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        cmd.output(),
-    )
-    .await
-    .with_context(|| format!("resolve agent timed out after {}s", timeout_secs))?
-    .with_context(|| format!("failed to spawn resolve agent '{}'", bin))?;
+    let output = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), cmd.output())
+        .await
+        .with_context(|| format!("resolve agent timed out after {}s", timeout_secs))?
+        .with_context(|| format!("failed to spawn resolve agent '{}'", bin))?;
 
     let agent_output = String::from_utf8_lossy(&output.stdout).to_string();
 
@@ -804,9 +766,15 @@ pub async fn git_update_ref(
     git_path: Option<&str>,
 ) -> Result<()> {
     let mut cmd = git_command(repo_path, git_path);
-    cmd.arg("update-ref").arg(ref_name).arg(new_oid).arg(old_oid);
+    cmd.arg("update-ref")
+        .arg(ref_name)
+        .arg(new_oid)
+        .arg(old_oid);
 
-    let output = cmd.output().await.context("failed to spawn git update-ref")?;
+    let output = cmd
+        .output()
+        .await
+        .context("failed to spawn git update-ref")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

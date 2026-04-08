@@ -29,7 +29,10 @@ pub fn repo_header(path: &str, opts: DisplayOpts) -> String {
 /// Format the daemon warning line.
 pub fn daemon_warning(opts: DisplayOpts) -> String {
     let icon = if opts.emoji { "\u{26A0}" } else { "!" };
-    let msg = format!("{} Daemon is not running \u{2014} start with: gitsitter daemon start", icon);
+    let msg = format!(
+        "{} Daemon is not running \u{2014} start with: gitsitter daemon start",
+        icon
+    );
     if opts.colors {
         format!("{}", msg.yellow())
     } else {
@@ -38,8 +41,9 @@ pub fn daemon_warning(opts: DisplayOpts) -> String {
 }
 
 /// Format a success prefix icon.
-pub fn success_icon(opts: DisplayOpts) -> &'static str {
-    if opts.emoji { "\u{2713}" } else { "\u{2713}" }
+pub fn success_icon(_opts: DisplayOpts) -> &'static str {
+    // TODO: use an emoji variant when opts.emoji is true
+    "\u{2713}"
 }
 
 /// Format a celebration prefix (for register).

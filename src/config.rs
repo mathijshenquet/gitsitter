@@ -54,7 +54,6 @@ impl Disabled {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Duration helpers
 // ---------------------------------------------------------------------------
@@ -64,8 +63,8 @@ fn parse_duration(s: &str) -> Result<Duration> {
     if s.is_empty() {
         anyhow::bail!("empty duration string");
     }
-    let (num, unit) = if s.ends_with("ms") {
-        (&s[..s.len() - 2], "ms")
+    let (num, unit) = if let Some(stripped) = s.strip_suffix("ms") {
+        (stripped, "ms")
     } else {
         (&s[..s.len() - 1], &s[s.len() - 1..])
     };
@@ -85,9 +84,9 @@ fn format_duration(d: &Duration) -> String {
         let ms = d.as_millis();
         return format!("{ms}ms");
     }
-    if secs % 3600 == 0 {
+    if secs.is_multiple_of(3600) {
         format!("{}h", secs / 3600)
-    } else if secs % 60 == 0 {
+    } else if secs.is_multiple_of(60) {
         format!("{}m", secs / 60)
     } else {
         format!("{secs}s")
@@ -109,7 +108,9 @@ fn deserialize_opt_duration<'de, D: Deserializer<'de>>(
     let v: Option<String> = Option::deserialize(de)?;
     match v {
         None => Ok(None),
-        Some(s) => parse_duration(&s).map(Some).map_err(serde::de::Error::custom),
+        Some(s) => parse_duration(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
     }
 }
 
@@ -194,7 +195,7 @@ struct RawInRepoConfig {
 // Public data structures
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct UserConfig {
     pub global: GlobalSettings,
     pub trusted_hosts: HashSet<String>,
@@ -309,16 +310,6 @@ impl Default for GlobalSettings {
     }
 }
 
-impl Default for UserConfig {
-    fn default() -> Self {
-        Self {
-            global: GlobalSettings::default(),
-            trusted_hosts: HashSet::new(),
-            repos: HashMap::new(),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Loading
 // ---------------------------------------------------------------------------
@@ -423,14 +414,15 @@ fn load_config_toml(path: &Path) -> Result<GlobalSettings> {
     }
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read config file: {}", path.display()))?;
-    let raw: RawConfigToml = toml::from_str(&text).with_context(|| {
-        format!("failed to parse config file: {}", path.display())
-    })?;
+    let raw: RawConfigToml = toml::from_str(&text)
+        .with_context(|| format!("failed to parse config file: {}", path.display()))?;
     Ok(GlobalSettings {
         refresh_interval: raw.refresh_interval.unwrap_or(Duration::from_secs(60)),
         colors: raw.colors.unwrap_or(true),
         emoji: raw.emoji.unwrap_or(true),
-        notification_cooldown: raw.notification_cooldown.unwrap_or(Duration::from_secs(300)),
+        notification_cooldown: raw
+            .notification_cooldown
+            .unwrap_or(Duration::from_secs(300)),
         git_path: raw.git_path,
         watcher_debounce: raw.watcher_debounce,
         on_conflict: OnConflict::from_str_opt(raw.on_conflict.as_deref()),
@@ -462,8 +454,12 @@ fn write_trusted_hosts(path: &Path, hosts: &HashSet<String>) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, &text)
         .with_context(|| format!("failed to write temp trusted hosts: {}", tmp.display()))?;
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("failed to rename trusted hosts into place: {}", path.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "failed to rename trusted hosts into place: {}",
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -477,9 +473,8 @@ fn load_repos_toml(path: &Path) -> Result<HashMap<String, RepoConfig>> {
     if text.trim().is_empty() {
         return Ok(HashMap::new());
     }
-    let raw: RawReposToml = toml::from_str(&text).with_context(|| {
-        format!("failed to parse repos file: {}", path.display())
-    })?;
+    let raw: RawReposToml = toml::from_str(&text)
+        .with_context(|| format!("failed to parse repos file: {}", path.display()))?;
     Ok(raw
         .into_iter()
         .map(|(k, v)| {
@@ -523,17 +518,16 @@ fn save_repos_toml(path: &Path, repos: &HashMap<String, RepoConfig>) -> Result<(
 
 /// Check if a file is a nix-store symlink and bail if so.
 fn check_nix_managed(path: &Path) -> Result<()> {
-    if path.is_symlink() {
-        if let Ok(target) = std::fs::read_link(path) {
-            if target.to_string_lossy().starts_with("/nix/store/") {
-                anyhow::bail!(
-                    "{} is managed by nix (symlink to {}). \
+    if path.is_symlink()
+        && let Ok(target) = std::fs::read_link(path)
+        && target.to_string_lossy().starts_with("/nix/store/")
+    {
+        anyhow::bail!(
+            "{} is managed by nix (symlink to {}). \
                      Edit your nix configuration instead.",
-                    path.display(),
-                    target.display()
-                );
-            }
-        }
+            path.display(),
+            target.display()
+        );
     }
     Ok(())
 }
@@ -566,9 +560,7 @@ fn lock_exclusive(file: &std::fs::File) -> Result<()> {
 #[cfg(windows)]
 fn lock_exclusive(file: &std::fs::File) -> Result<()> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
     use windows_sys::Win32::System::IO::OVERLAPPED;
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
     let ok = unsafe {
@@ -641,7 +633,7 @@ impl UserConfig {
         self.repos
             .get(repo_path)
             .and_then(|r| r.disabled.as_ref())
-            .map_or(false, |d| d.is_remote_disabled(remote_name))
+            .is_some_and(|d| d.is_remote_disabled(remote_name))
     }
 
     /// Check if a repo is explicitly disabled in user config.
@@ -649,7 +641,7 @@ impl UserConfig {
         self.repos
             .get(repo_path)
             .and_then(|r| r.disabled.as_ref())
-            .map_or(false, |d| d.is_repo_disabled())
+            .is_some_and(|d| d.is_repo_disabled())
     }
 
     /// Get the effective refresh interval for a repo.
@@ -659,15 +651,15 @@ impl UserConfig {
         repo_path: &str,
         in_repo_config: Option<&InRepoConfig>,
     ) -> Duration {
-        if let Some(repo_cfg) = self.repos.get(repo_path) {
-            if let Some(d) = repo_cfg.refresh_interval {
-                return d;
-            }
+        if let Some(repo_cfg) = self.repos.get(repo_path)
+            && let Some(d) = repo_cfg.refresh_interval
+        {
+            return d;
         }
-        if let Some(irc) = in_repo_config {
-            if let Some(d) = irc.refresh_interval {
-                return d;
-            }
+        if let Some(irc) = in_repo_config
+            && let Some(d) = irc.refresh_interval
+        {
+            return d;
         }
         self.global.refresh_interval
     }

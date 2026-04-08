@@ -50,10 +50,8 @@ pub fn parse_github_remote(url: &str) -> Option<GitHubRepo> {
         Some(rest)
     } else if let Some(rest) = url.strip_prefix("http://github.com/") {
         Some(rest)
-    } else if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
-        Some(rest)
     } else {
-        None
+        url.strip_prefix("ssh://git@github.com/")
     };
 
     if let Some(path) = path {
@@ -112,6 +110,8 @@ async fn gh_api(endpoint: &str) -> Result<serde_json::Value> {
 // Forge cache
 // ---------------------------------------------------------------------------
 
+type PrCacheMap = HashMap<(String, String, String), (bool, Instant)>;
+
 /// Cached forge data, shared across sync cycles.
 pub struct ForgeCache {
     /// Whether `gh` is available. Checked once at first use.
@@ -121,11 +121,17 @@ pub struct ForgeCache {
     user_info: Mutex<Option<(String, Vec<String>, Instant)>>,
     /// Cached PR ownership lookups.
     /// Key: (owner, repo, branch) -> (is_owned, fetched_at)
-    pr_cache: Mutex<HashMap<(String, String, String), (bool, Instant)>>,
+    pr_cache: Mutex<PrCacheMap>,
 }
 
 const USER_INFO_TTL: Duration = Duration::from_secs(3600); // 1 hour
 const PR_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
+
+impl Default for ForgeCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ForgeCache {
     pub fn new() -> Self {
@@ -162,10 +168,10 @@ impl ForgeCache {
         // Check cache
         {
             let cached = self.user_info.lock().unwrap();
-            if let Some((ref username, ref emails, fetched_at)) = *cached {
-                if fetched_at.elapsed() < USER_INFO_TTL {
-                    return Ok((username.clone(), emails.clone()));
-                }
+            if let Some((ref username, ref emails, fetched_at)) = *cached
+                && fetched_at.elapsed() < USER_INFO_TTL
+            {
+                return Ok((username.clone(), emails.clone()));
             }
         }
 
@@ -216,11 +222,7 @@ impl ForgeCache {
 
     /// Check if the authenticated user owns a PR for the given branch
     /// (is creator or assignee).
-    pub async fn user_owns_pr(
-        &self,
-        gh_repo: &GitHubRepo,
-        branch: &str,
-    ) -> bool {
+    pub async fn user_owns_pr(&self, gh_repo: &GitHubRepo, branch: &str) -> bool {
         if !self.ensure_gh().await {
             return false;
         }
@@ -233,10 +235,10 @@ impl ForgeCache {
         );
         {
             let cache = self.pr_cache.lock().unwrap();
-            if let Some((is_owned, fetched_at)) = cache.get(&cache_key) {
-                if fetched_at.elapsed() < PR_CACHE_TTL {
-                    return *is_owned;
-                }
+            if let Some((is_owned, fetched_at)) = cache.get(&cache_key)
+                && fetched_at.elapsed() < PR_CACHE_TTL
+            {
+                return *is_owned;
             }
         }
 
@@ -264,15 +266,16 @@ impl ForgeCache {
                         .is_some_and(|l| l.eq_ignore_ascii_case(&username));
 
                     // Check assignees
-                    let is_assignee = pr["assignees"]
-                        .as_array()
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .any(|a| {
-                            a["login"]
-                                .as_str()
-                                .is_some_and(|l| l.eq_ignore_ascii_case(&username))
-                        });
+                    let is_assignee =
+                        pr["assignees"]
+                            .as_array()
+                            .unwrap_or(&vec![])
+                            .iter()
+                            .any(|a| {
+                                a["login"]
+                                    .as_str()
+                                    .is_some_and(|l| l.eq_ignore_ascii_case(&username))
+                            });
 
                     is_creator || is_assignee
                 })

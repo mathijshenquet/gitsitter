@@ -6,17 +6,15 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
-use comfy_table::{presets, Cell, Color, ContentArrangement, Table};
+use comfy_table::{Cell, Color, ContentArrangement, Table, presets};
 
 use crate::cli_ui::{self, DisplayOpts};
 use crate::config::{self, UserConfig};
 use crate::git_ops;
 use crate::paths::Paths;
-use crate::transport::{
-    self, DaemonStream, Request, Response,
-};
+use crate::transport::{self, DaemonStream, Request, Response};
 
 /// Load display options from user config (best-effort, defaults if config fails).
 fn load_display_opts(paths: &Paths) -> DisplayOpts {
@@ -77,11 +75,10 @@ fn display_path(p: &str) -> String {
 /// Convert an ISO 8601 / RFC 3339 timestamp string to a human-readable relative
 /// time like "30s ago", "2m ago", "1h ago", "3d ago".
 fn format_relative_time(timestamp: &str) -> String {
-    let parsed = DateTime::parse_from_rfc3339(timestamp)
-        .or_else(|_| {
-            chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S")
-                .map(|naive| naive.and_utc().fixed_offset())
-        });
+    let parsed = DateTime::parse_from_rfc3339(timestamp).or_else(|_| {
+        chrono::NaiveDateTime::parse_from_str(timestamp, "%Y-%m-%d %H:%M:%S")
+            .map(|naive| naive.and_utc().fixed_offset())
+    });
     let dt = match parsed {
         Ok(dt) => dt,
         Err(_) => return timestamp.to_string(),
@@ -110,8 +107,7 @@ fn format_relative_time(timestamp: &str) -> String {
 /// Resolve the repo path for the current directory.
 fn resolve_cwd_repo_path() -> Result<String> {
     let cwd = std::env::current_dir().context("failed to get current directory")?;
-    let repo_id = git_ops::discover_repo_id(&cwd)
-        .context("not inside a git repository")?;
+    let repo_id = git_ops::discover_repo_id(&cwd).context("not inside a git repository")?;
     Ok(repo_id.to_string_lossy().to_string())
 }
 
@@ -128,7 +124,8 @@ fn resolve_path_or_cwd(path: Option<&str>) -> Result<String> {
         }
         None => std::env::current_dir()?,
     };
-    let canonical = p.canonicalize()
+    let canonical = p
+        .canonicalize()
         .with_context(|| format!("path does not exist: {}", p.display()))?;
     Ok(canonical.to_string_lossy().to_string())
 }
@@ -228,7 +225,11 @@ pub async fn handle_status(paths: &Paths, global: bool) -> Result<()> {
     Ok(())
 }
 
-async fn handle_status_global(paths: &Paths, opts: DisplayOpts, daemon_running: bool) -> Result<()> {
+async fn handle_status_global(
+    paths: &Paths,
+    opts: DisplayOpts,
+    daemon_running: bool,
+) -> Result<()> {
     if !daemon_running {
         let cfg = UserConfig::load(paths)?;
         if cfg.repos.is_empty() {
@@ -240,8 +241,15 @@ async fn handle_status_global(paths: &Paths, opts: DisplayOpts, daemon_running: 
             let mut table = global_status_table();
             for (path, repo_cfg) in &cfg.repos {
                 let dp = display_path(path);
-                let disabled = repo_cfg.disabled.as_ref().map_or(false, |d| d.is_repo_disabled());
-                let sync = if disabled { "never synced, disabled" } else { "never synced" };
+                let disabled = repo_cfg
+                    .disabled
+                    .as_ref()
+                    .is_some_and(|d| d.is_repo_disabled());
+                let sync = if disabled {
+                    "never synced, disabled"
+                } else {
+                    "never synced"
+                };
                 table.add_row(global_status_row(&dp, sync, "", opts));
             }
             println!("{table}");
@@ -304,11 +312,7 @@ fn global_status_row(path: &str, sync: &str, status: &str, opts: DisplayOpts) ->
             Cell::new(status),
         ]
     } else {
-        vec![
-            Cell::new(path),
-            Cell::new(sync),
-            Cell::new(status),
-        ]
+        vec![Cell::new(path), Cell::new(sync), Cell::new(status)]
     }
 }
 
@@ -317,16 +321,22 @@ fn print_untrusted_remote_warnings(repo_id: &Path, cfg: &UserConfig, opts: Displ
     let remote_urls = git_ops::get_all_remote_urls(repo_id).unwrap_or_default();
     let repo_id_str = repo_id.to_string_lossy();
     for (name, url) in &remote_urls {
-        if !cfg.is_remote_trusted(url) {
-            if let Some(host) = config::extract_host(url) {
-                println!("  {} remote '{}' ({}) is not trusted — won't sync",
-                    cli_ui::warning_icon(opts), name, host);
+        if !cfg.is_remote_trusted(url)
+            && let Some(host) = config::extract_host(url) {
+                println!(
+                    "  {} remote '{}' ({}) is not trusted — won't sync",
+                    cli_ui::warning_icon(opts),
+                    name,
+                    host
+                );
                 println!("  Add with: gitsitter trust {}", host);
             }
-        }
         if cfg.is_remote_disabled(&repo_id_str, name) {
-            println!("  {} remote '{}' is disabled",
-                cli_ui::warning_icon(opts), name);
+            println!(
+                "  {} remote '{}' is disabled",
+                cli_ui::warning_icon(opts),
+                name
+            );
         }
     }
 }
@@ -360,7 +370,11 @@ fn print_repo_status(data: &transport::StatusData, opts: DisplayOpts) {
         for (name, url) in &data.remote_urls {
             let trust = if data.untrusted_remotes.contains(name) {
                 let host = crate::config::extract_host(url).unwrap_or_else(|| url.to_string());
-                format!("  {} untrusted \u{2014} run 'gitsitter trust {}'", cli_ui::warning_icon(opts), host)
+                format!(
+                    "  {} untrusted \u{2014} run 'gitsitter trust {}'",
+                    cli_ui::warning_icon(opts),
+                    host
+                )
             } else if data.disabled_remotes.contains(name) {
                 format!("  {} disabled", cli_ui::warning_icon(opts))
             } else {
@@ -404,12 +418,18 @@ pub async fn handle_config(paths: &Paths) -> Result<()> {
         println!("Per-repo overrides:");
         for (path, repo_cfg) in &cfg.repos {
             let dp = display_path(path);
-            let marker = if current_repo.as_deref() == Some(path.as_str()) { " ←" } else { "" };
+            let marker = if current_repo.as_deref() == Some(path.as_str()) {
+                " ←"
+            } else {
+                ""
+            };
             println!("  {}:{}", dp, marker);
             if let Some(d) = &repo_cfg.disabled {
                 match d {
                     config::Disabled::All(true) => println!("    disabled: true"),
-                    config::Disabled::Remotes(remotes) => println!("    disabled remotes: {:?}", remotes),
+                    config::Disabled::Remotes(remotes) => {
+                        println!("    disabled remotes: {:?}", remotes)
+                    }
                     _ => {}
                 }
             }
@@ -479,10 +499,16 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
 
     // Get status (current repo or global)
     let req = if global {
-        Request::Status { repo_path: None, global: true }
+        Request::Status {
+            repo_path: None,
+            global: true,
+        }
     } else {
         let repo_path = resolve_cwd_repo_path()?;
-        Request::Status { repo_path: Some(repo_path), global: false }
+        Request::Status {
+            repo_path: Some(repo_path),
+            global: false,
+        }
     };
     let resp = roundtrip(&mut stream, &req).await?;
 
@@ -497,11 +523,10 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                     repo_path: Some(repo.display_path.clone()),
                     global: false,
                 };
-                if let Ok(resp) = roundtrip(&mut stream, &req).await {
-                    if let Response::Status { data } = resp {
+                if let Ok(resp) = roundtrip(&mut stream, &req).await
+                    && let Response::Status { data } = resp {
                         all.push(data);
                     }
-                }
             }
             all
         }
@@ -524,13 +549,20 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                 "diverged" => "diverged (last remote commit by someone else)",
                 "diverged_yours" => "diverged (auto-rebase failed, resolve manually)",
                 "pending_dirty" => "dirty worktree — commit or stash to sync",
-                "merge_conflict" => "merge conflict — resolve manually or run `gitsitter auto-resolve`",
+                "merge_conflict" => {
+                    "merge conflict — resolve manually or run `gitsitter auto-resolve`"
+                }
                 _ => continue,
             };
 
             any_issues = true;
             println!();
-            println!("{}: {} — {}", cli_ui::repo_header(&dp, opts), cli_ui::sync_pair(&b.name, upstream), action);
+            println!(
+                "{}: {} — {}",
+                cli_ui::repo_header(&dp, opts),
+                cli_ui::sync_pair(&b.name, upstream),
+                action
+            );
 
             match b.status.as_str() {
                 "local_ahead" => {
@@ -540,7 +572,7 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                     match prompt_choice(3) {
                         1 => {
                             let branch_remote = upstream.split('/').next().unwrap_or("origin");
-                            let remote_ref = upstream.splitn(2, '/').nth(1).unwrap_or(&b.name);
+                            let remote_ref = upstream.split_once('/').map(|x| x.1).unwrap_or(&b.name);
                             match git_ops::git_push(
                                 &repo_id_path,
                                 branch_remote,
@@ -548,7 +580,9 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                                 remote_ref,
                                 None,
                                 30,
-                            ).await {
+                            )
+                            .await
+                            {
                                 Ok(git_ops::PushResult::Success) => {
                                     println!("  {} Pushed {}", cli_ui::success_icon(opts), b.name);
                                 }
@@ -563,18 +597,27 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                             if !new_name.is_empty() {
                                 // Create branch at current HEAD, then reset original to upstream
                                 let result = std::process::Command::new("git")
-                                    .arg("-C").arg(&data.repo_id)
+                                    .arg("-C")
+                                    .arg(&data.repo_id)
                                     .args(["branch", &new_name])
                                     .output();
                                 match result {
                                     Ok(o) if o.status.success() => {
-                                        println!("  {} Created branch {}", cli_ui::success_icon(opts), new_name);
+                                        println!(
+                                            "  {} Created branch {}",
+                                            cli_ui::success_icon(opts),
+                                            new_name
+                                        );
                                         // Reset original branch to upstream
                                         if let Some(remote_oid) = &b.upstream {
                                             let _ = std::process::Command::new("git")
-                                                .arg("-C").arg(&data.repo_id)
-                                                .args(["update-ref", &format!("refs/heads/{}", b.name)])
-                                                .arg(remote_oid.split('/').last().unwrap_or("HEAD"))
+                                                .arg("-C")
+                                                .arg(&data.repo_id)
+                                                .args([
+                                                    "update-ref",
+                                                    &format!("refs/heads/{}", b.name),
+                                                ])
+                                                .arg(remote_oid.split('/').next_back().unwrap_or("HEAD"))
                                                 .output();
                                         }
                                     }
@@ -596,14 +639,10 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                     match prompt_choice(3) {
                         1 => {
                             let branch_remote = upstream.split('/').next().unwrap_or("origin");
-                            let remote_ref = upstream.splitn(2, '/').nth(1).unwrap_or(&b.name);
+                            let remote_ref = upstream.split_once('/').map(|x| x.1).unwrap_or(&b.name);
                             let upstream_ref = format!("{}/{}", branch_remote, remote_ref);
-                            match git_ops::git_rebase(
-                                &repo_id_path,
-                                &upstream_ref,
-                                None,
-                                30,
-                            ).await {
+                            match git_ops::git_rebase(&repo_id_path, &upstream_ref, None, 30).await
+                            {
                                 Ok(true) => {
                                     // Rebase succeeded, now push
                                     match git_ops::git_push(
@@ -613,21 +652,33 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                                         remote_ref,
                                         None,
                                         30,
-                                    ).await {
+                                    )
+                                    .await
+                                    {
                                         Ok(git_ops::PushResult::Success) => {
-                                            println!("  {} Rebased and pushed {}", cli_ui::success_icon(opts), b.name);
+                                            println!(
+                                                "  {} Rebased and pushed {}",
+                                                cli_ui::success_icon(opts),
+                                                b.name
+                                            );
                                         }
                                         _ => {
-                                            println!("  Rebase succeeded but push failed. Resolve manually.");
+                                            println!(
+                                                "  Rebase succeeded but push failed. Resolve manually."
+                                            );
                                         }
                                     }
                                 }
                                 Ok(false) => {
-                                    let _ = git_ops::git_rebase_abort(&repo_id_path, None, 30).await;
-                                    println!("  Rebase had conflicts and was aborted. Resolve manually.");
+                                    let _ =
+                                        git_ops::git_rebase_abort(&repo_id_path, None, 30).await;
+                                    println!(
+                                        "  Rebase had conflicts and was aborted. Resolve manually."
+                                    );
                                 }
                                 Err(e) => {
-                                    let _ = git_ops::git_rebase_abort(&repo_id_path, None, 30).await;
+                                    let _ =
+                                        git_ops::git_rebase_abort(&repo_id_path, None, 30).await;
                                     println!("  Rebase failed: {:#}. Resolve manually.", e);
                                 }
                             }
@@ -636,12 +687,17 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                             let new_name = prompt_string("  Branch name: ");
                             if !new_name.is_empty() {
                                 let result = std::process::Command::new("git")
-                                    .arg("-C").arg(&data.repo_id)
+                                    .arg("-C")
+                                    .arg(&data.repo_id)
                                     .args(["branch", &new_name])
                                     .output();
                                 match result {
                                     Ok(o) if o.status.success() => {
-                                        println!("  {} Created branch {}", cli_ui::success_icon(opts), new_name);
+                                        println!(
+                                            "  {} Created branch {}",
+                                            cli_ui::success_icon(opts),
+                                            new_name
+                                        );
                                     }
                                     _ => {
                                         println!("  Failed to create branch.");
@@ -678,17 +734,11 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
 
                             // Determine what sync operation is needed
                             let upstream_ref = format!("{}/{}", branch_remote, b.name);
-                            let sync_ok = match git_ops::analyze_merge(
-                                &repo_id_path,
-                                &b.name,
-                            ) {
+                            let sync_ok = match git_ops::analyze_merge(&repo_id_path, &b.name) {
                                 Ok(git_ops::MergeAnalysis::FastForward) => {
-                                    git_ops::git_ff_merge(
-                                        &repo_id_path,
-                                        &upstream_ref,
-                                        None,
-                                        30,
-                                    ).await.is_ok()
+                                    git_ops::git_ff_merge(&repo_id_path, &upstream_ref, None, 30)
+                                        .await
+                                        .is_ok()
                                 }
                                 Ok(git_ops::MergeAnalysis::Diverged) => {
                                     match git_ops::git_rebase(
@@ -696,10 +746,14 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                                         &upstream_ref,
                                         None,
                                         30,
-                                    ).await {
+                                    )
+                                    .await
+                                    {
                                         Ok(true) => true,
                                         _ => {
-                                            let _ = git_ops::git_rebase_abort(&repo_id_path, None, 30).await;
+                                            let _ =
+                                                git_ops::git_rebase_abort(&repo_id_path, None, 30)
+                                                    .await;
                                             false
                                         }
                                     }
@@ -714,20 +768,32 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                             match git_ops::git_stash_pop(&repo_id_path, None, 30).await {
                                 Ok(true) => {
                                     if sync_ok {
-                                        println!("  {} Synced and restored working changes", cli_ui::success_icon(opts));
+                                        println!(
+                                            "  {} Synced and restored working changes",
+                                            cli_ui::success_icon(opts)
+                                        );
                                     } else {
-                                        println!("  Sync failed but working changes restored. Resolve manually.");
+                                        println!(
+                                            "  Sync failed but working changes restored. Resolve manually."
+                                        );
                                     }
                                 }
                                 Ok(false) => {
                                     if sync_ok {
-                                        println!("  Synced, but stash pop has conflicts — resolve with `git stash pop` or `git stash drop`");
+                                        println!(
+                                            "  Synced, but stash pop has conflicts — resolve with `git stash pop` or `git stash drop`"
+                                        );
                                     } else {
-                                        println!("  Sync failed and stash pop has conflicts. Resolve manually.");
+                                        println!(
+                                            "  Sync failed and stash pop has conflicts. Resolve manually."
+                                        );
                                     }
                                 }
                                 Err(e) => {
-                                    println!("  Stash pop failed: {:#}. Your changes are in `git stash list`.", e);
+                                    println!(
+                                        "  Stash pop failed: {:#}. Your changes are in `git stash list`.",
+                                        e
+                                    );
                                 }
                             }
                         }
@@ -738,7 +804,8 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                 }
                 "merge_conflict" => {
                     let cfg = UserConfig::load(paths).ok();
-                    let has_agent = cfg.as_ref()
+                    let has_agent = cfg
+                        .as_ref()
                         .and_then(|c| c.global.resolve_agent.as_ref())
                         .is_some();
 
@@ -748,7 +815,12 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
                         println!("  [3] Skip (resolve manually)");
                         match prompt_choice(3) {
                             1 => {
-                                run_resolve_agent_interactive(&repo_id_path, cfg.as_ref().unwrap(), opts).await;
+                                run_resolve_agent_interactive(
+                                    &repo_id_path,
+                                    cfg.as_ref().unwrap(),
+                                    opts,
+                                )
+                                .await;
                             }
                             2 => {
                                 let _ = git_ops::git_rebase_abort(&repo_id_path, None, 30).await;
@@ -790,24 +862,31 @@ pub async fn handle_resolve(paths: &Paths, global: bool) -> Result<()> {
 }
 
 /// Shared code path for running the resolve agent — used by both `resolve` and `auto-resolve`.
-async fn run_resolve_agent_interactive(
-    repo_path: &Path,
-    config: &UserConfig,
-    opts: DisplayOpts,
-) {
+async fn run_resolve_agent_interactive(repo_path: &Path, config: &UserConfig, opts: DisplayOpts) {
     let agent = config.global.resolve_agent.as_deref().unwrap_or("claude");
     let agent_path = config.global.resolve_agent_path.as_deref();
 
     println!("  Running resolve agent '{}'...", agent);
     match git_ops::run_resolve_agent(repo_path, agent, agent_path, 180).await {
         Ok(result) if result.completed => {
-            println!("  {} Conflicts resolved by agent", cli_ui::success_icon(opts));
+            println!(
+                "  {} Conflicts resolved by agent",
+                cli_ui::success_icon(opts)
+            );
         }
         Ok(result) => {
             println!("  Agent did not fully resolve conflicts.");
             if !result.agent_output.is_empty() {
                 // Surface last few lines of agent output
-                for line in result.agent_output.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev() {
+                for line in result
+                    .agent_output
+                    .lines()
+                    .rev()
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
                     println!("  | {}", line);
                 }
             }
@@ -864,11 +943,10 @@ fn prompt_choice(max: usize) -> usize {
         if io::stdin().read_line(&mut input).is_err() {
             return max; // default to skip on error
         }
-        if let Ok(n) = input.trim().parse::<usize>() {
-            if n >= 1 && n <= max {
+        if let Ok(n) = input.trim().parse::<usize>()
+            && n >= 1 && n <= max {
                 return n;
             }
-        }
         println!("  Please enter a number between 1 and {}", max);
     }
 }
@@ -882,7 +960,12 @@ fn prompt_string(prompt: &str) -> String {
     input.trim().to_string()
 }
 
-pub async fn handle_disable(paths: &Paths, remote: Option<String>, all: bool, purge: bool) -> Result<()> {
+pub async fn handle_disable(
+    paths: &Paths,
+    remote: Option<String>,
+    all: bool,
+    purge: bool,
+) -> Result<()> {
     let opts = load_display_opts(paths);
     let repo_path = resolve_cwd_repo_path()?;
     let repo_id = git_ops::discover_repo_id(Path::new(&repo_path))?;
@@ -950,8 +1033,16 @@ pub async fn handle_untrust(paths: &Paths, host: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn handle_log(paths: &Paths, global: bool, follow: bool, path: Option<String>) -> Result<()> {
-    let log_dir = paths.daemon_log.parent().context("daemon_log has no parent")?;
+pub async fn handle_log(
+    paths: &Paths,
+    global: bool,
+    follow: bool,
+    path: Option<String>,
+) -> Result<()> {
+    let log_dir = paths
+        .daemon_log
+        .parent()
+        .context("daemon_log has no parent")?;
 
     // Find all daemon.log files (current + rotated daily files)
     let mut log_files: Vec<_> = std::fs::read_dir(log_dir)
@@ -981,7 +1072,8 @@ pub async fn handle_log(paths: &Paths, global: bool, follow: bool, path: Option<
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
         match git_ops::discover_repo_id(&target) {
             Ok(repo_id) => {
-                let label = repo_id.to_string_lossy()
+                let label = repo_id
+                    .to_string_lossy()
                     .trim_end_matches(['/', '\\'])
                     .to_string();
                 Some(label)
@@ -1081,8 +1173,8 @@ pub async fn handle_sync(paths: &Paths, all: bool) -> Result<()> {
 pub async fn handle_register(paths: &Paths, path: Option<String>) -> Result<()> {
     let opts = load_display_opts(paths);
     let repo_path = resolve_path_or_cwd(path.as_deref())?;
-    let repo_id = git_ops::discover_repo_id(Path::new(&repo_path))
-        .context("not a git repository")?;
+    let repo_id =
+        git_ops::discover_repo_id(Path::new(&repo_path)).context("not a git repository")?;
     let repo_id_str = repo_id.to_string_lossy().to_string();
 
     UserConfig::update_repo(paths, &repo_id_str, |_| {})?;
@@ -1120,7 +1212,10 @@ pub async fn handle_daemon_status(paths: &Paths) -> Result<()> {
                     println!("  Repos watched: {}", repos_watched);
                     if let Some(v) = latest_version {
                         println!();
-                        println!("  Update available: {v} (current: v{})", crate::self_update::current_version());
+                        println!(
+                            "  Update available: {v} (current: v{})",
+                            crate::self_update::current_version()
+                        );
                         println!("  Run 'gitsitter self-update' to update.");
                     }
                 }
@@ -1188,10 +1283,10 @@ pub async fn handle_daemon_start(paths: &Paths) -> Result<()> {
     // Try platform service manager first
     #[cfg(target_os = "macos")]
     {
-        let plist_path = dirs::home_dir()
-            .map(|h| h.join("Library/LaunchAgents/com.gitsitter.daemon.plist"));
-        if let Some(ref p) = plist_path {
-            if p.exists() {
+        let plist_path =
+            dirs::home_dir().map(|h| h.join("Library/LaunchAgents/com.gitsitter.daemon.plist"));
+        if let Some(ref p) = plist_path
+            && p.exists() {
                 let domain_target = format!("gui/{}", unsafe { libc::getuid() });
                 let result = tokio::process::Command::new("launchctl")
                     .args(["bootstrap", &domain_target, &p.display().to_string()])
@@ -1199,17 +1294,15 @@ pub async fn handle_daemon_start(paths: &Paths) -> Result<()> {
                     .stderr(std::process::Stdio::piped())
                     .status()
                     .await;
-                if let Ok(status) = result {
-                    if status.success() {
+                if let Ok(status) = result
+                    && status.success() {
                         if wait_for_daemon_ready(paths, std::time::Duration::from_secs(3)).await {
                             println!("\u{2713} Daemon started via launchd");
                             return Ok(());
                         }
                         bail!("launchd accepted the job, but the daemon socket did not appear");
                     }
-                }
             }
-        }
     }
 
     #[cfg(target_os = "linux")]
@@ -1237,7 +1330,9 @@ pub async fn handle_daemon_start(paths: &Paths) -> Result<()> {
 
     #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
     {
-        eprintln!("warning: no supported Unix service manager configured on this platform; starting detached daemon directly");
+        eprintln!(
+            "warning: no supported Unix service manager configured on this platform; starting detached daemon directly"
+        );
     }
 
     #[cfg(windows)]
@@ -1315,14 +1410,13 @@ pub async fn handle_daemon_stop(paths: &Paths) -> Result<()> {
 
 pub async fn handle_daemon_restart(paths: &Paths) -> Result<()> {
     // Stop if running
-    if transport::is_daemon_running(&paths.socket_path) {
-        if let Ok(mut stream) = transport::connect_to_daemon(&paths.socket_path).await {
+    if transport::is_daemon_running(&paths.socket_path)
+        && let Ok(mut stream) = transport::connect_to_daemon(&paths.socket_path).await {
             let req = Request::Shutdown;
             let _ = roundtrip(&mut stream, &req).await;
             // Give it a moment to shut down
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-    }
     // Start
     handle_daemon_start(paths).await
 }
@@ -1345,8 +1439,8 @@ fn build_daemon_path() -> String {
 
     let mut dirs = Vec::new();
     for tool in ["git", "ssh", "gh", "claude"] {
-        if let Ok(output) = std::process::Command::new(WHICH_CMD).arg(tool).output() {
-            if output.status.success() {
+        if let Ok(output) = std::process::Command::new(WHICH_CMD).arg(tool).output()
+            && output.status.success() {
                 // `where.exe` may return multiple lines; take the first
                 let stdout = std::str::from_utf8(&output.stdout).unwrap_or("");
                 let line = stdout.lines().next().unwrap_or("").trim();
@@ -1357,7 +1451,6 @@ fn build_daemon_path() -> String {
                     }
                 }
             }
-        }
     }
     if dirs.is_empty() {
         #[cfg(not(windows))]
@@ -1408,7 +1501,10 @@ async fn install_daemon() -> Result<()> {
                 "launchctl bootstrap failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
-            println!("Run manually: launchctl bootstrap {domain} {}", plist_path.display());
+            println!(
+                "Run manually: launchctl bootstrap {domain} {}",
+                plist_path.display()
+            );
         }
     }
 
@@ -1477,8 +1573,9 @@ pub async fn handle_install(component: Option<String>, shell_name: Option<String
         "shell" | "hooks" => {
             let sh = match &shell_name {
                 Some(s) => s.clone(),
-                None => crate::shell::detect_shell()
-                    .context("could not detect shell, specify with: gitsitter install shell <name>")?,
+                None => crate::shell::detect_shell().context(
+                    "could not detect shell, specify with: gitsitter install shell <name>",
+                )?,
             };
             crate::shell::install_hook(&sh)?;
             println!("Shell hook installed for {sh}");
@@ -1489,15 +1586,19 @@ pub async fn handle_install(component: Option<String>, shell_name: Option<String
         "all" => {
             let sh = match &shell_name {
                 Some(s) => s.clone(),
-                None => crate::shell::detect_shell()
-                    .context("could not detect shell, specify with: gitsitter install shell <name>")?,
+                None => crate::shell::detect_shell().context(
+                    "could not detect shell, specify with: gitsitter install shell <name>",
+                )?,
             };
             crate::shell::install_hook(&sh)?;
             println!("Shell hook installed for {sh}");
             println!();
             install_daemon().await?;
         }
-        _ => bail!("unknown component: {}. Use 'shell', 'daemon', or 'all'", comp),
+        _ => bail!(
+            "unknown component: {}. Use 'shell', 'daemon', or 'all'",
+            comp
+        ),
     }
     Ok(())
 }
@@ -1574,8 +1675,7 @@ pub async fn handle_uninstall(component: Option<String>) -> Result<()> {
     let comp = component.as_deref().unwrap_or("all");
     match comp {
         "shell" | "hooks" => {
-            let sh = crate::shell::detect_shell()
-                .unwrap_or_else(|| "bash".to_string());
+            let sh = crate::shell::detect_shell().unwrap_or_else(|| "bash".to_string());
             crate::shell::uninstall_hook(&sh)?;
             println!("Shell hook removed for {sh}");
         }
@@ -1583,14 +1683,16 @@ pub async fn handle_uninstall(component: Option<String>) -> Result<()> {
             uninstall_daemon().await?;
         }
         "all" => {
-            let sh = crate::shell::detect_shell()
-                .unwrap_or_else(|| "bash".to_string());
+            let sh = crate::shell::detect_shell().unwrap_or_else(|| "bash".to_string());
             crate::shell::uninstall_hook(&sh)?;
             println!("Shell hook removed for {sh}");
             println!();
             uninstall_daemon().await?;
         }
-        _ => bail!("unknown component: {}. Use 'shell', 'daemon', or 'all'", comp),
+        _ => bail!(
+            "unknown component: {}. Use 'shell', 'daemon', or 'all'",
+            comp
+        ),
     }
     Ok(())
 }
@@ -1634,12 +1736,23 @@ pub async fn handle_prompt(paths: &Paths) -> Result<()> {
         if data.newly_registered {
             let remote_names: Vec<&str> = data.remote_urls.keys().map(|s| s.as_str()).collect();
             if remote_names.is_empty() {
-                println!("gitsitter: Registered repo \u{1F4E6} {}, syncing tracking branches", dp);
+                println!(
+                    "gitsitter: Registered repo \u{1F4E6} {}, syncing tracking branches",
+                    dp
+                );
             } else {
-                println!("gitsitter: Registered repo \u{1F4E6} {}, syncing tracking branches on {}", dp, remote_names.join(", "));
+                println!(
+                    "gitsitter: Registered repo \u{1F4E6} {}, syncing tracking branches on {}",
+                    dp,
+                    remote_names.join(", ")
+                );
             }
             for name in &data.untrusted_remotes {
-                let url = data.remote_urls.get(name).map(|s| s.as_str()).unwrap_or("?");
+                let url = data
+                    .remote_urls
+                    .get(name)
+                    .map(|s| s.as_str())
+                    .unwrap_or("?");
                 let host = crate::config::extract_host(url).unwrap_or_else(|| url.to_string());
                 println!(
                     "gitsitter: \u{26A0}\u{FE0F} remote '{}' at {} not trusted \u{2014} run 'gitsitter trust {}' to enable syncing",
@@ -1687,7 +1800,9 @@ pub async fn handle_prompt(paths: &Paths) -> Result<()> {
                 "push_rejected" | "auth_failed" | "network_error" | "push_blocked_hook_timeout" => {
                     issues.push(format!(
                         "gitsitter: \u{1F4E6} {} {} sync error ({})",
-                        dp, pair, b.status.replace('_', " ")
+                        dp,
+                        pair,
+                        b.status.replace('_', " ")
                     ));
                 }
                 _ => continue,
