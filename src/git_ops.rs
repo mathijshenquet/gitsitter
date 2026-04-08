@@ -131,13 +131,11 @@ pub fn get_all_remote_urls(repo_id: &Path) -> Result<HashMap<String, String>> {
     let remote_names = repo.remotes()?;
     let mut map = HashMap::new();
     for i in 0..remote_names.len() {
-        if let Some(name) = remote_names.get(i) {
-            if let Ok(remote) = repo.find_remote(name) {
-                if let Some(url) = remote.url() {
-                    map.insert(name.to_string(), url.to_string());
-                }
+        if let Some(name) = remote_names.get(i)
+            && let Ok(remote) = repo.find_remote(name)
+            && let Some(url) = remote.url() {
+                map.insert(name.to_string(), url.to_string());
             }
-        }
     }
     Ok(map)
 }
@@ -645,19 +643,17 @@ pub async fn is_branch_owned_by_user_with_forge(
     // 2. Check committer email against forge emails
     if gh_repo.is_some() {
         let repo = git2::Repository::open(repo_id)?;
-        if let Some(committer_email) = get_upstream_committer_email(&repo, branch_name)? {
-            if forge_cache.email_matches_user(&committer_email).await {
+        if let Some(committer_email) = get_upstream_committer_email(&repo, branch_name)?
+            && forge_cache.email_matches_user(&committer_email).await {
                 return Ok(true);
             }
-        }
     }
 
     // 3. Check PR ownership
-    if let Some(ref gh_repo) = gh_repo {
-        if forge_cache.user_owns_pr(gh_repo, branch_name).await {
+    if let Some(ref gh_repo) = gh_repo
+        && forge_cache.user_owns_pr(gh_repo, branch_name).await {
             return Ok(true);
         }
-    }
 
     Ok(false)
 }

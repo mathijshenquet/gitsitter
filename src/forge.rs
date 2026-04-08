@@ -46,15 +46,9 @@ pub fn parse_github_remote(url: &str) -> Option<GitHubRepo> {
 
     // HTTPS: https://github.com/owner/repo.git
     // Also handle http:// and ssh://git@github.com/...
-    let path = if let Some(rest) = url.strip_prefix("https://github.com/") {
-        Some(rest)
-    } else if let Some(rest) = url.strip_prefix("http://github.com/") {
-        Some(rest)
-    } else if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
-        Some(rest)
-    } else {
-        None
-    };
+    let path = url.strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("http://github.com/"))
+        .or_else(|| url.strip_prefix("ssh://git@github.com/"));
 
     if let Some(path) = path {
         let path = path.strip_suffix(".git").unwrap_or(path);
@@ -112,6 +106,8 @@ async fn gh_api(endpoint: &str) -> Result<serde_json::Value> {
 // Forge cache
 // ---------------------------------------------------------------------------
 
+type PrCacheMap = HashMap<(String, String, String), (bool, Instant)>;
+
 /// Cached forge data, shared across sync cycles.
 pub struct ForgeCache {
     /// Whether `gh` is available. Checked once at first use.
@@ -121,11 +117,17 @@ pub struct ForgeCache {
     user_info: Mutex<Option<(String, Vec<String>, Instant)>>,
     /// Cached PR ownership lookups.
     /// Key: (owner, repo, branch) -> (is_owned, fetched_at)
-    pr_cache: Mutex<HashMap<(String, String, String), (bool, Instant)>>,
+    pr_cache: Mutex<PrCacheMap>,
 }
 
 const USER_INFO_TTL: Duration = Duration::from_secs(3600); // 1 hour
 const PR_CACHE_TTL: Duration = Duration::from_secs(300); // 5 minutes
+
+impl Default for ForgeCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ForgeCache {
     pub fn new() -> Self {
@@ -162,11 +164,10 @@ impl ForgeCache {
         // Check cache
         {
             let cached = self.user_info.lock().unwrap();
-            if let Some((ref username, ref emails, fetched_at)) = *cached {
-                if fetched_at.elapsed() < USER_INFO_TTL {
+            if let Some((ref username, ref emails, fetched_at)) = *cached
+                && fetched_at.elapsed() < USER_INFO_TTL {
                     return Ok((username.clone(), emails.clone()));
                 }
-            }
         }
 
         // Fetch username
@@ -233,11 +234,10 @@ impl ForgeCache {
         );
         {
             let cache = self.pr_cache.lock().unwrap();
-            if let Some((is_owned, fetched_at)) = cache.get(&cache_key) {
-                if fetched_at.elapsed() < PR_CACHE_TTL {
+            if let Some((is_owned, fetched_at)) = cache.get(&cache_key)
+                && fetched_at.elapsed() < PR_CACHE_TTL {
                     return *is_owned;
                 }
-            }
         }
 
         let username = match self.get_user_info().await {

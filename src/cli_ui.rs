@@ -38,8 +38,8 @@ pub fn daemon_warning(opts: DisplayOpts) -> String {
 }
 
 /// Format a success prefix icon.
-pub fn success_icon(opts: DisplayOpts) -> &'static str {
-    if opts.emoji { "\u{2713}" } else { "\u{2713}" }
+pub fn success_icon(_opts: DisplayOpts) -> &'static str {
+    "\u{2713}"
 }
 
 /// Format a celebration prefix (for register).

@@ -75,15 +75,14 @@ pub async fn check_for_update() -> Result<Option<String>> {
     let state_path = update_state_path();
 
     // Don't check if we recently checked
-    if let Some(state) = UpdateState::load(&state_path) {
-        if !state.is_stale() {
+    if let Some(state) = UpdateState::load(&state_path)
+        && !state.is_stale() {
             return Ok(if is_newer(&state.latest_version, CURRENT_VERSION) {
                 Some(state.latest_version)
             } else {
                 None
             });
         }
-    }
 
     let latest = fetch_latest_version().await?;
     let now = SystemTime::now()

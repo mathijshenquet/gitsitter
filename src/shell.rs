@@ -168,13 +168,11 @@ pub fn detect_shell() -> Option<String> {
         }
     }
 
-    if cfg!(windows) {
-        if let Ok(psmodulepath) = std::env::var("PSModulePath") {
-            if !psmodulepath.is_empty() {
-                return Some("powershell".to_string());
-            }
+    if cfg!(windows)
+        && let Ok(psmodulepath) = std::env::var("PSModulePath")
+        && !psmodulepath.is_empty() {
+            return Some("powershell".to_string());
         }
-    }
 
     None
 }

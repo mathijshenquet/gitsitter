@@ -246,7 +246,7 @@ pub async fn run_daemon(paths: &Paths) -> Result<()> {
     // 5. Seed repos from config.toml
     let mut repo_states: HashMap<String, TrackedRepo> = HashMap::new();
     for (repo_path, repo_cfg) in &config.repos {
-        if repo_cfg.disabled.as_ref().map_or(false, |d| d.is_repo_disabled()) {
+        if repo_cfg.disabled.as_ref().is_some_and(|d| d.is_repo_disabled()) {
             continue;
         }
         let repo_id_path = PathBuf::from(repo_path);
@@ -415,11 +415,10 @@ async fn handle_connection(daemon: SharedDaemon, mut stream: transport::DaemonSt
 
 fn is_eof(err: &anyhow::Error) -> bool {
     for cause in err.chain() {
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-            if io_err.kind() == std::io::ErrorKind::UnexpectedEof {
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+            && io_err.kind() == std::io::ErrorKind::UnexpectedEof {
                 return true;
             }
-        }
     }
     false
 }
@@ -591,12 +590,11 @@ async fn handle_prompt_check(daemon: &SharedDaemon, repo_path: &str) -> Response
 
     let resp = handle_status(daemon, Some(repo_id_str)).await;
 
-    if !already_tracked {
-        if let Response::Status { mut data } = resp {
+    if !already_tracked
+        && let Response::Status { mut data } = resp {
             data.newly_registered = true;
             return Response::Status { data };
         }
-    }
 
     resp
 }
@@ -625,7 +623,7 @@ pub(crate) async fn reload_config(daemon: &SharedDaemon) {
         let mut repos = daemon.repos.write().await;
         // Add new repos from config
         for (repo_path, repo_cfg) in &new_config.repos {
-            if repo_cfg.disabled.as_ref().map_or(false, |d| d.is_repo_disabled()) {
+            if repo_cfg.disabled.as_ref().is_some_and(|d| d.is_repo_disabled()) {
                 continue;
             }
             if !repos.contains_key(repo_path) {
@@ -693,11 +691,10 @@ fn build_status_data(tr: &TrackedRepo, config: &UserConfig) -> StatusData {
     for (remote_name, remote_url) in &tr.remote_urls {
         if !config.is_remote_trusted(remote_url) {
             untrusted_remotes.push(remote_name.clone());
-            if let Some(host) = crate::config::extract_host(remote_url) {
-                if !untrusted_hosts.contains(&host) {
+            if let Some(host) = crate::config::extract_host(remote_url)
+                && !untrusted_hosts.contains(&host) {
                     untrusted_hosts.push(host);
                 }
-            }
         }
         if config.is_remote_disabled(&tr.repo_id, remote_name) {
             disabled_remotes.push(remote_name.clone());
@@ -936,11 +933,10 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 .collect();
             if remotes.is_empty() && !remote_urls.is_empty() {
                 // Only add "origin" fallback if there are actual remotes configured
-                if let Some(url) = remote_urls.get("origin") {
-                    if config.is_remote_trusted(url) && !config.is_remote_disabled(repo_id, "origin") {
+                if let Some(url) = remote_urls.get("origin")
+                    && config.is_remote_trusted(url) && !config.is_remote_disabled(repo_id, "origin") {
                         remotes.push("origin".to_string());
                     }
-                }
             }
 
             let mut any_success = false;
