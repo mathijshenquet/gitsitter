@@ -39,17 +39,16 @@ mod imp {
 
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel::<()>();
 
-        let status_handle = service_control_handler::register(SERVICE_NAME, move |control| {
-            match control {
+        let status_handle =
+            service_control_handler::register(SERVICE_NAME, move |control| match control {
                 ServiceControl::Stop | ServiceControl::Shutdown => {
                     let _ = shutdown_tx.send(());
                     ServiceControlHandlerResult::NoError
                 }
                 ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
                 _ => ServiceControlHandlerResult::NotImplemented,
-            }
-        })
-        .context("failed to register Windows service control handler")?;
+            })
+            .context("failed to register Windows service control handler")?;
 
         status_handle
             .set_service_status(service_status(
@@ -120,15 +119,17 @@ mod imp {
             return;
         };
         let _ = transport::send_request(&mut stream, &Request::Shutdown).await;
-        let _ = transport::recv_response(&mut stream).await.map(|resp| match resp {
-            Response::Ok { .. } | Response::Error { .. } => (),
-            _ => (),
-        });
+        let _ = transport::recv_response(&mut stream)
+            .await
+            .map(|resp| match resp {
+                Response::Ok { .. } | Response::Error { .. } => (),
+                _ => (),
+            });
     }
 }
 
 #[cfg(windows)]
-pub use imp::{run_service_dispatcher, SERVICE_DISPLAY_NAME, SERVICE_NAME};
+pub use imp::{SERVICE_DISPLAY_NAME, SERVICE_NAME, run_service_dispatcher};
 
 #[cfg(not(windows))]
 pub const SERVICE_NAME: &str = "gitsitter";
