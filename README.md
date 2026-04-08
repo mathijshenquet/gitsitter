@@ -129,11 +129,11 @@ To update, run `gitsitter self-update`. The daemon will also notify you when a n
 <summary>Other install methods</summary>
 
 ```sh
-# From source
+# From source (Linux, macOS, or Windows)
 cargo install --git ssh://git@github.com/mathijshenquet/gitsitter
 gitsitter install
 
-# Specific version or custom path
+# Specific version or custom path (Linux/macOS only)
 curl -fsSL https://raw.githubusercontent.com/mathijshenquet/gitsitter/main/install.sh | sh -s -- --version v0.2.0
 curl -fsSL https://raw.githubusercontent.com/mathijshenquet/gitsitter/main/install.sh | sh -s -- --path /usr/local/bin
 ```
@@ -246,7 +246,8 @@ Per repo, per refresh interval:
 ~/.config/gitsitter/config.toml          # user configuration
 ~/.local/state/gitsitter/daemon.log      # daemon log
 ~/.local/state/gitsitter/daemon.pid      # PID file
-$XDG_RUNTIME_DIR/gitsitter.sock          # Unix domain socket
+$XDG_RUNTIME_DIR/gitsitter.sock          # Unix domain socket (Linux/macOS)
+\\.\pipe\gitsitter-<user>                 # named pipe (Windows)
 ```
 
 </details>
@@ -255,6 +256,7 @@ $XDG_RUNTIME_DIR/gitsitter.sock          # Unix domain socket
 
 - **Linux** — systemd user service, inotify file watching
 - **macOS** — launchd plist, FSEvents file watching
+- **Windows** (experimental) — Windows Service via `sc.exe`, named-pipe IPC, PowerShell/pwsh shell hooks. Builds and passes CI, but must be installed from source (`cargo install`). The install script, pre-built release binaries, and `self-update` do not support Windows yet.
 
 ## License
 
