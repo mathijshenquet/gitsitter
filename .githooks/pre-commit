@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Auto-format and re-stage changed files
+cargo fmt
+git diff --name-only --diff-filter=d | xargs -r git add
+
+# Lint
+cargo clippy -- -D warnings

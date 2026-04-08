@@ -32,6 +32,17 @@ tasks:
     cmds:
       - ./scripts/release.sh --dry-run
 
+  lint:
+    desc: Run formatter and clippy
+    cmds:
+      - cargo fmt
+      - cargo clippy -- -D warnings
+
+  hooks:install:
+    desc: Install git hooks from .githooks/
+    cmds:
+      - git config core.hooksPath .githooks
+
   version:
     desc: Show current version from Cargo.toml
     cmds:
