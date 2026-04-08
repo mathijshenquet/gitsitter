@@ -1537,13 +1537,13 @@ async fn install_daemon() -> Result<()> {
         let output = std::process::Command::new("systemctl")
             .args(["--user", "daemon-reload"])
             .output();
-        if let Ok(o) = output {
-            if o.status.success() {
-                let _ = std::process::Command::new("systemctl")
-                    .args(["--user", "enable", "--now", "gitsitter"])
-                    .output();
-                println!("systemd service enabled and started");
-            }
+        if let Ok(o) = output
+            && o.status.success()
+        {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "enable", "--now", "gitsitter"])
+                .output();
+            println!("systemd service enabled and started");
         }
     }
 
