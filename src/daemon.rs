@@ -628,8 +628,15 @@ pub(crate) async fn reload_config(daemon: &SharedDaemon) {
             if repo_cfg.disabled.as_ref().map_or(false, |d| d.is_repo_disabled()) {
                 continue;
             }
-            if !repos.contains_key(repo_path) {
-                let repo_id_path = PathBuf::from(repo_path);
+            let repo_id_path = PathBuf::from(repo_path);
+            if let Some(tr) = repos.get_mut(repo_path) {
+                // Refresh remote URLs for existing tracked repos
+                let fresh_urls = git_ops::get_all_remote_urls(&repo_id_path).unwrap_or_default();
+                if fresh_urls != tr.remote_urls {
+                    repo_info!(repo_path, "remote URLs changed, refreshing");
+                    tr.remote_urls = fresh_urls;
+                }
+            } else {
                 let display_path = git_ops::get_display_path(&repo_id_path)
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| repo_path.clone());
@@ -876,11 +883,18 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         return Ok(());
     }
 
+    // Refresh remote URLs from git on every sync cycle so stale cached
+    // values don't cause incorrect trust checks or status output (#8).
     let remote_urls = {
-        let repos = daemon.repos.read().await;
-        match repos.get(repo_id) {
-            Some(tr) => tr.remote_urls.clone(),
-            None => HashMap::new(),
+        let fresh_urls = git_ops::get_all_remote_urls(Path::new(repo_id)).unwrap_or_default();
+        let mut repos = daemon.repos.write().await;
+        if let Some(tr) = repos.get_mut(repo_id) {
+            if fresh_urls != tr.remote_urls {
+                tr.remote_urls = fresh_urls.clone();
+            }
+            fresh_urls
+        } else {
+            fresh_urls
         }
     };
 
