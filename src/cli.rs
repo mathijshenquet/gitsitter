@@ -1161,17 +1161,38 @@ pub async fn handle_sync(paths: &Paths, all: bool) -> Result<()> {
     } else {
         Some(resolve_cwd_repo_path()?)
     };
-    let display = repo_path.as_ref().map(|p| display_path(p));
     let req = Request::Sync { repo_path, all };
     let resp = roundtrip(&mut stream, &req).await?;
     match resp {
-        Response::Ok { .. } => {
+        Response::SyncComplete { data, events } => {
             let icon = cli_ui::success_icon(opts);
-            if let Some(dp) = display {
-                println!("{} Synced {}", icon, cli_ui::repo_header(&dp, opts));
-            } else {
-                println!("{} Synced all repos", icon);
+            let dp = &data.display_path;
+            println!("{} Synced {}", icon, cli_ui::repo_header(dp, opts));
+            for event in &events {
+                match event {
+                    transport::SyncEvent::Fetch { remotes } => {
+                        println!("  fetched {}", remotes.join(", "));
+                    }
+                    transport::SyncEvent::Branch {
+                        branch,
+                        detail,
+                        status,
+                        ..
+                    } => {
+                        println!("  {}: {} → {}", branch, detail, status);
+                    }
+                }
             }
+        }
+        Response::Status { data } => {
+            let icon = cli_ui::success_icon(opts);
+            let dp = &data.display_path;
+            println!("{} Synced {}", icon, cli_ui::repo_header(dp, opts));
+            print_repo_status(&data, opts);
+        }
+        Response::Ok { message } => {
+            let icon = cli_ui::success_icon(opts);
+            println!("{} {}", icon, message);
         }
         Response::Error { message } => eprintln!("error: {}", message),
         _ => eprintln!("unexpected response"),

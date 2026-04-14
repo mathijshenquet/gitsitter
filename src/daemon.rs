@@ -33,7 +33,9 @@ use crate::config::{EffectiveConflictAction, InRepoConfig, UserConfig};
 use crate::forge::ForgeCache;
 use crate::git_ops::{self, HistoryRewrite, MergeAnalysis, PushResult};
 use crate::paths::Paths;
-use crate::transport::{self, BranchStatusData, RepoStatusData, Request, Response, StatusData};
+use crate::transport::{
+    self, BranchStatusData, RepoStatusData, Request, Response, StatusData, SyncEvent,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -158,7 +160,11 @@ impl BackoffState {
 type SharedDaemon = Arc<Daemon>;
 
 impl TrackedRepo {
-    fn new(repo_id: String, display_path: String, remote_urls: HashMap<String, String>) -> Self {
+    pub fn new(
+        repo_id: String,
+        display_path: String,
+        remote_urls: HashMap<String, String>,
+    ) -> Self {
         Self {
             repo_id,
             display_path,
@@ -517,37 +523,56 @@ async fn handle_global_status(daemon: &SharedDaemon) -> Response {
 
 async fn handle_sync(daemon: &SharedDaemon, repo_path: Option<String>, all: bool) -> Response {
     if all {
-        let mut repos = daemon.repos.write().await;
-        for tr in repos.values_mut() {
-            tr.sync_reason = Some("cli sync requested (all repos)".into());
+        // Collect all repo IDs, then sync each one.
+        let repo_ids: Vec<String> = {
+            let repos = daemon.repos.read().await;
+            repos.keys().cloned().collect()
+        };
+        info!("⚡ cli sync requested (all repos)");
+        for repo_id in &repo_ids {
+            if let Err(e) = sync_repo(daemon, repo_id).await {
+                repo_warn!(display_repo_label(repo_id), "sync error: {:#}", e);
+            }
         }
-        drop(repos);
-        info!("⚡ event cli sync requested (all repos)");
-        daemon.sync_notify.notify_one();
         Response::Ok {
-            message: "sync triggered for all repos".into(),
+            message: format!("synced {} repos", repo_ids.len()),
         }
     } else if let Some(path) = repo_path {
         match resolve_repo_id_from_path(&path) {
             Ok(repo_id) => {
                 let repo_id_str = repo_id.to_string_lossy().to_string();
-                let mut repos = daemon.repos.write().await;
-                if let Some(tr) = repos.get_mut(&repo_id_str) {
-                    tr.sync_reason = Some(format!(
-                        "cli sync requested ({})",
-                        display_repo_label(&tr.display_path)
-                    ));
-                    drop(repos);
-                    repo_info!(display_repo_label(&path), "⚡ cli sync requested");
-                    daemon.sync_notify.notify_one();
-                    Response::Ok {
-                        message: format!("sync triggered for {}", path),
+                // Check that the repo is registered.
+                {
+                    let repos = daemon.repos.read().await;
+                    if !repos.contains_key(&repo_id_str) {
+                        return Response::Error {
+                            message: format!("repo not registered: {}", path),
+                        };
                     }
-                } else {
-                    drop(repos);
-                    Response::Error {
-                        message: format!("repo not registered: {}", path),
+                }
+                repo_info!(display_repo_label(&path), "⚡ cli sync requested");
+                let sync_events = match sync_repo(daemon, &repo_id_str).await {
+                    Ok(evts) => evts,
+                    Err(e) => {
+                        return Response::Error {
+                            message: format!("sync failed: {:#}", e),
+                        };
                     }
+                };
+                // Return full status + events after sync.
+                let repos = daemon.repos.read().await;
+                let config = daemon.config.read().await;
+                match repos.get(&repo_id_str) {
+                    Some(tr) => {
+                        let data = build_status_data(tr, &config);
+                        Response::SyncComplete {
+                            data,
+                            events: sync_events,
+                        }
+                    }
+                    None => Response::Ok {
+                        message: format!("synced {}", path),
+                    },
                 }
             }
             Err(e) => Response::Error {
@@ -840,12 +865,12 @@ async fn sync_loop(daemon: SharedDaemon, mut shutdown_rx: watch::Receiver<bool>)
 // Per-repo sync
 // ---------------------------------------------------------------------------
 
-async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
+pub async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<Vec<SyncEvent>> {
     {
         let mut repos = daemon.repos.write().await;
         if let Some(tr) = repos.get_mut(repo_id) {
             if tr.in_sync {
-                return Ok(());
+                return Ok(vec![]);
             }
             tr.in_sync = true;
         }
@@ -863,11 +888,12 @@ async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
     result
 }
 
-async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
+async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<Vec<SyncEvent>> {
     let sync_start = Instant::now();
     let repo_path = PathBuf::from(repo_id);
     let repo_label = repo_log_label(repo_id);
     let mut had_activity = false;
+    let mut events: Vec<SyncEvent> = Vec::new();
 
     // 1. Check repo exists
     if !repo_path.exists() {
@@ -877,7 +903,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         if let Some(tr) = repos.get_mut(repo_id) {
             tr.last_sync = Some(Instant::now());
         }
-        return Ok(());
+        return Ok(events);
     }
 
     // 2. Check for in-progress operations
@@ -887,7 +913,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         if let Some(tr) = repos.get_mut(repo_id) {
             tr.last_sync = Some(Instant::now());
         }
-        return Ok(());
+        return Ok(events);
     }
 
     // Load config and determine modes
@@ -899,7 +925,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         if let Some(tr) = repos.get_mut(repo_id) {
             tr.last_sync = Some(Instant::now());
         }
-        return Ok(());
+        return Ok(events);
     }
 
     // Refresh remote URLs from git on every sync cycle so stale cached
@@ -989,6 +1015,9 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
             }
 
             if any_success {
+                events.push(SyncEvent::Fetch {
+                    remotes: remotes.clone(),
+                });
                 let mut repos = daemon.repos.write().await;
                 if let Some(tr) = repos.get_mut(repo_id) {
                     tr.backoff.reset_fetch_backoff();
@@ -1119,6 +1148,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 .unwrap_or(false)
         };
 
+        let analysis_str = format!("{:?}", analysis);
         let sync_input = BranchSyncInput {
             merge_analysis: analysis,
             is_checked_out,
@@ -1128,6 +1158,24 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
             push_backoff_active,
         };
         let action = decide_branch_action(&sync_input);
+        let action_str = format!("{:?}", action);
+
+        // Helper to build a branch sync event.
+        macro_rules! branch_event {
+            ($status:expr, $detail:expr) => {
+                branch_event!($status, $detail, None)
+            };
+            ($status:expr, $detail:expr, $rewrite:expr) => {
+                SyncEvent::Branch {
+                    branch: branch.name.clone(),
+                    analysis: analysis_str.clone(),
+                    sync_action: action_str.clone(),
+                    rewrite: $rewrite,
+                    status: $status.to_string(),
+                    detail: $detail.to_string(),
+                }
+            };
+        }
 
         // Execute the decided action
         match action {
@@ -1147,6 +1195,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         },
                     );
                 }
+                events.push(branch_event!("upstream_gone", "upstream ref deleted"));
             }
 
             SyncAction::UpToDate => {
@@ -1164,6 +1213,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         },
                     );
                 }
+                events.push(branch_event!("synced", "up to date"));
             }
 
             SyncAction::SkipDirty | SyncAction::SkipRebaseDirty => {
@@ -1192,6 +1242,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         },
                     );
                 }
+                events.push(branch_event!("pending_dirty", "skipped — worktree dirty"));
             }
 
             SyncAction::FastForwardMerge => {
@@ -1228,6 +1279,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                 },
                             );
                         }
+                        events.push(branch_event!("synced", "fast-forwarded"));
                     }
                     Err(e) => {
                         repo_warn!(repo_label, "ff-merge failed :{}: {:#}", branch.name, e);
@@ -1245,6 +1297,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                 },
                             );
                         }
+                        events.push(branch_event!("error", "fast-forward failed"));
                     }
                 }
             }
@@ -1281,9 +1334,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                 },
                             );
                         }
+                        events.push(branch_event!("synced", "fast-forwarded (ref update)"));
                     }
                     Err(e) => {
                         repo_warn!(repo_label, "update-ref failed :{}: {:#}", branch.name, e);
+                        events.push(branch_event!("error", "fast-forward ref update failed"));
                     }
                 }
             }
@@ -1300,6 +1355,10 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         error_message: Some("local commits on non-owned branch — push manually or create a new branch".into()),
                     });
                 }
+                events.push(branch_event!(
+                    "local_ahead",
+                    "local ahead, not owned — skipped"
+                ));
             }
 
             SyncAction::SkipPushBackoff => {
@@ -1341,6 +1400,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                 },
                             );
                         }
+                        events.push(branch_event!("synced", "pushed"));
                     }
                     Ok(PushResult::Rejected(msg)) => {
                         repo_warn!(repo_label, "push rejected :{}: {}", branch.name, msg);
@@ -1416,6 +1476,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                     }
                     Err(e) => {
                         repo_error!(repo_label, "push error :{}: {:#}", branch.name, e);
+                        events.push(branch_event!("error", "push failed"));
                     }
                 }
             }
@@ -1438,6 +1499,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                         },
                     );
                 }
+                events.push(branch_event!("diverged", "diverged, not owned — flagged"));
             }
 
             SyncAction::RebaseThenPush => {
@@ -1445,6 +1507,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                 // was intentionally rewritten (e.g. rebase -i, squash).
                 let rewrite = git_ops::detect_history_rewrite(&repo_path, &branch.name)
                     .unwrap_or(HistoryRewrite::None);
+                let rewrite_str = Some(format!("{:?}", rewrite));
 
                 match rewrite {
                     HistoryRewrite::RemoteUnchanged => {
@@ -1469,6 +1532,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                 },
                             );
                         }
+                        events.push(branch_event!(
+                            "history_rewritten_remote_unchanged",
+                            "history rewrite detected, remote unchanged — holding",
+                            rewrite_str.clone()
+                        ));
                         continue;
                     }
                     HistoryRewrite::RemoteAdvanced => {
@@ -1493,6 +1561,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                 },
                             );
                         }
+                        events.push(branch_event!(
+                            "history_rewritten_remote_advanced",
+                            "history rewrite detected, remote advanced — holding",
+                            rewrite_str.clone()
+                        ));
                         continue;
                     }
                     HistoryRewrite::None => {
@@ -1551,6 +1624,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                     },
                                 );
                             }
+                            events.push(branch_event!(
+                                "synced",
+                                format!("rebased onto {}, pushed", upstream_ref),
+                                rewrite_str.clone()
+                            ));
                         }
                         _ => {
                             repo_warn!(repo_label, "push after rebase failed :{}", branch.name);
@@ -1571,6 +1649,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                     },
                                 );
                             }
+                            events.push(branch_event!(
+                                "diverged_yours",
+                                format!("rebased onto {}, push failed", upstream_ref),
+                                rewrite_str.clone()
+                            ));
                         }
                     }
                 } else {
@@ -1604,6 +1687,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                     },
                                 );
                             }
+                            events.push(branch_event!(
+                                "diverged_yours",
+                                "rebase conflicts, reverted",
+                                rewrite_str.clone()
+                            ));
                         }
                         EffectiveConflictAction::Leave => {
                             let mut repos = daemon.repos.write().await;
@@ -1617,6 +1705,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
                                     error_message: Some("rebase conflicts — resolve manually or run `gitsitter auto-resolve`".into()),
                                 });
                             }
+                            events.push(branch_event!(
+                                "merge_conflict",
+                                "rebase conflicts, left in place",
+                                rewrite_str.clone()
+                            ));
                         }
                         EffectiveConflictAction::ResolveAgent => {
                             let agent = config.global.resolve_agent.as_deref().unwrap_or("claude");
@@ -1819,7 +1912,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<()> {
         ),
     }
 
-    Ok(())
+    Ok(events)
 }
 
 // ---------------------------------------------------------------------------

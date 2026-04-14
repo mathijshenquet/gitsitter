@@ -59,6 +59,12 @@ pub enum Response {
     #[serde(rename = "status")]
     Status { data: StatusData },
 
+    #[serde(rename = "sync_complete")]
+    SyncComplete {
+        data: StatusData,
+        events: Vec<SyncEvent>,
+    },
+
     #[serde(rename = "global_status")]
     GlobalStatus { repos: Vec<RepoStatusData> },
 
@@ -112,6 +118,30 @@ pub struct RepoStatusData {
     /// e.g. "10 synced", "1/9 diverged"
     pub status_summary: String,
     pub last_sync: Option<String>,
+}
+
+/// Structured event emitted during a sync cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event")]
+pub enum SyncEvent {
+    #[serde(rename = "fetch")]
+    Fetch { remotes: Vec<String> },
+
+    #[serde(rename = "branch")]
+    Branch {
+        branch: String,
+        /// MergeAnalysis result: "UpToDate", "FastForward", "LocalAhead", "Diverged", "UpstreamGone"
+        analysis: String,
+        /// SyncAction chosen: "FastForwardMerge", "Push", "RebaseThenPush", "DivergedNotOwned", etc.
+        sync_action: String,
+        /// HistoryRewrite result (only for Diverged+owned): "None", "RemoteUnchanged", "RemoteAdvanced"
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rewrite: Option<String>,
+        /// Resulting sync status: "synced", "diverged", "history_rewritten_remote_unchanged", etc.
+        status: String,
+        /// Human-readable description: "fast-forwarded", "rebased onto origin/main, pushed", etc.
+        detail: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
