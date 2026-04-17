@@ -18,6 +18,7 @@
         };
         nativeBuildInputs = with pkgs; [
           pkg-config
+          git
         ];
         buildInputs = with pkgs; [
           openssl
