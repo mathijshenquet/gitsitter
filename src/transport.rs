@@ -12,6 +12,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::sync::BranchState;
+
 /// Maximum allowed message size (16 MB).
 const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
 
@@ -106,8 +108,8 @@ pub struct StatusData {
 pub struct BranchStatusData {
     pub name: String,
     pub upstream: Option<String>,
-    /// synced, diverged, local_ahead, remote_ahead, etc.
-    pub status: String,
+    /// Observable branch state (synced, diverged, local_ahead, ...).
+    pub status: BranchState,
     /// e.g. "pulled 2m ago", "pushed 45s ago"
     pub last_action: Option<String>,
 }

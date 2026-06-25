@@ -462,7 +462,7 @@ mod transport_tests {
                     branches: vec![transport::BranchStatusData {
                         name: "main".into(),
                         upstream: Some("origin/main".into()),
-                        status: "synced".into(),
+                        status: gitsitter::sync::BranchState::Synced,
                         last_action: None,
                     }],
                     untrusted_remotes: vec![],
