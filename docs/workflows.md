@@ -2,7 +2,7 @@
 
 > **Auto-generated** by `cargo test --test workflows -- --ignored generate_workflow_docs`.
 > All outputs reflect actual behavior: each scenario constructs real git repositories and runs gitsitter's sync pipeline against them.
-> Version **0.1.0**, commit `c7685e0`.
+> Version **0.1.0**, commit `9a5505d`.
 > **Do not edit** — re-run the test to regenerate.
 
 Each scenario below shows a simulated multi-user git workflow, then runs `gitsitter sync` and shows the resulting status. Shell prompts indicate which simulated host is acting (`alice`, `bob`, etc.).
@@ -18,7 +18,7 @@ Someone else pushes to a branch you have checked out. Your local copy is behind.
 ```sh
 alice $ git clone origin ~/project && cd ~/project
 alice $ echo '# project' > README.md
-alice $ git add . && git commit -m 'initial commit'   # => efc4f11
+alice $ git add . && git commit -m 'initial commit'   # => 9d660ba
 alice $ git push -u origin main
 ```
 
@@ -66,7 +66,7 @@ You make a new commit locally:
 
 ```sh
 alice $ echo 'buy milk' > todo.txt
-alice $ git add . && git commit -m 'add todo list'   # => 1a95a97
+alice $ git add . && git commit -m 'add todo list'   # => 879fee7
 ```
 
 
@@ -87,9 +87,9 @@ gitsitter pushes your commit to the remote.
 - **Outcome**: `local commits pushed to remote`
 
 
-## Scenario: Normal divergence — rebase then push
+## Scenario: Normal divergence — held for manual resolution
 
-Your branch diverges from the remote (e.g. a CI merge landed on remote while you committed locally). gitsitter detects this as ordinary divergence (not a history rewrite), rebases your work on top of the remote, and pushes.
+Your branch diverges from the remote (e.g. a CI merge landed on remote while you committed locally). gitsitter detects this as ordinary divergence (not a history rewrite). It only ever fast-forwards and pushes, so it does not rebase or rewrite history — it flags the branch and leaves it for you to resolve with git (merge or rebase).
 
 
 ### Setup
@@ -104,15 +104,15 @@ alice $ git push -u origin main
 A CI merge lands on the remote, then Alice commits locally:
 
 ```sh
-ci    $ # merge commit lands on origin/main   # => 5df6f75
+ci    $ # merge commit lands on origin/main   # => 8fd91f6
 ```
 
 ```sh
 alice $ echo 'from alice' > local.txt
-alice $ git add . && git commit -m 'alice: add file'   # => 84634e5
+alice $ git add . && git commit -m 'alice: add file'   # => ce587ac
 ```
 
-Now local (`84634e5`) and remote (`5df6f75`) have diverged.
+Now local (`ce587ac`) and remote (`8fd91f6`) have diverged.
 
 
 ### gitsitter sync
@@ -120,16 +120,16 @@ Now local (`84634e5`) and remote (`5df6f75`) have diverged.
 ```sh
 $ gitsitter sync
 fetched origin
-main: Diverged → RebaseThenPush (rewrite: None) → rebased onto origin/main, pushed [synced]
+main: Diverged → Diverged (rewrite: None) → diverged — holding for manual resolution [diverged_yours]
 ```
 
-gitsitter checks the reflog, confirms this is normal divergence (not a history rewrite), rebases Alice's commit on top of the remote, and pushes.
+gitsitter checks the reflog, confirms this is normal divergence (not a history rewrite), and holds — leaving Alice to merge or rebase with git.
 
 
 ### Result
 
-- **Status**: `synced`
-- **Outcome**: `rebase onto remote, then push`
+- **Status**: `diverged_yours`
+- **Outcome**: `diverged — held for manual resolution`
 
 
 ## Scenario: Interactive rebase — rewrite detected, remote unchanged
@@ -143,11 +143,11 @@ You squash or reorder commits with `git rebase -i`. The remote still has the old
 alice $ git clone origin ~/project && cd ~/project
 alice $ echo aaa > a.txt && git add . && git commit -m 'commit A'
 alice $ git push -u origin main
-alice $ echo bbb > b.txt && git add . && git commit -m 'commit B'   # => 78770ca
+alice $ echo bbb > b.txt && git add . && git commit -m 'commit B'   # => 71112af
 alice $ git push
 ```
 
-Remote and local are both at `78770ca`. Two commits published: A and B.
+Remote and local are both at `71112af`. Two commits published: A and B.
 
 
 ### Rewrite
@@ -156,10 +156,10 @@ Alice squashes commits A and B into one (simulating `git rebase -i HEAD~2`):
 
 ```sh
 alice $ git rebase -i HEAD~2   # squash A+B
-alice $ # branch is now at fdad020  (was 78770ca)
+alice $ # branch is now at 2361333  (was 71112af)
 ```
 
-Local is at `fdad020`, remote is still at `78770ca`. The branches have diverged, but this is an intentional rewrite — not concurrent work.
+Local is at `2361333`, remote is still at `71112af`. The branches have diverged, but this is an intentional rewrite — not concurrent work.
 
 
 ### gitsitter sync
@@ -167,7 +167,7 @@ Local is at `fdad020`, remote is still at `78770ca`. The branches have diverged,
 ```sh
 $ gitsitter sync
 fetched origin
-main: Diverged → RebaseThenPush (rewrite: RemoteUnchanged) → history rewrite detected, remote unchanged — holding [history_rewritten_remote_unchanged]
+main: Diverged → Diverged (rewrite: RemoteUnchanged) → history rewrite detected, remote unchanged — holding [history_rewritten_remote_unchanged]
 ```
 
 gitsitter walks the reflog, finds that a prior branch tip (`commit B`) is reachable from the remote but not from the current local tip — evidence of intentional history editing. It holds instead of rebasing.
@@ -192,7 +192,7 @@ You amend the most recent commit after pushing. gitsitter detects the rewrite an
 alice $ git clone origin ~/project && cd ~/project
 alice $ echo '# v1' > README.md && git add . && git commit -m 'initial'
 alice $ git push -u origin main
-alice $ echo wip > feature.txt && git add . && git commit -m 'add feature (wip)'   # => c896a68
+alice $ echo wip > feature.txt && git add . && git commit -m 'add feature (wip)'   # => c6330c6
 alice $ git push
 ```
 
@@ -201,7 +201,7 @@ alice $ git push
 
 ```sh
 alice $ echo done > feature.txt && git add .
-alice $ git commit --amend -m 'add feature (done)'   # c896a68 => f66f3f6
+alice $ git commit --amend -m 'add feature (done)'   # c6330c6 => 161fc5a
 ```
 
 
@@ -210,7 +210,7 @@ alice $ git commit --amend -m 'add feature (done)'   # c896a68 => f66f3f6
 ```sh
 $ gitsitter sync
 fetched origin
-main: Diverged → RebaseThenPush (rewrite: RemoteUnchanged) → history rewrite detected, remote unchanged — holding [history_rewritten_remote_unchanged]
+main: Diverged → Diverged (rewrite: RemoteUnchanged) → history rewrite detected, remote unchanged — holding [history_rewritten_remote_unchanged]
 ```
 
 Same as interactive rebase: gitsitter detects the rewrite and holds.
@@ -233,7 +233,7 @@ You rewrite local history, but in the meantime someone else pushes to the remote
 alice $ git clone origin ~/project && cd ~/project
 alice $ echo aaa > a.txt && git add . && git commit -m 'commit A'
 alice $ git push -u origin main
-alice $ echo bbb > b.txt && git add . && git commit -m 'commit B'   # => 78770ca
+alice $ echo bbb > b.txt && git add . && git commit -m 'commit B'   # => 71112af
 alice $ git push
 ```
 
@@ -242,17 +242,17 @@ alice $ git push
 
 ```sh
 alice $ git rebase -i HEAD~1   # rewrite B into C
-alice $ # local is now at 7abdb50
+alice $ # local is now at 084a9bf
 ```
 
 
 ### Remote advances
 
 ```sh
-ci    $ # merge commit lands on origin/main   # => 414dad3
+ci    $ # merge commit lands on origin/main   # => 939d777
 ```
 
-Remote is now at `414dad3` (past the old published tip `78770ca`), while local was rewritten to `7abdb50`.
+Remote is now at `939d777` (past the old published tip `71112af`), while local was rewritten to `084a9bf`.
 
 
 ### gitsitter sync
@@ -260,7 +260,7 @@ Remote is now at `414dad3` (past the old published tip `78770ca`), while local w
 ```sh
 $ gitsitter sync
 fetched origin
-main: Diverged → RebaseThenPush (rewrite: RemoteAdvanced) → history rewrite detected, remote advanced — holding [history_rewritten_remote_advanced]
+main: Diverged → Diverged (rewrite: RemoteAdvanced) → history rewrite detected, remote advanced — holding [history_rewritten_remote_advanced]
 ```
 
 gitsitter detects both the rewrite *and* that the remote advanced past the old published tip. A force-push would discard Bob's commit D. gitsitter warns and holds.

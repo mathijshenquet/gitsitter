@@ -453,13 +453,18 @@ async fn scenario_local_ahead_push() -> String {
     r.into_string()
 }
 
-async fn scenario_normal_divergence_rebase() -> String {
+async fn scenario_normal_divergence_held() -> String {
     let mut r = Recorder::new();
-    r.heading(2, "Scenario: Normal divergence — rebase then push");
+    r.heading(
+        2,
+        "Scenario: Normal divergence — held for manual resolution",
+    );
     r.paragraph(
         "Your branch diverges from the remote (e.g. a CI merge landed on remote \
          while you committed locally). gitsitter detects this as ordinary divergence \
-         (not a history rewrite), rebases your work on top of the remote, and pushes.",
+         (not a history rewrite). It only ever fast-forwards and pushes, so it does \
+         not rebase or rewrite history — it flags the branch and leaves it for you to \
+         resolve with git (merge or rebase).",
     );
 
     let tmp = temp_dir();
@@ -536,15 +541,15 @@ async fn scenario_normal_divergence_rebase() -> String {
     let result = sync_and_get_result(&daemon, &id_str, &branch).await;
     r.sync_result(&result);
 
-    assert_eq!(result.status, "synced");
+    assert_eq!(result.status, "diverged_yours");
 
     r.paragraph(
         "gitsitter checks the reflog, confirms this is normal divergence (not a \
-         history rewrite), rebases Alice's commit on top of the remote, and pushes.",
+         history rewrite), and holds — leaving Alice to merge or rebase with git.",
     );
     r.heading(3, "Result");
     r.status_line("Status", &result.status);
-    r.status_line("Outcome", "rebase onto remote, then push");
+    r.status_line("Outcome", "diverged — held for manual resolution");
     r.finish_list();
 
     r.into_string()
@@ -1044,7 +1049,7 @@ async fn generate_workflow_docs() {
     let mut doc = generate_header();
     doc += &scenario_fast_forward().await;
     doc += &scenario_local_ahead_push().await;
-    doc += &scenario_normal_divergence_rebase().await;
+    doc += &scenario_normal_divergence_held().await;
     doc += &scenario_interactive_rebase_detected().await;
     doc += &scenario_amend_detected().await;
     doc += &scenario_rewrite_remote_advanced().await;
@@ -1069,7 +1074,7 @@ async fn generate_workflow_docs() {
 async fn workflow_scenarios_pass() {
     scenario_fast_forward().await;
     scenario_local_ahead_push().await;
-    scenario_normal_divergence_rebase().await;
+    scenario_normal_divergence_held().await;
     scenario_interactive_rebase_detected().await;
     scenario_amend_detected().await;
     scenario_rewrite_remote_advanced().await;

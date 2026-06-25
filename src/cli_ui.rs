@@ -99,7 +99,7 @@ pub fn branch_status_label(status: &str) -> &'static str {
         "local_ahead" => "local ahead",
         "fast_forward" | "remote_ahead" => "remote ahead",
         "diverged" => "diverged (someone else)",
-        "diverged_yours" => "diverged (rebase needed)",
+        "diverged_yours" => "diverged (resolve manually)",
         "history_rewritten_remote_unchanged" => "history rewritten (force-push ready)",
         "history_rewritten_remote_advanced" => "history rewritten (remote advanced)",
         "pending_dirty" => "dirty worktree",
