@@ -241,7 +241,7 @@ async fn sync_and_get_result(daemon: &Arc<Daemon>, repo_id: &str, branch: &str) 
     let status = tr
         .branches
         .get(branch)
-        .map(|b| b.sync_status.clone())
+        .map(|b| b.state.status_str().to_string())
         .unwrap_or_else(|| "no_status".to_string());
     SyncResult { status, events }
 }

@@ -14,6 +14,7 @@ use crate::cli_ui::{self, DisplayOpts};
 use crate::config::{self, UserConfig};
 use crate::git_ops;
 use crate::paths::Paths;
+use crate::sync::BranchState;
 use crate::transport::{self, DaemonStream, Request, Response};
 
 /// Load display options from user config (best-effort, defaults if config fails).
@@ -1326,43 +1327,43 @@ pub async fn handle_prompt(paths: &Paths) -> Result<()> {
         for b in &data.branches {
             let upstream = b.upstream.as_deref().unwrap_or("upstream");
             let pair = cli_ui::sync_pair(&b.name, upstream);
-            match b.status.as_str() {
-                "local_ahead" => {
+            match &b.status {
+                BranchState::LocalAheadNotOwned => {
                     issues.push(format!(
                         "gitsitter: \u{1F4E6} {} {} has unpushed changes (last remote commit by someone else)",
                         dp, pair
                     ));
                 }
-                "diverged" => {
+                BranchState::DivergedNotOwned => {
                     issues.push(format!(
                         "gitsitter: \u{1F4E6} {} {} has diverged (last remote commit by someone else)",
                         dp, pair
                     ));
                 }
-                "diverged_yours" => {
+                BranchState::Diverged => {
                     issues.push(format!(
                         "gitsitter: \u{1F4E6} {} {} has diverged \u{2014} resolve manually (merge or rebase)",
                         dp, pair
                     ));
                 }
-                "pending_dirty" => {
+                BranchState::DirtyWorktree => {
                     issues.push(format!(
                         "gitsitter: \u{270F}\u{FE0F} {} {} dirty worktree \u{2014} commit or stash to sync",
                         dp, pair
                     ));
                 }
-                "merge_conflict" => {
+                BranchState::MergeConflict => {
                     issues.push(format!(
                         "gitsitter: \u{1F527} {} {} has merge conflicts \u{2014} resolve manually",
                         dp, pair
                     ));
                 }
-                "push_rejected" | "auth_failed" | "network_error" | "push_blocked_hook_timeout" => {
+                BranchState::Failed(_) => {
                     issues.push(format!(
                         "gitsitter: \u{1F4E6} {} {} sync error ({})",
                         dp,
                         pair,
-                        b.status.replace('_', " ")
+                        b.status.status_str().replace('_', " ")
                     ));
                 }
                 _ => continue,

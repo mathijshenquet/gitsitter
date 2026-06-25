@@ -2,7 +2,7 @@
 
 > **Auto-generated** by `cargo test --test workflows -- --ignored generate_workflow_docs`.
 > All outputs reflect actual behavior: each scenario constructs real git repositories and runs gitsitter's sync pipeline against them.
-> Version **0.1.0**, commit `9a5505d`.
+> Version **0.1.0**, commit `336f4b9`.
 > **Do not edit** — re-run the test to regenerate.
 
 Each scenario below shows a simulated multi-user git workflow, then runs `gitsitter sync` and shows the resulting status. Shell prompts indicate which simulated host is acting (`alice`, `bob`, etc.).
@@ -18,7 +18,7 @@ Someone else pushes to a branch you have checked out. Your local copy is behind.
 ```sh
 alice $ git clone origin ~/project && cd ~/project
 alice $ echo '# project' > README.md
-alice $ git add . && git commit -m 'initial commit'   # => 9d660ba
+alice $ git add . && git commit -m 'initial commit'   # => 9347046
 alice $ git push -u origin main
 ```
 
@@ -66,7 +66,7 @@ You make a new commit locally:
 
 ```sh
 alice $ echo 'buy milk' > todo.txt
-alice $ git add . && git commit -m 'add todo list'   # => 879fee7
+alice $ git add . && git commit -m 'add todo list'   # => 4f9d42b
 ```
 
 
@@ -104,15 +104,15 @@ alice $ git push -u origin main
 A CI merge lands on the remote, then Alice commits locally:
 
 ```sh
-ci    $ # merge commit lands on origin/main   # => 8fd91f6
+ci    $ # merge commit lands on origin/main   # => c587afe
 ```
 
 ```sh
 alice $ echo 'from alice' > local.txt
-alice $ git add . && git commit -m 'alice: add file'   # => ce587ac
+alice $ git add . && git commit -m 'alice: add file'   # => 95669a6
 ```
 
-Now local (`ce587ac`) and remote (`8fd91f6`) have diverged.
+Now local (`95669a6`) and remote (`c587afe`) have diverged.
 
 
 ### gitsitter sync
@@ -143,11 +143,11 @@ You squash or reorder commits with `git rebase -i`. The remote still has the old
 alice $ git clone origin ~/project && cd ~/project
 alice $ echo aaa > a.txt && git add . && git commit -m 'commit A'
 alice $ git push -u origin main
-alice $ echo bbb > b.txt && git add . && git commit -m 'commit B'   # => 71112af
+alice $ echo bbb > b.txt && git add . && git commit -m 'commit B'   # => 7e710f7
 alice $ git push
 ```
 
-Remote and local are both at `71112af`. Two commits published: A and B.
+Remote and local are both at `7e710f7`. Two commits published: A and B.
 
 
 ### Rewrite
@@ -156,10 +156,10 @@ Alice squashes commits A and B into one (simulating `git rebase -i HEAD~2`):
 
 ```sh
 alice $ git rebase -i HEAD~2   # squash A+B
-alice $ # branch is now at 2361333  (was 71112af)
+alice $ # branch is now at df2e9d3  (was 7e710f7)
 ```
 
-Local is at `2361333`, remote is still at `71112af`. The branches have diverged, but this is an intentional rewrite — not concurrent work.
+Local is at `df2e9d3`, remote is still at `7e710f7`. The branches have diverged, but this is an intentional rewrite — not concurrent work.
 
 
 ### gitsitter sync
@@ -192,7 +192,7 @@ You amend the most recent commit after pushing. gitsitter detects the rewrite an
 alice $ git clone origin ~/project && cd ~/project
 alice $ echo '# v1' > README.md && git add . && git commit -m 'initial'
 alice $ git push -u origin main
-alice $ echo wip > feature.txt && git add . && git commit -m 'add feature (wip)'   # => c6330c6
+alice $ echo wip > feature.txt && git add . && git commit -m 'add feature (wip)'   # => c3dfcf9
 alice $ git push
 ```
 
@@ -201,7 +201,7 @@ alice $ git push
 
 ```sh
 alice $ echo done > feature.txt && git add .
-alice $ git commit --amend -m 'add feature (done)'   # c6330c6 => 161fc5a
+alice $ git commit --amend -m 'add feature (done)'   # c3dfcf9 => 1b3f70f
 ```
 
 
@@ -233,7 +233,7 @@ You rewrite local history, but in the meantime someone else pushes to the remote
 alice $ git clone origin ~/project && cd ~/project
 alice $ echo aaa > a.txt && git add . && git commit -m 'commit A'
 alice $ git push -u origin main
-alice $ echo bbb > b.txt && git add . && git commit -m 'commit B'   # => 71112af
+alice $ echo bbb > b.txt && git add . && git commit -m 'commit B'   # => 7e710f7
 alice $ git push
 ```
 
@@ -242,17 +242,17 @@ alice $ git push
 
 ```sh
 alice $ git rebase -i HEAD~1   # rewrite B into C
-alice $ # local is now at 084a9bf
+alice $ # local is now at 61e07ec
 ```
 
 
 ### Remote advances
 
 ```sh
-ci    $ # merge commit lands on origin/main   # => 939d777
+ci    $ # merge commit lands on origin/main   # => 576a967
 ```
 
-Remote is now at `939d777` (past the old published tip `71112af`), while local was rewritten to `084a9bf`.
+Remote is now at `576a967` (past the old published tip `7e710f7`), while local was rewritten to `61e07ec`.
 
 
 ### gitsitter sync

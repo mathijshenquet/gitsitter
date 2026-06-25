@@ -8,6 +8,7 @@ pub mod paths;
 pub mod self_update;
 pub mod service;
 pub mod shell;
+pub mod sync;
 pub mod transport;
 pub mod tui;
 pub mod watcher;

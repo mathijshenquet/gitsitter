@@ -33,6 +33,7 @@ use crate::config::{InRepoConfig, UserConfig};
 use crate::forge::ForgeCache;
 use crate::git_ops::{self, HistoryRewrite, MergeAnalysis, PushResult};
 use crate::paths::Paths;
+use crate::sync::{ActionError, BranchInputs, BranchState, SyncAction, decide_branch_action};
 use crate::transport::{
     self, BranchStatusData, RepoStatusData, Request, Response, StatusData, SyncEvent,
 };
@@ -85,7 +86,7 @@ pub struct TrackedRepo {
 /// Runtime state for a single branch, kept in memory only.
 #[derive(Debug, Clone)]
 pub struct BranchRuntimeState {
-    pub sync_status: String,
+    pub state: BranchState,
     pub last_pull_at: Option<String>,
     pub last_push_at: Option<String>,
     pub local_oid: Option<String>,
@@ -494,12 +495,17 @@ async fn handle_global_status(daemon: &SharedDaemon) -> Response {
         let synced = tr
             .branches
             .values()
-            .filter(|b| b.sync_status == "synced" || b.sync_status == "up_to_date")
+            .filter(|b| b.state == BranchState::Synced)
             .count();
         let diverged = tr
             .branches
             .values()
-            .filter(|b| b.sync_status == "diverged")
+            .filter(|b| {
+                matches!(
+                    b.state,
+                    BranchState::Diverged | BranchState::DivergedNotOwned
+                )
+            })
             .count();
 
         let disabled = config.is_repo_disabled(&tr.repo_id);
@@ -758,7 +764,7 @@ fn build_status_data(tr: &TrackedRepo, config: &UserConfig) -> StatusData {
         .map(|(name, bs)| BranchStatusData {
             name: name.clone(),
             upstream: upstream_map.get(name.as_str()).map(|s| s.to_string()),
-            status: bs.sync_status.clone(),
+            status: bs.state.clone(),
             last_action: bs
                 .last_pull_at
                 .as_ref()
@@ -1110,7 +1116,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<Vec<Syn
 
         let ref_name = format!("refs/heads/{}", branch.name);
 
-        // Gather inputs for the pure decision function
+        // Gather inputs for the pure decision function.
         let is_checked_out = occupancy.contains_key(&branch.name);
         let is_worktree_dirty = if is_checked_out {
             let wt_path = occupancy.get(&branch.name).unwrap();
@@ -1147,446 +1153,97 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<Vec<Syn
                 .map(|tr| tr.backoff.should_skip_push(&ref_name))
                 .unwrap_or(false)
         };
+        // History-rewrite detection is only meaningful (and only paid for) on an
+        // owned divergence: it distinguishes a rebase/squash from plain concurrent
+        // divergence, and whether the remote also advanced past the old tip.
+        let rewrite = if matches!(analysis, MergeAnalysis::Diverged) && is_owner {
+            git_ops::detect_history_rewrite(&repo_path, &branch.name)
+                .unwrap_or(HistoryRewrite::None)
+        } else {
+            HistoryRewrite::None
+        };
 
         let analysis_str = format!("{:?}", analysis);
-        let sync_input = BranchSyncInput {
-            merge_analysis: analysis,
+        let inputs = BranchInputs {
+            analysis,
             is_checked_out,
             is_worktree_dirty,
             is_owner,
             is_merge_of_remote,
             push_backoff_active,
+            rewrite: rewrite.clone(),
         };
-        let action = decide_branch_action(&sync_input);
-        let action_str = format!("{:?}", action);
+        let action = decide_branch_action(&inputs);
 
-        // Helper to build a branch sync event.
-        macro_rules! branch_event {
-            ($status:expr, $detail:expr) => {
-                branch_event!($status, $detail, None)
-            };
-            ($status:expr, $detail:expr, $rewrite:expr) => {
-                SyncEvent::Branch {
-                    branch: branch.name.clone(),
-                    analysis: analysis_str.clone(),
-                    sync_action: action_str.clone(),
-                    rewrite: $rewrite,
-                    status: $status.to_string(),
-                    detail: $detail.to_string(),
-                }
-            };
+        // 5b. Execute the decided action into a single outcome, then apply that
+        // outcome (state write, backoff, event) in one place below. This keeps
+        // the executor free of repeated lock/set_branch/event boilerplate.
+        let outcome = execute_action(
+            &repo_path,
+            &repo_label,
+            branch,
+            &action,
+            &occupancy,
+            &worktrees,
+            &upstream_name,
+            &ref_name,
+            git_path_ref,
+            &rewrite,
+        )
+        .await;
+
+        let Some(outcome) = outcome else { continue };
+
+        if outcome.had_activity {
+            had_activity = true;
         }
 
-        // Execute the decided action
-        match action {
-            SyncAction::UpstreamGone => {
-                repo_info!(repo_label, "upstream gone :{}", branch.name);
-                let mut repos = daemon.repos.write().await;
-                if let Some(tr) = repos.get_mut(repo_id) {
-                    tr.set_branch(
-                        &branch.name,
-                        BranchRuntimeState {
-                            sync_status: "upstream_gone".into(),
-                            last_pull_at: None,
-                            last_push_at: None,
-                            local_oid: Some(branch.local_oid.clone()),
-                            remote_oid: None,
-                            error_message: Some("upstream ref deleted".into()),
-                        },
-                    );
+        let timestamp = if outcome.mark_pull || outcome.mark_push {
+            Some(chrono::Utc::now().to_rfc3339())
+        } else {
+            None
+        };
+
+        {
+            let mut repos = daemon.repos.write().await;
+            if let Some(tr) = repos.get_mut(repo_id) {
+                match outcome.backoff {
+                    BackoffOp::None => {}
+                    BackoffOp::ResetPush => tr.backoff.reset_push_backoff(&ref_name),
+                    BackoffOp::RecordPush => tr.backoff.record_push_failure(&ref_name),
+                    BackoffOp::RecordFetch => tr.backoff.record_fetch_failure(),
                 }
-                events.push(branch_event!("upstream_gone", "upstream ref deleted"));
-            }
-
-            SyncAction::UpToDate => {
-                let mut repos = daemon.repos.write().await;
-                if let Some(tr) = repos.get_mut(repo_id) {
-                    tr.set_branch(
-                        &branch.name,
-                        BranchRuntimeState {
-                            sync_status: "synced".into(),
-                            last_pull_at: None,
-                            last_push_at: None,
-                            local_oid: Some(branch.local_oid.clone()),
-                            remote_oid: branch.remote_oid.clone(),
-                            error_message: None,
-                        },
-                    );
-                }
-                events.push(branch_event!("synced", "up to date"));
-            }
-
-            SyncAction::SkipDirty => {
-                repo_info!(repo_label, "skipping ff :{} — worktree dirty", branch.name);
-                let mut repos = daemon.repos.write().await;
-                if let Some(tr) = repos.get_mut(repo_id) {
-                    tr.set_branch(
-                        &branch.name,
-                        BranchRuntimeState {
-                            sync_status: "pending_dirty".into(),
-                            last_pull_at: None,
-                            last_push_at: None,
-                            local_oid: Some(branch.local_oid.clone()),
-                            remote_oid: branch.remote_oid.clone(),
-                            error_message: Some("dirty worktree — commit or stash to sync".into()),
-                        },
-                    );
-                }
-                events.push(branch_event!("pending_dirty", "skipped — worktree dirty"));
-            }
-
-            SyncAction::FastForwardMerge => {
-                let remote_oid = match &branch.remote_oid {
-                    Some(oid) => oid.clone(),
-                    None => continue,
-                };
-                let wt_path = occupancy.get(&branch.name).unwrap();
-                let wt_path_buf = PathBuf::from(wt_path);
-
-                match git_ops::git_ff_merge(
-                    &wt_path_buf,
-                    &upstream_name,
-                    git_path_ref,
-                    GIT_TIMEOUT_SECS,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        had_activity = true;
-                        repo_info!(repo_label, "ff-merged :{}", branch.name);
-                        let now = chrono::Utc::now().to_rfc3339();
-                        let mut repos = daemon.repos.write().await;
-                        if let Some(tr) = repos.get_mut(repo_id) {
-                            tr.set_branch(
-                                &branch.name,
-                                BranchRuntimeState {
-                                    sync_status: "synced".into(),
-                                    last_pull_at: Some(now),
-                                    last_push_at: None,
-                                    local_oid: Some(remote_oid.clone()),
-                                    remote_oid: Some(remote_oid),
-                                    error_message: None,
-                                },
-                            );
-                        }
-                        events.push(branch_event!("synced", "fast-forwarded"));
-                    }
-                    Err(e) => {
-                        repo_warn!(repo_label, "ff-merge failed :{}: {:#}", branch.name, e);
-                        let mut repos = daemon.repos.write().await;
-                        if let Some(tr) = repos.get_mut(repo_id) {
-                            tr.set_branch(
-                                &branch.name,
-                                BranchRuntimeState {
-                                    sync_status: "error".into(),
-                                    last_pull_at: None,
-                                    last_push_at: None,
-                                    local_oid: Some(branch.local_oid.clone()),
-                                    remote_oid: Some(remote_oid),
-                                    error_message: Some(format!("{:#}", e)),
-                                },
-                            );
-                        }
-                        events.push(branch_event!("error", "fast-forward failed"));
-                    }
-                }
-            }
-
-            SyncAction::FastForwardRef => {
-                let remote_oid = match &branch.remote_oid {
-                    Some(oid) => oid.clone(),
-                    None => continue,
-                };
-                match git_ops::git_update_ref(
-                    &repo_path,
-                    &ref_name,
-                    &remote_oid,
-                    &branch.local_oid,
-                    git_path_ref,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        had_activity = true;
-                        repo_info!(repo_label, "update-ref :{}", branch.name);
-                        let now = chrono::Utc::now().to_rfc3339();
-                        let mut repos = daemon.repos.write().await;
-                        if let Some(tr) = repos.get_mut(repo_id) {
-                            tr.set_branch(
-                                &branch.name,
-                                BranchRuntimeState {
-                                    sync_status: "synced".into(),
-                                    last_pull_at: Some(now),
-                                    last_push_at: None,
-                                    local_oid: Some(remote_oid.clone()),
-                                    remote_oid: Some(remote_oid),
-                                    error_message: None,
-                                },
-                            );
-                        }
-                        events.push(branch_event!("synced", "fast-forwarded (ref update)"));
-                    }
-                    Err(e) => {
-                        repo_warn!(repo_label, "update-ref failed :{}: {:#}", branch.name, e);
-                        events.push(branch_event!("error", "fast-forward ref update failed"));
-                    }
-                }
-            }
-
-            SyncAction::LocalAheadNotOwned => {
-                let mut repos = daemon.repos.write().await;
-                if let Some(tr) = repos.get_mut(repo_id) {
-                    tr.set_branch(&branch.name, BranchRuntimeState {
-                        sync_status: "local_ahead".into(),
-                        last_pull_at: None,
-                        last_push_at: None,
-                        local_oid: Some(branch.local_oid.clone()),
-                        remote_oid: branch.remote_oid.clone(),
-                        error_message: Some("local commits on non-owned branch — push manually or create a new branch".into()),
-                    });
-                }
-                events.push(branch_event!(
-                    "local_ahead",
-                    "local ahead, not owned — skipped"
-                ));
-            }
-
-            SyncAction::SkipPushBackoff => {
-                // Silently skip — backoff active
-            }
-
-            SyncAction::Push => {
-                let push_path = worktrees
-                    .first()
-                    .map(|wt| PathBuf::from(&wt.path))
-                    .unwrap_or_else(|| repo_path.clone());
-
-                match git_ops::git_push(
-                    &push_path,
-                    &branch.remote,
+                tr.set_branch(
                     &branch.name,
-                    &branch.remote_ref,
-                    git_path_ref,
-                    GIT_TIMEOUT_SECS,
-                )
-                .await
-                {
-                    Ok(PushResult::Success) => {
-                        had_activity = true;
-                        repo_info!(repo_label, "pushed :{}", branch.name);
-                        let now = chrono::Utc::now().to_rfc3339();
-                        let mut repos = daemon.repos.write().await;
-                        if let Some(tr) = repos.get_mut(repo_id) {
-                            tr.backoff.reset_push_backoff(&ref_name);
-                            tr.set_branch(
-                                &branch.name,
-                                BranchRuntimeState {
-                                    sync_status: "synced".into(),
-                                    last_pull_at: None,
-                                    last_push_at: Some(now),
-                                    local_oid: Some(branch.local_oid.clone()),
-                                    remote_oid: Some(branch.local_oid.clone()),
-                                    error_message: None,
-                                },
-                            );
-                        }
-                        events.push(branch_event!("synced", "pushed"));
-                    }
-                    Ok(PushResult::Rejected(msg)) => {
-                        repo_warn!(repo_label, "push rejected :{}: {}", branch.name, msg);
-                        let mut repos = daemon.repos.write().await;
-                        if let Some(tr) = repos.get_mut(repo_id) {
-                            tr.backoff.record_push_failure(&ref_name);
-                            tr.set_branch(
-                                &branch.name,
-                                BranchRuntimeState {
-                                    sync_status: "push_rejected".into(),
-                                    last_pull_at: None,
-                                    last_push_at: None,
-                                    local_oid: Some(branch.local_oid.clone()),
-                                    remote_oid: branch.remote_oid.clone(),
-                                    error_message: Some(msg),
-                                },
-                            );
-                        }
-                    }
-                    Ok(PushResult::AuthFailed(msg)) => {
-                        repo_warn!(repo_label, "push auth failed :{}: {}", branch.name, msg);
-                        let mut repos = daemon.repos.write().await;
-                        if let Some(tr) = repos.get_mut(repo_id) {
-                            tr.backoff.record_fetch_failure();
-                            tr.set_branch(
-                                &branch.name,
-                                BranchRuntimeState {
-                                    sync_status: "auth_failed".into(),
-                                    last_pull_at: None,
-                                    last_push_at: None,
-                                    local_oid: Some(branch.local_oid.clone()),
-                                    remote_oid: branch.remote_oid.clone(),
-                                    error_message: Some(msg),
-                                },
-                            );
-                        }
-                    }
-                    Ok(PushResult::NetworkError(msg)) => {
-                        repo_warn!(repo_label, "push network error :{}: {}", branch.name, msg);
-                        let mut repos = daemon.repos.write().await;
-                        if let Some(tr) = repos.get_mut(repo_id) {
-                            tr.backoff.record_fetch_failure();
-                            tr.set_branch(
-                                &branch.name,
-                                BranchRuntimeState {
-                                    sync_status: "network_error".into(),
-                                    last_pull_at: None,
-                                    last_push_at: None,
-                                    local_oid: Some(branch.local_oid.clone()),
-                                    remote_oid: branch.remote_oid.clone(),
-                                    error_message: Some(msg),
-                                },
-                            );
-                        }
-                    }
-                    Ok(PushResult::HookTimeout) => {
-                        repo_warn!(repo_label, "push hook timeout :{}", branch.name);
-                        let mut repos = daemon.repos.write().await;
-                        if let Some(tr) = repos.get_mut(repo_id) {
-                            tr.backoff.record_push_failure(&ref_name);
-                            tr.set_branch(
-                                &branch.name,
-                                BranchRuntimeState {
-                                    sync_status: "push_blocked_hook_timeout".into(),
-                                    last_pull_at: None,
-                                    last_push_at: None,
-                                    local_oid: Some(branch.local_oid.clone()),
-                                    remote_oid: branch.remote_oid.clone(),
-                                    error_message: Some("push hook timed out".into()),
-                                },
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        repo_error!(repo_label, "push error :{}: {:#}", branch.name, e);
-                        events.push(branch_event!("error", "push failed"));
-                    }
-                }
-            }
-
-            SyncAction::DivergedNotOwned => {
-                repo_warn!(repo_label, "diverged :{}", branch.name);
-                let mut repos = daemon.repos.write().await;
-                if let Some(tr) = repos.get_mut(repo_id) {
-                    tr.set_branch(
-                        &branch.name,
-                        BranchRuntimeState {
-                            sync_status: "diverged".into(),
-                            last_pull_at: None,
-                            last_push_at: None,
-                            local_oid: Some(branch.local_oid.clone()),
-                            remote_oid: branch.remote_oid.clone(),
-                            error_message: Some(
-                                "diverged (last remote commit by someone else)".into(),
-                            ),
+                    BranchRuntimeState {
+                        state: outcome.state.clone(),
+                        last_pull_at: if outcome.mark_pull {
+                            timestamp.clone()
+                        } else {
+                            None
                         },
-                    );
-                }
-                events.push(branch_event!("diverged", "diverged, not owned — flagged"));
+                        last_push_at: if outcome.mark_push {
+                            timestamp.clone()
+                        } else {
+                            None
+                        },
+                        local_oid: outcome.local_oid.clone(),
+                        remote_oid: outcome.remote_oid.clone(),
+                        error_message: outcome.error_message.clone(),
+                    },
+                );
             }
+        }
 
-            SyncAction::Diverged => {
-                // gitsitter only fast-forwards and pushes; a genuine
-                // divergence is reported and held for manual resolution.
-                // Detecting a local history rewrite (rebase -i, squash) lets
-                // the status distinguish that — and whether the remote also
-                // advanced — from a plain divergence.
-                let rewrite = git_ops::detect_history_rewrite(&repo_path, &branch.name)
-                    .unwrap_or(HistoryRewrite::None);
-                let rewrite_str = Some(format!("{:?}", rewrite));
-
-                match rewrite {
-                    HistoryRewrite::RemoteUnchanged => {
-                        repo_info!(
-                            repo_label,
-                            "history rewritten (remote unchanged) :{}",
-                            branch.name
-                        );
-                        let mut repos = daemon.repos.write().await;
-                        if let Some(tr) = repos.get_mut(repo_id) {
-                            tr.set_branch(
-                                &branch.name,
-                                BranchRuntimeState {
-                                    sync_status: "history_rewritten_remote_unchanged".into(),
-                                    last_pull_at: None,
-                                    last_push_at: None,
-                                    local_oid: Some(branch.local_oid.clone()),
-                                    remote_oid: branch.remote_oid.clone(),
-                                    error_message: Some(
-                                        "local history rewritten — push --force-with-lease when ready".into(),
-                                    ),
-                                },
-                            );
-                        }
-                        events.push(branch_event!(
-                            "history_rewritten_remote_unchanged",
-                            "history rewrite detected, remote unchanged — holding",
-                            rewrite_str.clone()
-                        ));
-                        continue;
-                    }
-                    HistoryRewrite::RemoteAdvanced => {
-                        repo_info!(
-                            repo_label,
-                            "history rewritten (remote advanced) :{}",
-                            branch.name
-                        );
-                        let mut repos = daemon.repos.write().await;
-                        if let Some(tr) = repos.get_mut(repo_id) {
-                            tr.set_branch(
-                                &branch.name,
-                                BranchRuntimeState {
-                                    sync_status: "history_rewritten_remote_advanced".into(),
-                                    last_pull_at: None,
-                                    last_push_at: None,
-                                    local_oid: Some(branch.local_oid.clone()),
-                                    remote_oid: branch.remote_oid.clone(),
-                                    error_message: Some(
-                                        "local history rewritten and remote advanced — force-push would discard remote commits; consider backing up and resetting to remote".into(),
-                                    ),
-                                },
-                            );
-                        }
-                        events.push(branch_event!(
-                            "history_rewritten_remote_advanced",
-                            "history rewrite detected, remote advanced — holding",
-                            rewrite_str.clone()
-                        ));
-                        continue;
-                    }
-                    HistoryRewrite::None => {
-                        repo_warn!(repo_label, "diverged :{}", branch.name);
-                        let mut repos = daemon.repos.write().await;
-                        if let Some(tr) = repos.get_mut(repo_id) {
-                            tr.set_branch(
-                                &branch.name,
-                                BranchRuntimeState {
-                                    sync_status: "diverged_yours".into(),
-                                    last_pull_at: None,
-                                    last_push_at: None,
-                                    local_oid: Some(branch.local_oid.clone()),
-                                    remote_oid: branch.remote_oid.clone(),
-                                    error_message: Some(
-                                        "diverged — resolve manually (merge or rebase)".into(),
-                                    ),
-                                },
-                            );
-                        }
-                        events.push(branch_event!(
-                            "diverged_yours",
-                            "diverged — holding for manual resolution",
-                            rewrite_str.clone()
-                        ));
-                    }
-                }
-            }
+        if outcome.emit_event {
+            events.push(SyncEvent::Branch {
+                branch: branch.name.clone(),
+                analysis: analysis_str.clone(),
+                sync_action: action.label().to_string(),
+                rewrite: outcome.rewrite_label.clone(),
+                status: outcome.state.status_str().to_string(),
+                detail: outcome.detail.clone(),
+            });
         }
     }
 
@@ -1640,81 +1297,324 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<Vec<Syn
 }
 
 // ---------------------------------------------------------------------------
-// Pure sync decision logic
+// Action executor
 // ---------------------------------------------------------------------------
 
-/// The action that the sync loop should take for a single branch.
-#[derive(Debug, Clone, PartialEq)]
-pub enum SyncAction {
-    /// Nothing to do — branch is in sync.
-    UpToDate,
-    /// Upstream tracking ref was deleted.
-    UpstreamGone,
-    /// Fast-forward the branch (it's checked out in a worktree).
-    FastForwardMerge,
-    /// Fast-forward the branch via update-ref (not checked out).
-    FastForwardRef,
-    /// Skip fast-forward because the worktree is dirty.
-    SkipDirty,
-    /// Push local commits to the remote.
-    Push,
-    /// Local is ahead but user doesn't own the branch — don't push.
-    LocalAheadNotOwned,
-    /// Skip push because we're in backoff.
-    SkipPushBackoff,
-    /// Diverged with ownership — reported and held for manual resolution.
-    /// gitsitter never rebases; the user resolves with git directly.
-    Diverged,
-    /// Diverged but user doesn't own the remote tip — flag it.
-    DivergedNotOwned,
+/// A backoff bookkeeping operation to apply after an action runs.
+enum BackoffOp {
+    None,
+    ResetPush,
+    RecordPush,
+    RecordFetch,
 }
 
-/// Inputs to the sync decision function. All the state needed to decide
-/// what to do with a single branch, without any side effects.
-#[derive(Debug, Clone)]
-pub struct BranchSyncInput {
-    pub merge_analysis: MergeAnalysis,
-    pub is_checked_out: bool,
-    pub is_worktree_dirty: bool,
-    pub is_owner: bool,
-    /// For LocalAhead with a merge commit incorporating remote changes.
-    pub is_merge_of_remote: bool,
-    pub push_backoff_active: bool,
+/// The result of executing a single branch's [`SyncAction`]: the new observable
+/// state plus everything the caller needs to record it once.
+struct BranchOutcome {
+    state: BranchState,
+    local_oid: Option<String>,
+    remote_oid: Option<String>,
+    error_message: Option<String>,
+    detail: String,
+    rewrite_label: Option<String>,
+    mark_pull: bool,
+    mark_push: bool,
+    had_activity: bool,
+    backoff: BackoffOp,
+    emit_event: bool,
 }
 
-/// Decide what sync action to take for a branch, purely from its state.
-pub fn decide_branch_action(input: &BranchSyncInput) -> SyncAction {
-    match input.merge_analysis {
-        MergeAnalysis::UpstreamGone => SyncAction::UpstreamGone,
-        MergeAnalysis::UpToDate => SyncAction::UpToDate,
+impl BranchOutcome {
+    /// A held state: no write performed, detail/message derived from the state.
+    fn held(state: BranchState, local_oid: String, remote_oid: Option<String>) -> Self {
+        let detail = state.hold_detail().to_string();
+        let error_message = state.hold_message().map(|s| s.to_string());
+        Self {
+            state,
+            local_oid: Some(local_oid),
+            remote_oid,
+            error_message,
+            detail,
+            rewrite_label: None,
+            mark_pull: false,
+            mark_push: false,
+            had_activity: false,
+            backoff: BackoffOp::None,
+            emit_event: true,
+        }
+    }
+}
 
-        MergeAnalysis::FastForward => {
-            if input.is_checked_out {
-                if input.is_worktree_dirty {
-                    SyncAction::SkipDirty
-                } else {
-                    SyncAction::FastForwardMerge
+/// A failed push outcome. Push failures record state + backoff but, matching the
+/// daemon's long-standing behavior, do not emit a sync event.
+fn push_failure(
+    branch: &git_ops::RepoBranch,
+    err: ActionError,
+    message: String,
+    backoff: BackoffOp,
+) -> BranchOutcome {
+    BranchOutcome {
+        state: BranchState::Failed(err),
+        local_oid: Some(branch.local_oid.clone()),
+        remote_oid: branch.remote_oid.clone(),
+        error_message: Some(message),
+        detail: "push failed".to_string(),
+        rewrite_label: None,
+        mark_pull: false,
+        mark_push: false,
+        had_activity: false,
+        backoff,
+        emit_event: false,
+    }
+}
+
+/// Execute the decided action for a single branch, performing any git side
+/// effects and returning the outcome to record. Returns `None` when there is
+/// nothing to record (silent skip).
+#[allow(clippy::too_many_arguments)]
+async fn execute_action(
+    repo_path: &Path,
+    repo_label: &str,
+    branch: &git_ops::RepoBranch,
+    action: &SyncAction,
+    occupancy: &HashMap<String, String>,
+    worktrees: &[git_ops::WorktreeInfo],
+    upstream_name: &str,
+    ref_name: &str,
+    git_path_ref: Option<&str>,
+    rewrite: &HistoryRewrite,
+) -> Option<BranchOutcome> {
+    match action {
+        SyncAction::SkipPushBackoff => None,
+
+        SyncAction::Noop => Some(BranchOutcome {
+            state: BranchState::Synced,
+            local_oid: Some(branch.local_oid.clone()),
+            remote_oid: branch.remote_oid.clone(),
+            error_message: None,
+            detail: "up to date".to_string(),
+            rewrite_label: None,
+            mark_pull: false,
+            mark_push: false,
+            had_activity: false,
+            backoff: BackoffOp::None,
+            emit_event: true,
+        }),
+
+        SyncAction::Hold(state) => {
+            match state {
+                BranchState::UpstreamGone => {
+                    repo_info!(repo_label, "upstream gone :{}", branch.name)
                 }
+                BranchState::DirtyWorktree => {
+                    repo_info!(repo_label, "skipping ff :{} — worktree dirty", branch.name)
+                }
+                BranchState::DivergedNotOwned | BranchState::Diverged => {
+                    repo_warn!(repo_label, "diverged :{}", branch.name)
+                }
+                BranchState::HistoryRewritten => repo_info!(
+                    repo_label,
+                    "history rewritten (remote unchanged) :{}",
+                    branch.name
+                ),
+                BranchState::HistoryRewrittenRemoteAdvanced => repo_info!(
+                    repo_label,
+                    "history rewritten (remote advanced) :{}",
+                    branch.name
+                ),
+                _ => {}
+            }
+            // The upstream ref is gone, so there is no meaningful remote oid.
+            let remote_oid = if *state == BranchState::UpstreamGone {
+                None
             } else {
-                SyncAction::FastForwardRef
+                branch.remote_oid.clone()
+            };
+            let mut out = BranchOutcome::held(state.clone(), branch.local_oid.clone(), remote_oid);
+            // Surface the rewrite classification for divergence-derived states.
+            if matches!(
+                state,
+                BranchState::Diverged
+                    | BranchState::HistoryRewritten
+                    | BranchState::HistoryRewrittenRemoteAdvanced
+            ) {
+                out.rewrite_label = Some(format!("{:?}", rewrite));
+            }
+            Some(out)
+        }
+
+        SyncAction::FastForwardMerge => {
+            let remote_oid = branch.remote_oid.clone()?;
+            let wt_path = occupancy.get(&branch.name)?;
+            let wt_path_buf = PathBuf::from(wt_path);
+            match git_ops::git_ff_merge(&wt_path_buf, upstream_name, git_path_ref, GIT_TIMEOUT_SECS)
+                .await
+            {
+                Ok(()) => {
+                    repo_info!(repo_label, "ff-merged :{}", branch.name);
+                    Some(BranchOutcome {
+                        state: BranchState::Synced,
+                        local_oid: Some(remote_oid.clone()),
+                        remote_oid: Some(remote_oid),
+                        error_message: None,
+                        detail: "fast-forwarded".to_string(),
+                        rewrite_label: None,
+                        mark_pull: true,
+                        mark_push: false,
+                        had_activity: true,
+                        backoff: BackoffOp::None,
+                        emit_event: true,
+                    })
+                }
+                Err(e) => {
+                    repo_warn!(repo_label, "ff-merge failed :{}: {:#}", branch.name, e);
+                    Some(BranchOutcome {
+                        state: BranchState::Failed(ActionError::Other),
+                        local_oid: Some(branch.local_oid.clone()),
+                        remote_oid: Some(remote_oid),
+                        error_message: Some(format!("{:#}", e)),
+                        detail: "fast-forward failed".to_string(),
+                        rewrite_label: None,
+                        mark_pull: false,
+                        mark_push: false,
+                        had_activity: false,
+                        backoff: BackoffOp::None,
+                        emit_event: true,
+                    })
+                }
             }
         }
 
-        MergeAnalysis::LocalAhead => {
-            if !input.is_owner && !input.is_merge_of_remote {
-                return SyncAction::LocalAheadNotOwned;
+        SyncAction::FastForwardRef => {
+            let remote_oid = branch.remote_oid.clone()?;
+            match git_ops::git_update_ref(
+                repo_path,
+                ref_name,
+                &remote_oid,
+                &branch.local_oid,
+                git_path_ref,
+            )
+            .await
+            {
+                Ok(()) => {
+                    repo_info!(repo_label, "update-ref :{}", branch.name);
+                    Some(BranchOutcome {
+                        state: BranchState::Synced,
+                        local_oid: Some(remote_oid.clone()),
+                        remote_oid: Some(remote_oid),
+                        error_message: None,
+                        detail: "fast-forwarded (ref update)".to_string(),
+                        rewrite_label: None,
+                        mark_pull: true,
+                        mark_push: false,
+                        had_activity: true,
+                        backoff: BackoffOp::None,
+                        emit_event: true,
+                    })
+                }
+                Err(e) => {
+                    repo_warn!(repo_label, "update-ref failed :{}: {:#}", branch.name, e);
+                    Some(BranchOutcome {
+                        state: BranchState::Failed(ActionError::Other),
+                        local_oid: Some(branch.local_oid.clone()),
+                        remote_oid: Some(remote_oid),
+                        error_message: Some(format!("{:#}", e)),
+                        detail: "fast-forward ref update failed".to_string(),
+                        rewrite_label: None,
+                        mark_pull: false,
+                        mark_push: false,
+                        had_activity: false,
+                        backoff: BackoffOp::None,
+                        emit_event: true,
+                    })
+                }
             }
-            if input.push_backoff_active {
-                return SyncAction::SkipPushBackoff;
-            }
-            SyncAction::Push
         }
 
-        MergeAnalysis::Diverged => {
-            if input.is_owner {
-                SyncAction::Diverged
-            } else {
-                SyncAction::DivergedNotOwned
+        SyncAction::Push => {
+            let push_path = worktrees
+                .first()
+                .map(|wt| PathBuf::from(&wt.path))
+                .unwrap_or_else(|| repo_path.to_path_buf());
+
+            match git_ops::git_push(
+                &push_path,
+                &branch.remote,
+                &branch.name,
+                &branch.remote_ref,
+                git_path_ref,
+                GIT_TIMEOUT_SECS,
+            )
+            .await
+            {
+                Ok(PushResult::Success) => {
+                    repo_info!(repo_label, "pushed :{}", branch.name);
+                    Some(BranchOutcome {
+                        state: BranchState::Synced,
+                        local_oid: Some(branch.local_oid.clone()),
+                        remote_oid: Some(branch.local_oid.clone()),
+                        error_message: None,
+                        detail: "pushed".to_string(),
+                        rewrite_label: None,
+                        mark_pull: false,
+                        mark_push: true,
+                        had_activity: true,
+                        backoff: BackoffOp::ResetPush,
+                        emit_event: true,
+                    })
+                }
+                Ok(PushResult::Rejected(msg)) => {
+                    repo_warn!(repo_label, "push rejected :{}: {}", branch.name, msg);
+                    Some(push_failure(
+                        branch,
+                        ActionError::PushRejected,
+                        msg,
+                        BackoffOp::RecordPush,
+                    ))
+                }
+                Ok(PushResult::AuthFailed(msg)) => {
+                    repo_warn!(repo_label, "push auth failed :{}: {}", branch.name, msg);
+                    Some(push_failure(
+                        branch,
+                        ActionError::AuthFailed,
+                        msg,
+                        BackoffOp::RecordFetch,
+                    ))
+                }
+                Ok(PushResult::NetworkError(msg)) => {
+                    repo_warn!(repo_label, "push network error :{}: {}", branch.name, msg);
+                    Some(push_failure(
+                        branch,
+                        ActionError::NetworkError,
+                        msg,
+                        BackoffOp::RecordFetch,
+                    ))
+                }
+                Ok(PushResult::HookTimeout) => {
+                    repo_warn!(repo_label, "push hook timeout :{}", branch.name);
+                    Some(push_failure(
+                        branch,
+                        ActionError::HookTimeout,
+                        "push hook timed out".to_string(),
+                        BackoffOp::RecordPush,
+                    ))
+                }
+                Err(e) => {
+                    repo_error!(repo_label, "push error :{}: {:#}", branch.name, e);
+                    Some(BranchOutcome {
+                        state: BranchState::Failed(ActionError::Other),
+                        local_oid: Some(branch.local_oid.clone()),
+                        remote_oid: branch.remote_oid.clone(),
+                        error_message: Some(format!("{:#}", e)),
+                        detail: "push failed".to_string(),
+                        rewrite_label: None,
+                        mark_pull: false,
+                        mark_push: false,
+                        had_activity: false,
+                        backoff: BackoffOp::None,
+                        emit_event: true,
+                    })
+                }
             }
         }
     }
@@ -1775,173 +1675,5 @@ async fn wait_for_shutdown_signal(shutdown_rx: &mut watch::Receiver<bool>) -> Re
         }
 
         Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn base_input() -> BranchSyncInput {
-        BranchSyncInput {
-            merge_analysis: MergeAnalysis::UpToDate,
-            is_checked_out: false,
-            is_worktree_dirty: false,
-            is_owner: false,
-            is_merge_of_remote: false,
-            push_backoff_active: false,
-        }
-    }
-
-    // --- UpToDate / UpstreamGone ---
-
-    #[test]
-    fn up_to_date() {
-        let input = BranchSyncInput {
-            merge_analysis: MergeAnalysis::UpToDate,
-            ..base_input()
-        };
-        assert_eq!(decide_branch_action(&input), SyncAction::UpToDate);
-    }
-
-    #[test]
-    fn upstream_gone() {
-        let input = BranchSyncInput {
-            merge_analysis: MergeAnalysis::UpstreamGone,
-            ..base_input()
-        };
-        assert_eq!(decide_branch_action(&input), SyncAction::UpstreamGone);
-    }
-
-    // --- FastForward ---
-
-    #[test]
-    fn ff_not_checked_out_uses_update_ref() {
-        let input = BranchSyncInput {
-            merge_analysis: MergeAnalysis::FastForward,
-            is_checked_out: false,
-            ..base_input()
-        };
-        assert_eq!(decide_branch_action(&input), SyncAction::FastForwardRef);
-    }
-
-    #[test]
-    fn ff_checked_out_clean_does_merge() {
-        let input = BranchSyncInput {
-            merge_analysis: MergeAnalysis::FastForward,
-            is_checked_out: true,
-            is_worktree_dirty: false,
-            ..base_input()
-        };
-        assert_eq!(decide_branch_action(&input), SyncAction::FastForwardMerge);
-    }
-
-    #[test]
-    fn ff_checked_out_dirty_skips() {
-        let input = BranchSyncInput {
-            merge_analysis: MergeAnalysis::FastForward,
-            is_checked_out: true,
-            is_worktree_dirty: true,
-            ..base_input()
-        };
-        assert_eq!(decide_branch_action(&input), SyncAction::SkipDirty);
-    }
-
-    // --- LocalAhead ---
-
-    #[test]
-    fn local_ahead_not_owned() {
-        let input = BranchSyncInput {
-            merge_analysis: MergeAnalysis::LocalAhead,
-            is_owner: false,
-            is_merge_of_remote: false,
-            ..base_input()
-        };
-        assert_eq!(decide_branch_action(&input), SyncAction::LocalAheadNotOwned);
-    }
-
-    #[test]
-    fn local_ahead_owned_pushes() {
-        let input = BranchSyncInput {
-            merge_analysis: MergeAnalysis::LocalAhead,
-            is_owner: true,
-            ..base_input()
-        };
-        assert_eq!(decide_branch_action(&input), SyncAction::Push);
-    }
-
-    #[test]
-    fn local_ahead_merge_of_remote_pushes() {
-        let input = BranchSyncInput {
-            merge_analysis: MergeAnalysis::LocalAhead,
-            is_owner: false,
-            is_merge_of_remote: true,
-            ..base_input()
-        };
-        assert_eq!(decide_branch_action(&input), SyncAction::Push);
-    }
-
-    #[test]
-    fn local_ahead_push_backoff() {
-        let input = BranchSyncInput {
-            merge_analysis: MergeAnalysis::LocalAhead,
-            is_owner: true,
-            push_backoff_active: true,
-            ..base_input()
-        };
-        assert_eq!(decide_branch_action(&input), SyncAction::SkipPushBackoff);
-    }
-
-    // --- Diverged ---
-
-    // gitsitter never rebases — an owned divergence is always held and
-    // reported, regardless of whether the branch is checked out or dirty.
-    #[test]
-    fn diverged_owner_clean_holds() {
-        let input = BranchSyncInput {
-            merge_analysis: MergeAnalysis::Diverged,
-            is_owner: true,
-            is_checked_out: true,
-            is_worktree_dirty: false,
-            ..base_input()
-        };
-        assert_eq!(decide_branch_action(&input), SyncAction::Diverged);
-    }
-
-    #[test]
-    fn diverged_owner_not_checked_out_holds() {
-        let input = BranchSyncInput {
-            merge_analysis: MergeAnalysis::Diverged,
-            is_owner: true,
-            is_checked_out: false,
-            ..base_input()
-        };
-        assert_eq!(decide_branch_action(&input), SyncAction::Diverged);
-    }
-
-    #[test]
-    fn diverged_owner_dirty_holds() {
-        let input = BranchSyncInput {
-            merge_analysis: MergeAnalysis::Diverged,
-            is_owner: true,
-            is_checked_out: true,
-            is_worktree_dirty: true,
-            ..base_input()
-        };
-        assert_eq!(decide_branch_action(&input), SyncAction::Diverged);
-    }
-
-    #[test]
-    fn diverged_not_owned() {
-        let input = BranchSyncInput {
-            merge_analysis: MergeAnalysis::Diverged,
-            is_owner: false,
-            ..base_input()
-        };
-        assert_eq!(decide_branch_action(&input), SyncAction::DivergedNotOwned);
     }
 }
