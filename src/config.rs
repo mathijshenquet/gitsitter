@@ -155,12 +155,6 @@ struct RawConfigToml {
         skip_serializing_if = "Option::is_none"
     )]
     watcher_debounce: Option<Duration>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    on_conflict: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    resolve_agent: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    resolve_agent_path: Option<String>,
 }
 
 /// Raw representation of repos.toml.
@@ -202,70 +196,6 @@ pub struct UserConfig {
     pub repos: HashMap<String, RepoConfig>,
 }
 
-/// What to do when a rebase hits conflicts.
-#[derive(Debug, Clone, PartialEq)]
-pub enum OnConflict {
-    /// Try resolve agent if configured, otherwise leave conflicts. Default.
-    Auto,
-    /// Abort rebase, restore clean state.
-    Revert,
-    /// Leave repo in conflict state for user to handle.
-    Leave,
-    /// Spawn resolve agent (falls back to leave if not configured).
-    ResolveAgent,
-}
-
-impl OnConflict {
-    fn from_str_opt(s: Option<&str>) -> Self {
-        match s {
-            Some("revert") => OnConflict::Revert,
-            Some("leave") => OnConflict::Leave,
-            Some("resolve-agent") => OnConflict::ResolveAgent,
-            Some("auto") | None => OnConflict::Auto,
-            Some(_) => OnConflict::Auto,
-        }
-    }
-
-    pub fn to_str(&self) -> &'static str {
-        match self {
-            OnConflict::Auto => "auto",
-            OnConflict::Revert => "revert",
-            OnConflict::Leave => "leave",
-            OnConflict::ResolveAgent => "resolve-agent",
-        }
-    }
-
-    /// Resolve the effective policy given whether an agent is configured.
-    pub fn effective(&self, has_agent: bool) -> EffectiveConflictAction {
-        match self {
-            OnConflict::Revert => EffectiveConflictAction::Revert,
-            OnConflict::Leave => EffectiveConflictAction::Leave,
-            OnConflict::ResolveAgent => {
-                if has_agent {
-                    EffectiveConflictAction::ResolveAgent
-                } else {
-                    EffectiveConflictAction::Leave
-                }
-            }
-            OnConflict::Auto => {
-                if has_agent {
-                    EffectiveConflictAction::ResolveAgent
-                } else {
-                    EffectiveConflictAction::Leave
-                }
-            }
-        }
-    }
-}
-
-/// The resolved action after considering agent availability.
-#[derive(Debug, Clone, PartialEq)]
-pub enum EffectiveConflictAction {
-    Revert,
-    Leave,
-    ResolveAgent,
-}
-
 #[derive(Debug, Clone)]
 pub struct GlobalSettings {
     pub refresh_interval: Duration,
@@ -274,9 +204,6 @@ pub struct GlobalSettings {
     pub notification_cooldown: Duration,
     pub git_path: Option<String>,
     pub watcher_debounce: Option<Duration>,
-    pub on_conflict: OnConflict,
-    pub resolve_agent: Option<String>,
-    pub resolve_agent_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -303,9 +230,6 @@ impl Default for GlobalSettings {
             notification_cooldown: Duration::from_secs(300),
             git_path: None,
             watcher_debounce: None,
-            on_conflict: OnConflict::Auto,
-            resolve_agent: None,
-            resolve_agent_path: None,
         }
     }
 }
@@ -425,9 +349,6 @@ fn load_config_toml(path: &Path) -> Result<GlobalSettings> {
             .unwrap_or(Duration::from_secs(300)),
         git_path: raw.git_path,
         watcher_debounce: raw.watcher_debounce,
-        on_conflict: OnConflict::from_str_opt(raw.on_conflict.as_deref()),
-        resolve_agent: raw.resolve_agent,
-        resolve_agent_path: raw.resolve_agent_path,
     })
 }
 
@@ -820,13 +741,11 @@ mod tests {
             refresh_interval = "30s"
             colors = false
             emoji = false
-            on_conflict = "revert"
         "#;
         let raw: RawConfigToml = toml::from_str(toml_str).unwrap();
         assert_eq!(raw.refresh_interval, Some(Duration::from_secs(30)));
         assert_eq!(raw.colors, Some(false));
         assert_eq!(raw.emoji, Some(false));
-        assert_eq!(raw.on_conflict, Some("revert".to_string()));
     }
 
     // --- Repos TOML parsing ---
@@ -860,52 +779,6 @@ mod tests {
         assert_eq!(
             *disabled,
             Disabled::Remotes(vec!["upstream".into(), "fork".into()])
-        );
-    }
-
-    // --- OnConflict ---
-
-    #[test]
-    fn on_conflict_from_str() {
-        assert_eq!(OnConflict::from_str_opt(None), OnConflict::Auto);
-        assert_eq!(OnConflict::from_str_opt(Some("revert")), OnConflict::Revert);
-        assert_eq!(OnConflict::from_str_opt(Some("leave")), OnConflict::Leave);
-        assert_eq!(
-            OnConflict::from_str_opt(Some("resolve-agent")),
-            OnConflict::ResolveAgent
-        );
-        assert_eq!(OnConflict::from_str_opt(Some("bogus")), OnConflict::Auto);
-    }
-
-    #[test]
-    fn on_conflict_effective_without_agent() {
-        assert_eq!(
-            OnConflict::Auto.effective(false),
-            EffectiveConflictAction::Leave
-        );
-        assert_eq!(
-            OnConflict::Revert.effective(false),
-            EffectiveConflictAction::Revert
-        );
-        assert_eq!(
-            OnConflict::ResolveAgent.effective(false),
-            EffectiveConflictAction::Leave
-        );
-    }
-
-    #[test]
-    fn on_conflict_effective_with_agent() {
-        assert_eq!(
-            OnConflict::Auto.effective(true),
-            EffectiveConflictAction::ResolveAgent
-        );
-        assert_eq!(
-            OnConflict::Revert.effective(true),
-            EffectiveConflictAction::Revert
-        );
-        assert_eq!(
-            OnConflict::ResolveAgent.effective(true),
-            EffectiveConflictAction::ResolveAgent
         );
     }
 

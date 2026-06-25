@@ -7,14 +7,9 @@ let
   bashHook = builtins.readFile ../src/embed/bash_hook.sh;
   zshHook = builtins.readFile ../src/embed/zsh_hook.zsh;
   fishHook = builtins.readFile ../src/embed/fish_hook.fish;
-  resolveAgentSettings = lib.optionalAttrs cfg.resolveAgent.enable {
-    on_conflict = "auto";
-    resolve_agent = cfg.resolveAgent.tool;
-  };
-  renderedSettings = resolveAgentSettings // cfg.settings;
+  renderedSettings = cfg.settings;
   daemonPathPackages = [ pkgs.git pkgs.openssh ]
-    ++ lib.optional cfg.githubIntegration.enable pkgs.gh
-    ++ lib.optional (cfg.resolveAgent.enable && cfg.resolveAgent.package != null) cfg.resolveAgent.package;
+    ++ lib.optional cfg.githubIntegration.enable pkgs.gh;
   daemonPath = lib.makeBinPath daemonPathPackages;
   envVars = {
     GITSITTER_CONFIG_DIR = "${config.xdg.configHome}";
@@ -69,20 +64,6 @@ in
     };
 
     githubIntegration.enable = lib.mkEnableOption "GitHub integration (relaxed ownership via gh CLI)";
-
-    resolveAgent = {
-      enable = lib.mkEnableOption "AI-assisted conflict resolution";
-      tool = lib.mkOption {
-        type = lib.types.str;
-        default = "claude";
-        description = "Which resolve agent to use (e.g. \"claude\").";
-      };
-      package = lib.mkOption {
-        type = lib.types.nullOr lib.types.package;
-        default = null;
-        description = "Resolve agent package. If null, assumes the tool binary is on PATH.";
-      };
-    };
   };
 
   config = lib.mkIf cfg.enable {

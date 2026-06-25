@@ -132,7 +132,7 @@ pub enum SyncEvent {
         branch: String,
         /// MergeAnalysis result: "UpToDate", "FastForward", "LocalAhead", "Diverged", "UpstreamGone"
         analysis: String,
-        /// SyncAction chosen: "FastForwardMerge", "Push", "RebaseThenPush", "DivergedNotOwned", etc.
+        /// SyncAction chosen: "FastForwardMerge", "Push", "Diverged", "DivergedNotOwned", etc.
         sync_action: String,
         /// HistoryRewrite result (only for Diverged+owned): "None", "RemoteUnchanged", "RemoteAdvanced"
         #[serde(skip_serializing_if = "Option::is_none")]

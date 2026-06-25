@@ -29,7 +29,7 @@ macro_rules! repo_error {
 }
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 
-use crate::config::{EffectiveConflictAction, InRepoConfig, UserConfig};
+use crate::config::{InRepoConfig, UserConfig};
 use crate::forge::ForgeCache;
 use crate::git_ops::{self, HistoryRewrite, MergeAnalysis, PushResult};
 use crate::paths::Paths;
@@ -1216,18 +1216,8 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<Vec<Syn
                 events.push(branch_event!("synced", "up to date"));
             }
 
-            SyncAction::SkipDirty | SyncAction::SkipRebaseDirty => {
-                let label = if matches!(action, SyncAction::SkipDirty) {
-                    "ff"
-                } else {
-                    "rebase"
-                };
-                repo_info!(
-                    repo_label,
-                    "skipping {} :{} — worktree dirty",
-                    label,
-                    branch.name
-                );
+            SyncAction::SkipDirty => {
+                repo_info!(repo_label, "skipping ff :{} — worktree dirty", branch.name);
                 let mut repos = daemon.repos.write().await;
                 if let Some(tr) = repos.get_mut(repo_id) {
                     tr.set_branch(
@@ -1502,9 +1492,12 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<Vec<Syn
                 events.push(branch_event!("diverged", "diverged, not owned — flagged"));
             }
 
-            SyncAction::RebaseThenPush => {
-                // Before attempting rebase, check if the local branch
-                // was intentionally rewritten (e.g. rebase -i, squash).
+            SyncAction::Diverged => {
+                // gitsitter only fast-forwards and pushes; a genuine
+                // divergence is reported and held for manual resolution.
+                // Detecting a local history rewrite (rebase -i, squash) lets
+                // the status distinguish that — and whether the remote also
+                // advanced — from a plain divergence.
                 let rewrite = git_ops::detect_history_rewrite(&repo_path, &branch.name)
                     .unwrap_or(HistoryRewrite::None);
                 let rewrite_str = Some(format!("{:?}", rewrite));
@@ -1569,297 +1562,28 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<Vec<Syn
                         continue;
                     }
                     HistoryRewrite::None => {
-                        // Ordinary divergence — proceed with rebase
-                    }
-                }
-
-                let rebase_path = worktrees
-                    .first()
-                    .map(|wt| PathBuf::from(&wt.path))
-                    .unwrap_or_else(|| repo_path.clone());
-
-                let upstream_ref = format!("{}/{}", branch.remote, branch.remote_ref);
-                let rebase_ok = git_ops::git_rebase(
-                    &rebase_path,
-                    &upstream_ref,
-                    git_path_ref,
-                    GIT_TIMEOUT_SECS,
-                )
-                .await
-                .unwrap_or(false);
-
-                if rebase_ok {
-                    repo_info!(repo_label, "rebased :{} onto {}", branch.name, upstream_ref);
-                    let push_path = worktrees
-                        .first()
-                        .map(|wt| PathBuf::from(&wt.path))
-                        .unwrap_or_else(|| repo_path.clone());
-
-                    match git_ops::git_push(
-                        &push_path,
-                        &branch.remote,
-                        &branch.name,
-                        &branch.remote_ref,
-                        git_path_ref,
-                        GIT_TIMEOUT_SECS,
-                    )
-                    .await
-                    {
-                        Ok(PushResult::Success) => {
-                            had_activity = true;
-                            repo_info!(repo_label, "pushed (after rebase) :{}", branch.name);
-                            let now = chrono::Utc::now().to_rfc3339();
-                            let mut repos = daemon.repos.write().await;
-                            if let Some(tr) = repos.get_mut(repo_id) {
-                                tr.backoff.reset_push_backoff(&ref_name);
-                                tr.set_branch(
-                                    &branch.name,
-                                    BranchRuntimeState {
-                                        sync_status: "synced".into(),
-                                        last_pull_at: None,
-                                        last_push_at: Some(now),
-                                        local_oid: Some(branch.local_oid.clone()),
-                                        remote_oid: Some(branch.local_oid.clone()),
-                                        error_message: None,
-                                    },
-                                );
-                            }
-                            events.push(branch_event!(
-                                "synced",
-                                format!("rebased onto {}, pushed", upstream_ref),
-                                rewrite_str.clone()
-                            ));
-                        }
-                        _ => {
-                            repo_warn!(repo_label, "push after rebase failed :{}", branch.name);
-                            let mut repos = daemon.repos.write().await;
-                            if let Some(tr) = repos.get_mut(repo_id) {
-                                tr.backoff.record_push_failure(&ref_name);
-                                tr.set_branch(
-                                    &branch.name,
-                                    BranchRuntimeState {
-                                        sync_status: "diverged_yours".into(),
-                                        last_pull_at: None,
-                                        last_push_at: None,
-                                        local_oid: Some(branch.local_oid.clone()),
-                                        remote_oid: branch.remote_oid.clone(),
-                                        error_message: Some(
-                                            "rebased but push failed — will retry".into(),
-                                        ),
-                                    },
-                                );
-                            }
-                            events.push(branch_event!(
-                                "diverged_yours",
-                                format!("rebased onto {}, push failed", upstream_ref),
-                                rewrite_str.clone()
-                            ));
-                        }
-                    }
-                } else {
-                    // Rebase had conflicts — apply on_conflict policy
-                    repo_warn!(repo_label, "rebase conflicts :{}", branch.name);
-                    let has_agent = config.global.resolve_agent.is_some();
-                    let conflict_action = config.global.on_conflict.effective(has_agent);
-
-                    match conflict_action {
-                        EffectiveConflictAction::Revert => {
-                            let _ = git_ops::git_rebase_abort(
-                                &rebase_path,
-                                git_path_ref,
-                                GIT_TIMEOUT_SECS,
-                            )
-                            .await;
-                            let mut repos = daemon.repos.write().await;
-                            if let Some(tr) = repos.get_mut(repo_id) {
-                                tr.set_branch(
-                                    &branch.name,
-                                    BranchRuntimeState {
-                                        sync_status: "diverged_yours".into(),
-                                        last_pull_at: None,
-                                        last_push_at: None,
-                                        local_oid: Some(branch.local_oid.clone()),
-                                        remote_oid: branch.remote_oid.clone(),
-                                        error_message: Some(
-                                            "diverged — rebase has conflicts, resolve manually"
-                                                .into(),
-                                        ),
-                                    },
-                                );
-                            }
-                            events.push(branch_event!(
-                                "diverged_yours",
-                                "rebase conflicts, reverted",
-                                rewrite_str.clone()
-                            ));
-                        }
-                        EffectiveConflictAction::Leave => {
-                            let mut repos = daemon.repos.write().await;
-                            if let Some(tr) = repos.get_mut(repo_id) {
-                                tr.set_branch(&branch.name, BranchRuntimeState {
-                                    sync_status: "merge_conflict".into(),
+                        repo_warn!(repo_label, "diverged :{}", branch.name);
+                        let mut repos = daemon.repos.write().await;
+                        if let Some(tr) = repos.get_mut(repo_id) {
+                            tr.set_branch(
+                                &branch.name,
+                                BranchRuntimeState {
+                                    sync_status: "diverged_yours".into(),
                                     last_pull_at: None,
                                     last_push_at: None,
                                     local_oid: Some(branch.local_oid.clone()),
                                     remote_oid: branch.remote_oid.clone(),
-                                    error_message: Some("rebase conflicts — resolve manually or run `gitsitter auto-resolve`".into()),
-                                });
-                            }
-                            events.push(branch_event!(
-                                "merge_conflict",
-                                "rebase conflicts, left in place",
-                                rewrite_str.clone()
-                            ));
-                        }
-                        EffectiveConflictAction::ResolveAgent => {
-                            let agent = config.global.resolve_agent.as_deref().unwrap_or("claude");
-                            let agent_path = config.global.resolve_agent_path.as_deref();
-                            repo_info!(
-                                repo_label,
-                                "running resolve agent '{}' :{}",
-                                agent,
-                                branch.name
+                                    error_message: Some(
+                                        "diverged — resolve manually (merge or rebase)".into(),
+                                    ),
+                                },
                             );
-
-                            const RESOLVE_TIMEOUT_SECS: u64 = 180;
-                            match git_ops::run_resolve_agent(
-                                &rebase_path,
-                                agent,
-                                agent_path,
-                                RESOLVE_TIMEOUT_SECS,
-                            )
-                            .await
-                            {
-                                Ok(result) if result.completed => {
-                                    repo_info!(
-                                        repo_label,
-                                        "resolve agent succeeded :{}",
-                                        branch.name
-                                    );
-                                    match git_ops::git_push(
-                                        &rebase_path,
-                                        &branch.remote,
-                                        &branch.name,
-                                        &branch.remote_ref,
-                                        git_path_ref,
-                                        GIT_TIMEOUT_SECS,
-                                    )
-                                    .await
-                                    {
-                                        Ok(PushResult::Success) => {
-                                            had_activity = true;
-                                            repo_info!(
-                                                repo_label,
-                                                "pushed (after resolve agent) :{}",
-                                                branch.name
-                                            );
-                                            let now = chrono::Utc::now().to_rfc3339();
-                                            let mut repos = daemon.repos.write().await;
-                                            if let Some(tr) = repos.get_mut(repo_id) {
-                                                tr.backoff.reset_push_backoff(&ref_name);
-                                                tr.set_branch(
-                                                    &branch.name,
-                                                    BranchRuntimeState {
-                                                        sync_status: "synced".into(),
-                                                        last_pull_at: None,
-                                                        last_push_at: Some(now),
-                                                        local_oid: Some(branch.local_oid.clone()),
-                                                        remote_oid: Some(branch.local_oid.clone()),
-                                                        error_message: None,
-                                                    },
-                                                );
-                                            }
-                                        }
-                                        _ => {
-                                            repo_warn!(
-                                                repo_label,
-                                                "push after resolve agent failed :{}",
-                                                branch.name
-                                            );
-                                            let mut repos = daemon.repos.write().await;
-                                            if let Some(tr) = repos.get_mut(repo_id) {
-                                                tr.backoff.record_push_failure(&ref_name);
-                                                tr.set_branch(
-                                                    &branch.name,
-                                                    BranchRuntimeState {
-                                                        sync_status: "diverged_yours".into(),
-                                                        last_pull_at: None,
-                                                        last_push_at: None,
-                                                        local_oid: Some(branch.local_oid.clone()),
-                                                        remote_oid: branch.remote_oid.clone(),
-                                                        error_message: Some(
-                                                            "resolved but push failed — will retry"
-                                                                .into(),
-                                                        ),
-                                                    },
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(result) => {
-                                    repo_warn!(
-                                        repo_label,
-                                        "resolve agent did not complete :{}",
-                                        branch.name
-                                    );
-                                    let msg = if result.agent_output.is_empty() {
-                                        "resolve agent could not fully resolve conflicts — finish manually or run `gitsitter auto-resolve`".to_string()
-                                    } else {
-                                        let trimmed: String = result
-                                            .agent_output
-                                            .lines()
-                                            .rev()
-                                            .take(3)
-                                            .collect::<Vec<_>>()
-                                            .into_iter()
-                                            .rev()
-                                            .collect::<Vec<_>>()
-                                            .join("\n");
-                                        format!("resolve agent partial: {}", trimmed)
-                                    };
-                                    let mut repos = daemon.repos.write().await;
-                                    if let Some(tr) = repos.get_mut(repo_id) {
-                                        tr.set_branch(
-                                            &branch.name,
-                                            BranchRuntimeState {
-                                                sync_status: "merge_conflict".into(),
-                                                last_pull_at: None,
-                                                last_push_at: None,
-                                                local_oid: Some(branch.local_oid.clone()),
-                                                remote_oid: branch.remote_oid.clone(),
-                                                error_message: Some(msg),
-                                            },
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    repo_warn!(
-                                        repo_label,
-                                        "resolve agent failed :{}: {:#}",
-                                        branch.name,
-                                        e
-                                    );
-                                    let mut repos = daemon.repos.write().await;
-                                    if let Some(tr) = repos.get_mut(repo_id) {
-                                        tr.set_branch(
-                                            &branch.name,
-                                            BranchRuntimeState {
-                                                sync_status: "merge_conflict".into(),
-                                                last_pull_at: None,
-                                                last_push_at: None,
-                                                local_oid: Some(branch.local_oid.clone()),
-                                                remote_oid: branch.remote_oid.clone(),
-                                                error_message: Some(format!(
-                                                    "resolve agent error: {:#}",
-                                                    e
-                                                )),
-                                            },
-                                        );
-                                    }
-                                }
-                            }
                         }
+                        events.push(branch_event!(
+                            "diverged_yours",
+                            "diverged — holding for manual resolution",
+                            rewrite_str.clone()
+                        ));
                     }
                 }
             }
@@ -1938,10 +1662,9 @@ pub enum SyncAction {
     LocalAheadNotOwned,
     /// Skip push because we're in backoff.
     SkipPushBackoff,
-    /// Rebase local onto remote, then push (user owns both sides).
-    RebaseThenPush,
-    /// Skip rebase because worktree is dirty.
-    SkipRebaseDirty,
+    /// Diverged with ownership — reported and held for manual resolution.
+    /// gitsitter never rebases; the user resolves with git directly.
+    Diverged,
     /// Diverged but user doesn't own the remote tip — flag it.
     DivergedNotOwned,
 }
@@ -1989,11 +1712,7 @@ pub fn decide_branch_action(input: &BranchSyncInput) -> SyncAction {
 
         MergeAnalysis::Diverged => {
             if input.is_owner {
-                if input.is_checked_out && input.is_worktree_dirty {
-                    SyncAction::SkipRebaseDirty
-                } else {
-                    SyncAction::RebaseThenPush
-                }
+                SyncAction::Diverged
             } else {
                 SyncAction::DivergedNotOwned
             }
@@ -2179,8 +1898,10 @@ mod tests {
 
     // --- Diverged ---
 
+    // gitsitter never rebases — an owned divergence is always held and
+    // reported, regardless of whether the branch is checked out or dirty.
     #[test]
-    fn diverged_owner_clean_rebases() {
+    fn diverged_owner_clean_holds() {
         let input = BranchSyncInput {
             merge_analysis: MergeAnalysis::Diverged,
             is_owner: true,
@@ -2188,22 +1909,22 @@ mod tests {
             is_worktree_dirty: false,
             ..base_input()
         };
-        assert_eq!(decide_branch_action(&input), SyncAction::RebaseThenPush);
+        assert_eq!(decide_branch_action(&input), SyncAction::Diverged);
     }
 
     #[test]
-    fn diverged_owner_not_checked_out_rebases() {
+    fn diverged_owner_not_checked_out_holds() {
         let input = BranchSyncInput {
             merge_analysis: MergeAnalysis::Diverged,
             is_owner: true,
             is_checked_out: false,
             ..base_input()
         };
-        assert_eq!(decide_branch_action(&input), SyncAction::RebaseThenPush);
+        assert_eq!(decide_branch_action(&input), SyncAction::Diverged);
     }
 
     #[test]
-    fn diverged_owner_dirty_skips() {
+    fn diverged_owner_dirty_holds() {
         let input = BranchSyncInput {
             merge_analysis: MergeAnalysis::Diverged,
             is_owner: true,
@@ -2211,7 +1932,7 @@ mod tests {
             is_worktree_dirty: true,
             ..base_input()
         };
-        assert_eq!(decide_branch_action(&input), SyncAction::SkipRebaseDirty);
+        assert_eq!(decide_branch_action(&input), SyncAction::Diverged);
     }
 
     #[test]

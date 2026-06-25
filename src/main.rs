@@ -65,18 +65,6 @@ enum Commands {
     },
     /// Register a repo (usually called by shell hooks)
     Register { path: Option<String> },
-    /// Interactively resolve sync issues (diverged/unowned branches)
-    Resolve {
-        /// Resolve issues for all repos (default: current repo only)
-        #[arg(short, long)]
-        global: bool,
-    },
-    /// Run resolve agent on current rebase conflicts
-    AutoResolve {
-        /// Override resolve agent (e.g. "claude")
-        #[arg(long)]
-        agent: Option<String>,
-    },
     /// Update gitsitter to the latest release
     #[clap(name = "self-update")]
     SelfUpdate,
@@ -130,8 +118,6 @@ async fn main() {
             path,
         }) => cli::handle_log(&paths, global, follow, path).await,
         Some(Commands::Sync { all }) => cli::handle_sync(&paths, all).await,
-        Some(Commands::Resolve { global }) => cli::handle_resolve(&paths, global).await,
-        Some(Commands::AutoResolve { agent }) => cli::handle_auto_resolve(&paths, agent).await,
         Some(Commands::Register { path }) => cli::handle_register(&paths, path).await,
         Some(Commands::SelfUpdate) => gitsitter::self_update::self_update().await,
         Some(Commands::Install {

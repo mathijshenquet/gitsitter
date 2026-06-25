@@ -34,7 +34,7 @@ From there, the daemon keeps syncing in the background. At a high level, it appl
 
 - **Remote is ahead** → fast-forward your local branch
 - **You're ahead** → push to remote
-- **Diverged** → rebase onto remote and push
+- **Diverged** → flag it and leave it for you to resolve manually
 
 This also applies to branches you're not currently on:
 
@@ -56,10 +56,9 @@ This protects shared and review branches where auto-pushing would be surprising.
 ```sh
 $ cd ~/work/app
 gitsitter: 📦 ~/work/app feature/search has unpushed changes (last remote commit by someone else)
-gitsitter: Run `gitsitter resolve` to resolve issues
 ```
 
-When the daemon can't sync a branch automatically — due to merge conflicts, ambiguous ownership, etc — it flags it. Run `gitsitter resolve` to walk through each issue interactively.
+When the daemon can't sync a branch automatically — divergence, ambiguous ownership, etc — it flags it via your shell prompt and `gitsitter status`, then leaves it for you to resolve.
 
 ## Integrations
 
@@ -69,14 +68,6 @@ Enable GitHub integration to relax the committer-email check. When enabled, gits
 
 With Nix: `githubIntegration.enable = true`
 Without Nix: ensure `gh` is authenticated and on the daemon's PATH (it's auto-discovered at install time). When adding this later, rerun `gitsitter install`.
-
-### Resolve agent
-
-When a rebase produces conflicts, gitsitter can invoke an AI agent to resolve them automatically. Configure which tool to use (default and only for now: `claude`):
-
-With Nix: `resolveAgent.enable = true`
-Without Nix: set `resolve_agent = "claude"` in your config.
-
 
 ## Getting started
 
@@ -100,10 +91,6 @@ The flake exports a Home Manager module that manages the binary, config, shell i
             shellIntegration.fish = true;
             shellIntegration.bash = true;
             githubIntegration.enable = true;
-            resolveAgent = {
-              enable = true;
-              tool = "claude";
-            };
             settings = {
               trusted_hosts."git.corp.internal" = true;
             };
@@ -173,8 +160,7 @@ Teams can commit `.gitsitter.toml` to share a `refresh_interval` override. User 
 
 ```sh
 gitsitter                    # show status for current repo
-gitsitter resolve            # interactively resolve sync issues
-gitsitter resolve --global   # resolve issues across all repos
+gitsitter status --global    # show status for all tracked repos
 ```
 
 <details>
@@ -221,7 +207,7 @@ cargo test
 <summary>Architecture</summary>
 
 - **Client-server:** CLI connects to daemon over local IPC (Unix socket / Windows named pipe), JSON protocol
-- **Hybrid git:** `git2` for fast reads (merge analysis, status, authorship), `git` CLI for network/writes (fetch, push, rebase)
+- **Hybrid git:** `git2` for fast reads (merge analysis, status, authorship), `git` CLI for network/writes (fetch, push)
 - **File watching:** `notify` crate watches `.git/refs/` and `.git/HEAD` for near-instant reaction to local commits
 - **State:** in-memory only, no database
 - **Repo identity:** keyed by canonicalized common git dir (worktree-safe)
@@ -237,8 +223,7 @@ Per repo, per refresh interval:
    - Fast-forward possible → ff-merge (checked out) or update-ref (not checked out)
    - Local ahead + your branch → push
    - Local ahead + not your branch → flag as issue (unless local tip merges the remote tip → push)
-   - Diverged + your branch → rebase and push
-   - Diverged + not your branch → flag as issue
+   - Diverged → flag as issue (never rebased; resolve manually)
 
 ### File layout
 
