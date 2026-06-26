@@ -23,14 +23,13 @@ tasks:
       - cargo clippy -q -- -W unexpected_cfgs 2>&1
 
   release:
-    desc: Tag and push a release from Cargo.toml version
+    desc: How to cut a release (handled by GitHub Actions)
+    silent: true
     cmds:
-      - ./scripts/release.sh
-
-  release:dry-run:
-    desc: Show what release would do without making changes
-    cmds:
-      - ./scripts/release.sh --dry-run
+      - |
+        echo "Releases are automated:"
+        echo "  patch        -> auto-shipped on every merge to main"
+        echo "  minor/major/rc -> Actions > Release > Run workflow (choose level)"
 
   lint:
     desc: Run formatter and clippy

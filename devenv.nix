@@ -6,6 +6,7 @@
     openssl
     libgit2
     sqlite
+    cargo-edit
   ];
 
   languages.rust = {

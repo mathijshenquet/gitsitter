@@ -4,30 +4,134 @@ on:
   push:
     tags:
       - "v[0-9]+.*"
+  workflow_dispatch:
+    inputs:
+      level:
+        description: "Bump level (ignored if tag is set)"
+        type: choice
+        options: [patch, minor, major, rc]
+        default: minor
+      tag:
+        description: "Existing tag to publish (e.g. v0.2.1). If set, skips bump."
+        type: string
+        default: ""
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Manual minor/major/rc bumps. Computes the next version with cargo-edit,
+  # commits + tags + pushes, then dispatches this workflow for the new tag.
+  # (A tag pushed with GITHUB_TOKEN does not itself trigger workflows, so we
+  # dispatch explicitly.)
+  bump:
+    name: Bump version and tag
+    if: github.event_name == 'workflow_dispatch' && inputs.tag == ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    concurrency:
+      group: gitsitter-release-main
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Install cargo-edit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      - name: Bump version
+        id: bump
+        run: |
+          cargo set-version --bump "${{ inputs.level }}"
+          version="$(cargo pkgid | sed 's/.*@//')"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Reject if tag already exists
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.bump.outputs.tag }}" >/dev/null 2>&1; then
+            echo "::error::Tag ${{ steps.bump.outputs.tag }} already exists."
+            exit 1
+          fi
+
+      - name: Commit, tag, and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- Cargo.toml Cargo.lock; then
+            git add Cargo.toml Cargo.lock
+            git commit -m "Release ${{ steps.bump.outputs.tag }} [skip ci]"
+            git push origin HEAD:main
+          fi
+          git tag "${{ steps.bump.outputs.tag }}"
+          git push origin "${{ steps.bump.outputs.tag }}"
+
+      - name: Trigger release for new tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release.yml --ref "${{ steps.bump.outputs.tag }}" -f tag="${{ steps.bump.outputs.tag }}"
+
   validate:
+    name: Validate
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ref.outputs.tag }}
+    steps:
+      - name: Resolve tag
+        id: ref
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.tag }}
+
+      - name: Validate tag matches Cargo.toml version
+        run: |
+          TAG="${{ steps.ref.outputs.tag }}"
+          TAG_VERSION="${TAG#v}"
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag v$TAG_VERSION does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+
+  test:
+    name: Test
+    needs: validate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate tag matches Cargo.toml version
-        run: |
-          TAG="${GITHUB_REF#refs/tags/v}"
-          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          if [ "$TAG" != "$CARGO_VERSION" ]; then
-            echo "::error::Tag v$TAG does not match Cargo.toml version $CARGO_VERSION"
-            exit 1
-          fi
-          echo "VERSION=$TAG" >> "$GITHUB_ENV"
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test
 
   build:
-    needs: validate
+    needs: [validate, test]
     strategy:
       matrix:
         include:
@@ -42,6 +146,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
 
       - name: Install Rust toolchain
         run: |
@@ -73,10 +179,14 @@ jobs:
           path: ${{ env.ARCHIVE }}
 
   release:
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -85,13 +195,12 @@ jobs:
 
       - name: Create release
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          TAG="${{ needs.validate.outputs.tag }}"
           # Gather all tarballs
           find artifacts -name '*.tar.gz' -exec mv {} . \;
           # Generate checksums
           sha256sum gitsitter-*.tar.gz > SHA256SUMS
           gh release create "$TAG" \
-            --draft \
             --verify-tag \
             --title "$TAG" \
             --generate-notes \

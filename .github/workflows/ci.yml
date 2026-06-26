@@ -60,3 +60,76 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt -- --check
+
+  # Continuous release: every green push to main auto-ships a patch. Bumps the
+  # version with cargo-edit, commits + tags + pushes, then dispatches release.yml
+  # for the new tag. Pause with repo variable AUTO_RELEASE=false, or skip a single
+  # commit with [no release] / [skip ci] in its message. For minor/major/rc, run
+  # the release workflow manually instead (Actions -> Release -> Run workflow).
+  prepare-release:
+    name: Prepare release
+    if: |
+      github.event_name == 'push'
+      && github.ref == 'refs/heads/main'
+      && vars.AUTO_RELEASE != 'false'
+      && github.event.head_commit.author.email != '41898282+github-actions[bot]@users.noreply.github.com'
+      && !contains(github.event.head_commit.message, '[no release]')
+      && !contains(github.event.head_commit.message, '[skip ci]')
+    needs: [check, test, fmt]
+    runs-on: ubuntu-latest
+    concurrency:
+      group: gitsitter-release-main
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Install cargo-edit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-edit
+
+      - name: Bump patch version
+        id: version
+        run: |
+          cargo set-version --bump patch
+          version="$(cargo pkgid | sed 's/.*@//')"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if tag already exists
+        id: skip
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Tag ${{ steps.version.outputs.tag }} already exists; nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit, tag, and push
+        if: steps.skip.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- Cargo.toml Cargo.lock; then
+            git add Cargo.toml Cargo.lock
+            git commit -m "Release ${{ steps.version.outputs.tag }} [skip ci]"
+            git push origin HEAD:main
+          fi
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Trigger release for new tag
+        if: steps.skip.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run release.yml --ref "${{ steps.version.outputs.tag }}" -f tag="${{ steps.version.outputs.tag }}"
