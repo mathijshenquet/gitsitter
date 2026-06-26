@@ -13,6 +13,8 @@
         pname = "gitsitter";
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
         src = ./.;
+        # The build sandbox has no .git, so hand build.rs the revision for `--version`.
+        GIT_COMMIT_HASH = self.shortRev or self.dirtyShortRev or "unknown";
         cargoLock = {
           lockFile = ./Cargo.lock;
         };

@@ -6,7 +6,7 @@ use gitsitter::paths::Paths;
 #[derive(Parser)]
 #[command(
     name = "gitsitter",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_COMMIT_HASH"), ")"),
     about = "Keep local branches in sync with remotes"
 )]
 struct Cli {

@@ -11,10 +11,14 @@ path = "src/lib.rs"
 name = "gitsitter"
 path = "src/main.rs"
 
+[features]
+# Build libgit2 + OpenSSL from source so the binary is self-contained. Off by
+# default (nix and normal builds link system libs); the CI release job enables
+# it via `--features vendored` to ship portable binaries.
+vendored = ["git2/vendored-libgit2", "git2/vendored-openssl"]
+
 [dependencies]
-# Vendor libgit2 + OpenSSL so release binaries are self-contained and don't
-# depend on each build runner's (or the user's) system libraries.
-git2 = { version = "0.20", features = ["vendored-libgit2", "vendored-openssl"] }
+git2 = "0.20"
 notify = "8"
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
