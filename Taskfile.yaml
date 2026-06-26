@@ -45,5 +45,5 @@ tasks:
   version:
     desc: Show current version from Cargo.toml
     cmds:
-      - cargo pkgid | sed 's/.*@//'
+      - grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/'
     silent: true

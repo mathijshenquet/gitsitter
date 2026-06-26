@@ -55,7 +55,7 @@ jobs:
         id: bump
         run: |
           cargo set-version --bump "${{ inputs.level }}"
-          version="$(cargo pkgid | sed 's/.*@//')"
+          version="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "tag=v${version}" >> "$GITHUB_OUTPUT"
 
