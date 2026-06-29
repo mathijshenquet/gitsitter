@@ -73,7 +73,6 @@ pub fn branch_status_icon(status: &BranchState, opts: DisplayOpts) -> &'static s
                 "\u{270D}\u{FE0F}"
             }
             BranchState::DirtyWorktree => "\u{270F}\u{FE0F}",
-            BranchState::MergeConflict => "\u{1F527}",
             BranchState::UpstreamGone => "\u{1F6AB}",
             BranchState::Failed(_) => "\u{274C}",
         }
@@ -86,7 +85,6 @@ pub fn branch_status_icon(status: &BranchState, opts: DisplayOpts) -> &'static s
                 "rewritten"
             }
             BranchState::DirtyWorktree => "dirty",
-            BranchState::MergeConflict => "conflict",
             BranchState::UpstreamGone => "upstream gone",
             BranchState::Failed(_) => "error",
         }
@@ -103,7 +101,6 @@ pub fn branch_status_label(status: &BranchState) -> &'static str {
         BranchState::HistoryRewritten => "history rewritten (force-push ready)",
         BranchState::HistoryRewrittenRemoteAdvanced => "history rewritten (remote advanced)",
         BranchState::DirtyWorktree => "dirty worktree",
-        BranchState::MergeConflict => "merge conflict",
         BranchState::UpstreamGone => "upstream gone",
         BranchState::Failed(_) => "error",
     }
@@ -122,7 +119,6 @@ pub fn branch_status_styled(status: &BranchState, opts: DisplayOpts) -> String {
         BranchState::HistoryRewritten => format!("{}", label.yellow()),
         BranchState::DirtyWorktree => format!("{}", label.yellow()),
         BranchState::HistoryRewrittenRemoteAdvanced
-        | BranchState::MergeConflict
         | BranchState::UpstreamGone
         | BranchState::Failed(_) => format!("{}", label.red()),
     }

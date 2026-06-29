@@ -1322,59 +1322,50 @@ pub async fn handle_prompt(paths: &Paths) -> Result<()> {
             }
         }
 
+        // (emoji, branch name, reason) for each branch that warrants a notice.
+        // The explicit allowlist keeps quiet states (Synced, UpstreamGone,
+        // history-rewrite, ...) silent — same set as before.
         let mut issues = Vec::new();
 
         for b in &data.branches {
-            let upstream = b.upstream.as_deref().unwrap_or("upstream");
-            let pair = cli_ui::sync_pair(&b.name, upstream);
-            match &b.status {
-                BranchState::LocalAheadNotOwned => {
-                    issues.push(format!(
-                        "gitsitter: \u{1F4E6} {} {} has unpushed changes (last remote commit by someone else)",
-                        dp, pair
-                    ));
-                }
-                BranchState::DivergedNotOwned => {
-                    issues.push(format!(
-                        "gitsitter: \u{1F4E6} {} {} has diverged (last remote commit by someone else)",
-                        dp, pair
-                    ));
-                }
-                BranchState::Diverged => {
-                    issues.push(format!(
-                        "gitsitter: \u{1F4E6} {} {} has diverged \u{2014} resolve manually (merge or rebase)",
-                        dp, pair
-                    ));
-                }
-                BranchState::DirtyWorktree => {
-                    issues.push(format!(
-                        "gitsitter: \u{270F}\u{FE0F} {} {} dirty worktree \u{2014} commit or stash to sync",
-                        dp, pair
-                    ));
-                }
-                BranchState::MergeConflict => {
-                    issues.push(format!(
-                        "gitsitter: \u{1F527} {} {} has merge conflicts \u{2014} resolve manually",
-                        dp, pair
-                    ));
-                }
-                BranchState::Failed(_) => {
-                    issues.push(format!(
-                        "gitsitter: \u{1F4E6} {} {} sync error ({})",
-                        dp,
-                        pair,
-                        b.status.status_str().replace('_', " ")
-                    ));
-                }
+            let (emoji, reason) = match &b.status {
+                BranchState::LocalAheadNotOwned => (
+                    "\u{1F4E6}",
+                    "unpushed changes (last remote commit by someone else)".to_string(),
+                ),
+                BranchState::DivergedNotOwned => (
+                    "\u{1F4E6}",
+                    "diverged (last remote commit by someone else)".to_string(),
+                ),
+                BranchState::Diverged => (
+                    "\u{1F4E6}",
+                    "diverged \u{2014} resolve manually (merge or rebase)".to_string(),
+                ),
+                BranchState::DirtyWorktree => (
+                    "\u{270F}\u{FE0F}",
+                    "dirty worktree \u{2014} commit or stash to sync".to_string(),
+                ),
+                BranchState::Failed(_) => (
+                    "\u{1F4E6}",
+                    format!("sync error ({})", b.status.status_str().replace('_', " ")),
+                ),
                 _ => continue,
-            }
+            };
+            issues.push((emoji, b.name.as_str(), reason));
         }
 
-        if !issues.is_empty() {
-            for issue in &issues {
-                println!("{}", issue);
+        match issues.len() {
+            0 => {}
+            1 => {
+                let (emoji, branch, reason) = &issues[0];
+                println!("gitsitter: {} {}/{}  {}", emoji, dp, branch, reason);
             }
-            println!("gitsitter: resolve flagged branches manually with git");
+            n => {
+                println!("gitsitter: {} \u{2014} {} branches need attention", dp, n);
+                for (emoji, branch, reason) in &issues {
+                    println!("  {} {}  {}", emoji, branch, reason);
+                }
+            }
         }
     }
     Ok(())

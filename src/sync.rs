@@ -40,8 +40,6 @@ pub enum BranchState {
     HistoryRewritten,
     /// Local history was rewritten and the remote advanced past the old tip.
     HistoryRewrittenRemoteAdvanced,
-    /// Worktree is mid-merge/rebase with conflicts.
-    MergeConflict,
     /// A write action failed; the error is the reason, recorded apart from state.
     Failed(ActionError),
 }
@@ -82,7 +80,6 @@ impl BranchState {
             BranchState::Diverged => "diverged_yours",
             BranchState::HistoryRewritten => "history_rewritten_remote_unchanged",
             BranchState::HistoryRewrittenRemoteAdvanced => "history_rewritten_remote_advanced",
-            BranchState::MergeConflict => "merge_conflict",
             BranchState::Failed(e) => e.status_str(),
         }
     }
@@ -100,7 +97,6 @@ impl BranchState {
             BranchState::HistoryRewrittenRemoteAdvanced => {
                 "history rewrite detected, remote advanced — holding"
             }
-            BranchState::MergeConflict => "merge conflict — resolve manually",
             BranchState::Synced => "up to date",
             BranchState::Failed(_) => "action failed",
         }
@@ -123,7 +119,6 @@ impl BranchState {
                 "local history rewritten and remote advanced — force-push would discard remote \
                  commits; consider backing up and resetting to remote",
             ),
-            BranchState::MergeConflict => Some("merge conflict — resolve manually"),
             BranchState::Synced | BranchState::Failed(_) => None,
         }
     }
