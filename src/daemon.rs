@@ -1038,6 +1038,13 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<Vec<Syn
         }
     }
 
+    // Config is only consulted for the disabled check and fetch filtering above.
+    // Release it before the branch loop so a concurrent `reload_config` (which
+    // takes the write lock) isn't blocked behind this repo's network I/O
+    // (fetch/push/gh) — tokio's RwLock is write-preferring, so a pending writer
+    // would otherwise stall every other repo's `config.read()` too.
+    drop(config);
+
     // Build a set of canonical branches per (remote, remote_ref) pair.
     // If multiple local branches track the same remote ref, the one whose
     // local name matches the remote ref is canonical; the rest are skipped.

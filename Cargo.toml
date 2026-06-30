@@ -21,7 +21,6 @@ vendored = ["git2/vendored-libgit2", "git2/vendored-openssl"]
 git2 = "0.20"
 notify = "8"
 clap = { version = "4", features = ["derive"] }
-ratatui = "0.29"
 crossterm = "0.28"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }

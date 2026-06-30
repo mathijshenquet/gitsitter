@@ -70,28 +70,42 @@ pub fn parse_github_remote(url: &str) -> Option<GitHubRepo> {
 // GitHub CLI helpers
 // ---------------------------------------------------------------------------
 
+/// Timeout for `gh` subprocess calls. Unlike git ops these hit the network with
+/// no inner bound, so a hung `gh` (flaky network, credential prompt) would
+/// otherwise stall the sync indefinitely. `kill_on_drop` reaps the child when
+/// the timeout fires so hung invocations don't accumulate.
+const GH_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Check if `gh` CLI is available and authenticated.
 async fn gh_is_available() -> bool {
-    let result = tokio::process::Command::new("gh")
+    let status = tokio::process::Command::new("gh")
         .args(["auth", "status"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .await;
-    matches!(result, Ok(status) if status.success())
+        .kill_on_drop(true)
+        .status();
+    match tokio::time::timeout(GH_TIMEOUT, status).await {
+        Ok(Ok(status)) => status.success(),
+        _ => false,
+    }
 }
 
 /// Call `gh api <endpoint>` and return parsed JSON.
 async fn gh_api(endpoint: &str) -> Result<serde_json::Value> {
-    let output = tokio::process::Command::new("gh")
-        .args(["api", endpoint])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .context("failed to spawn gh")?;
+    let output = tokio::time::timeout(
+        GH_TIMEOUT,
+        tokio::process::Command::new("gh")
+            .args(["api", endpoint])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .with_context(|| format!("gh api {endpoint} timed out after {GH_TIMEOUT:?}"))?
+    .context("failed to spawn gh")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
