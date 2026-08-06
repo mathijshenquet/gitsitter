@@ -20,6 +20,19 @@ enum Commands {
     Status {
         #[arg(short, long)]
         global: bool,
+        /// Print machine-readable JSON
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(
+        long_about = "Check whether a repository's tracking branches are verified in sync.\n\nExit codes:\n  0  verified clean: every branch is synced\n  1  one or more branches need attention (printed on stdout)\n  2  cannot verify the repository state (reason printed on stderr)"
+    )]
+    Check {
+        /// Repository path (defaults to the current directory)
+        path: Option<String>,
+        /// Force a fresh fetch and sync cycle before checking
+        #[arg(long)]
+        sync: bool,
     },
     /// Show configuration
     Config,
@@ -103,8 +116,11 @@ async fn main() {
     let paths = Paths::resolve();
 
     let result = match args.command {
-        None => cli::handle_status(&paths, false).await,
-        Some(Commands::Status { global }) => cli::handle_status(&paths, global).await,
+        None => cli::handle_status(&paths, false, false).await,
+        Some(Commands::Status { global, json }) => cli::handle_status(&paths, global, json).await,
+        Some(Commands::Check { path, sync }) => {
+            std::process::exit(cli::handle_check(&paths, path.as_deref(), sync).await);
+        }
         Some(Commands::Config) => cli::handle_config(&paths).await,
         Some(Commands::Enable { remote, all }) => cli::handle_enable(&paths, remote, all).await,
         Some(Commands::Disable { remote, all, purge }) => {
