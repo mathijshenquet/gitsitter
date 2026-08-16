@@ -69,6 +69,11 @@ impl ActionError {
 }
 
 impl BranchState {
+    /// Whether this branch has been verified in sync with its upstream.
+    pub fn is_synced(&self) -> bool {
+        matches!(self, BranchState::Synced)
+    }
+
     /// Stable status string for transport, prompt, and status display.
     pub fn status_str(&self) -> &'static str {
         match self {
@@ -397,5 +402,31 @@ mod tests {
             BranchState::Failed(ActionError::PushRejected).status_str(),
             "push_rejected"
         );
+    }
+
+    #[test]
+    fn only_synced_is_clean() {
+        assert!(BranchState::Synced.is_synced());
+
+        for state in [
+            BranchState::LocalAheadNotOwned,
+            BranchState::DirtyWorktree,
+            BranchState::UpstreamGone,
+            BranchState::DivergedNotOwned,
+            BranchState::Diverged,
+            BranchState::HistoryRewritten,
+            BranchState::HistoryRewrittenRemoteAdvanced,
+            BranchState::Failed(ActionError::PushRejected),
+            BranchState::Failed(ActionError::AuthFailed),
+            BranchState::Failed(ActionError::NetworkError),
+            BranchState::Failed(ActionError::HookTimeout),
+            BranchState::Failed(ActionError::Other),
+        ] {
+            assert!(
+                !state.is_synced(),
+                "{} should need attention",
+                state.status_str()
+            );
+        }
     }
 }

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use comfy_table::{Cell, Color, ContentArrangement, Table, presets};
+use serde::Serialize;
 
 use crate::cli_ui::{self, DisplayOpts};
 use crate::config::{self, UserConfig};
@@ -131,6 +132,90 @@ fn resolve_path_or_cwd(path: Option<&str>) -> Result<String> {
     Ok(canonical.to_string_lossy().to_string())
 }
 
+#[derive(Serialize)]
+struct JsonStatus {
+    repo: String,
+    last_sync: Option<String>,
+    clean: bool,
+    branches: Vec<JsonBranchStatus>,
+}
+
+#[derive(Serialize)]
+struct JsonBranchStatus {
+    name: String,
+    upstream: Option<String>,
+    status: String,
+    clean: bool,
+    reason: Option<String>,
+    last_action: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JsonGlobalStatus {
+    repo: String,
+    summary: String,
+    last_sync: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JsonError {
+    error: String,
+}
+
+fn json_status(data: &transport::StatusData) -> JsonStatus {
+    let branches: Vec<JsonBranchStatus> = data
+        .branches
+        .iter()
+        .map(|branch| JsonBranchStatus {
+            name: branch.name.clone(),
+            upstream: branch.upstream.clone(),
+            status: branch.status.status_str().to_string(),
+            clean: branch.status.is_synced(),
+            reason: branch.status.hold_message().map(str::to_string),
+            last_action: branch.last_action.clone(),
+        })
+        .collect();
+    let clean = branches.iter().all(|branch| branch.clean);
+
+    JsonStatus {
+        repo: data.display_path.clone(),
+        last_sync: data.last_sync.clone(),
+        clean,
+        branches,
+    }
+}
+
+fn json_global_status(repos: &[transport::RepoStatusData]) -> Vec<JsonGlobalStatus> {
+    repos
+        .iter()
+        .map(|repo| JsonGlobalStatus {
+            repo: repo.display_path.clone(),
+            summary: repo.status_summary.clone(),
+            last_sync: repo.last_sync.clone(),
+        })
+        .collect()
+}
+
+fn print_json<T: Serialize>(value: &T) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string(value).context("failed to serialize JSON status")?
+    );
+    Ok(())
+}
+
+fn one_line_reason(message: impl std::fmt::Display) -> String {
+    message.to_string().replace(['\n', '\r'], " ")
+}
+
+fn json_error(message: impl std::fmt::Display) -> Result<()> {
+    let message = one_line_reason(message);
+    print_json(&JsonError {
+        error: message.clone(),
+    })?;
+    bail!("{}", message)
+}
+
 /// Send a request and receive a single response over a connected stream.
 async fn roundtrip<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: &mut S,
@@ -177,7 +262,11 @@ fn resolve_remote_target<'a>(
 // Handlers
 // ---------------------------------------------------------------------------
 
-pub async fn handle_status(paths: &Paths, global: bool) -> Result<()> {
+pub async fn handle_status(paths: &Paths, global: bool, json: bool) -> Result<()> {
+    if json {
+        return handle_status_json(paths, global).await;
+    }
+
     let opts = load_display_opts(paths);
     let daemon_running = transport::is_daemon_running(&paths.socket_path);
 
@@ -224,6 +313,136 @@ pub async fn handle_status(paths: &Paths, global: bool) -> Result<()> {
     }
     print_update_hint();
     Ok(())
+}
+
+async fn handle_status_json(paths: &Paths, global: bool) -> Result<()> {
+    let mut stream = match require_daemon(paths).await {
+        Ok(stream) => stream,
+        Err(error) => return json_error(format!("{error:#}")),
+    };
+
+    if global {
+        let response = match roundtrip(
+            &mut stream,
+            &Request::Status {
+                repo_path: None,
+                global: true,
+            },
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => return json_error(format!("{error:#}")),
+        };
+
+        return match response {
+            Response::GlobalStatus { repos } => print_json(&json_global_status(&repos)),
+            Response::Error { message } => json_error(message),
+            _ => json_error("unexpected response from daemon"),
+        };
+    }
+
+    let repo_path = match resolve_cwd_repo_path() {
+        Ok(repo_path) => repo_path,
+        Err(error) => return json_error(format!("{error:#}")),
+    };
+    let response = match roundtrip(
+        &mut stream,
+        &Request::Status {
+            repo_path: Some(repo_path),
+            global: false,
+        },
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => return json_error(format!("{error:#}")),
+    };
+
+    match response {
+        Response::Status { data } => print_json(&json_status(&data)),
+        Response::Error { message } => json_error(message),
+        _ => json_error("unexpected response from daemon"),
+    }
+}
+
+fn resolve_check_repo_path(path: Option<&str>) -> Result<String> {
+    match path {
+        None => resolve_cwd_repo_path(),
+        Some(_) => {
+            let path = resolve_path_or_cwd(path)?;
+            let repo_id =
+                git_ops::discover_repo_id(Path::new(&path)).context("not a git repository")?;
+            Ok(repo_id.to_string_lossy().to_string())
+        }
+    }
+}
+
+fn attention_branches(data: &transport::StatusData) -> Vec<&transport::BranchStatusData> {
+    data.branches
+        .iter()
+        .filter(|branch| !branch.status.is_synced())
+        .collect()
+}
+
+fn check_error(message: impl std::fmt::Display) -> i32 {
+    eprintln!("{}", one_line_reason(message));
+    2
+}
+
+pub async fn handle_check(paths: &Paths, path: Option<&str>, sync: bool) -> i32 {
+    let repo_path = match resolve_check_repo_path(path) {
+        Ok(repo_path) => repo_path,
+        Err(error) => return check_error(format!("{error:#}")),
+    };
+    let mut stream = match require_daemon(paths).await {
+        Ok(stream) => stream,
+        Err(error) => return check_error(format!("{error:#}")),
+    };
+    let request = if sync {
+        Request::Sync {
+            repo_path: Some(repo_path),
+            all: false,
+        }
+    } else {
+        Request::Status {
+            repo_path: Some(repo_path),
+            global: false,
+        }
+    };
+    let response = match roundtrip(&mut stream, &request).await {
+        Ok(response) => response,
+        Err(error) => return check_error(format!("{error:#}")),
+    };
+    let data = match (sync, response) {
+        (false, Response::Status { data }) => data,
+        (true, Response::SyncComplete { data, .. }) => data,
+        (_, Response::Error { message }) => return check_error(message),
+        _ => return check_error("unexpected response from daemon"),
+    };
+
+    if !sync && data.last_sync.is_none() {
+        return check_error("repository has not completed a sync");
+    }
+
+    let attention = attention_branches(&data);
+    if attention.is_empty() {
+        return 0;
+    }
+
+    for branch in attention {
+        let reason = branch
+            .status
+            .hold_message()
+            .unwrap_or_else(|| branch.status.hold_detail());
+        println!(
+            "{}\t{}\t{}",
+            branch.name,
+            branch.status.status_str(),
+            reason
+        );
+    }
+    1
 }
 
 async fn handle_status_global(
@@ -1369,4 +1588,103 @@ pub async fn handle_prompt(paths: &Paths) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::sync::{ActionError, BranchState};
+
+    fn status_data(branches: Vec<transport::BranchStatusData>) -> transport::StatusData {
+        transport::StatusData {
+            repo_id: "/repo/.git".to_string(),
+            display_path: "/repo".to_string(),
+            last_sync: Some("2026-08-06T08:00:00Z".to_string()),
+            branches,
+            untrusted_remotes: vec![],
+            untrusted_hosts: vec![],
+            disabled_remotes: vec![],
+            remote_urls: HashMap::new(),
+            newly_registered: false,
+        }
+    }
+
+    #[test]
+    fn status_json_uses_stable_status_strings_and_clean_flags() {
+        let data = status_data(vec![
+            transport::BranchStatusData {
+                name: "main".to_string(),
+                upstream: Some("origin/main".to_string()),
+                status: BranchState::Synced,
+                last_action: Some("pushed 45s ago".to_string()),
+            },
+            transport::BranchStatusData {
+                name: "feature".to_string(),
+                upstream: Some("origin/feature".to_string()),
+                status: BranchState::Diverged,
+                last_action: None,
+            },
+            transport::BranchStatusData {
+                name: "broken".to_string(),
+                upstream: Some("origin/broken".to_string()),
+                status: BranchState::Failed(ActionError::PushRejected),
+                last_action: None,
+            },
+        ]);
+
+        let rendered = serde_json::to_value(json_status(&data)).unwrap();
+
+        assert_eq!(rendered["repo"], "/repo");
+        assert_eq!(rendered["clean"], false);
+        assert_eq!(rendered["branches"][0]["status"], "synced");
+        assert_eq!(rendered["branches"][0]["clean"], true);
+        assert_eq!(rendered["branches"][0]["reason"], serde_json::Value::Null);
+        assert_eq!(rendered["branches"][1]["status"], "diverged_yours");
+        assert_eq!(rendered["branches"][1]["clean"], false);
+        assert_eq!(
+            rendered["branches"][1]["reason"],
+            "diverged — resolve manually (merge or rebase)"
+        );
+        assert_eq!(rendered["branches"][2]["status"], "push_rejected");
+        assert_eq!(rendered["branches"][2]["clean"], false);
+    }
+
+    #[test]
+    fn check_classifies_every_non_synced_branch_as_attention() {
+        let data = status_data(vec![
+            transport::BranchStatusData {
+                name: "main".to_string(),
+                upstream: Some("origin/main".to_string()),
+                status: BranchState::Synced,
+                last_action: None,
+            },
+            transport::BranchStatusData {
+                name: "dirty".to_string(),
+                upstream: Some("origin/dirty".to_string()),
+                status: BranchState::DirtyWorktree,
+                last_action: None,
+            },
+            transport::BranchStatusData {
+                name: "gone".to_string(),
+                upstream: None,
+                status: BranchState::UpstreamGone,
+                last_action: None,
+            },
+            transport::BranchStatusData {
+                name: "failed".to_string(),
+                upstream: Some("origin/failed".to_string()),
+                status: BranchState::Failed(ActionError::NetworkError),
+                last_action: None,
+            },
+        ]);
+
+        let names: Vec<&str> = attention_branches(&data)
+            .into_iter()
+            .map(|branch| branch.name.as_str())
+            .collect();
+
+        assert_eq!(names, ["dirty", "gone", "failed"]);
+    }
 }

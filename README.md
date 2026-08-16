@@ -161,6 +161,8 @@ Teams can commit `.gitsitter.toml` to share a `refresh_interval` override. User 
 ```sh
 gitsitter                    # show status for current repo
 gitsitter status --global    # show status for all tracked repos
+gitsitter status --json      # print machine-readable status for current repo
+gitsitter check [path]       # exit-code check for a repo's sync state
 ```
 
 <details>
@@ -168,6 +170,10 @@ gitsitter status --global    # show status for all tracked repos
 
 ```sh
 gitsitter status --global    # show status for all tracked repos
+gitsitter status --json      # print machine-readable status for current repo
+gitsitter status --global --json  # print machine-readable status for all repos
+gitsitter check [path]       # check a repo's last-known sync state
+gitsitter check [path] --sync # sync, then check the fresh state
 gitsitter sync               # trigger immediate sync for current repo
 gitsitter sync --all         # trigger immediate sync for all repos
 gitsitter config             # show global config
@@ -191,6 +197,20 @@ gitsitter uninstall          # remove shell hooks and daemon service
 ```
 
 </details>
+
+`gitsitter check [path]` is intended for automation. It is silent on success;
+its exit code is the contract:
+
+- `0` — the daemon verified every tracked branch is synced.
+- `1` — one or more branches need attention; each is printed as
+  `branch<TAB>status<TAB>reason` on stdout.
+- `2` — gitsitter could not verify the state (for example, the daemon is
+  unavailable, the repo is unregistered, or no sync has completed yet). The
+  reason is printed on stderr.
+
+Pass `--sync` to make `check` run a fresh sync cycle before evaluating it.
+`gitsitter status --json` emits structured per-branch status, while
+`gitsitter status --global --json` emits repository summaries.
 
 ## Building
 
