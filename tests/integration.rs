@@ -588,6 +588,28 @@ mod git_ops_tests {
     }
 
     #[test]
+    fn worktree_operation_in_progress_sees_linked_worktree_lock() {
+        let tmp = temp_dir();
+        let repo = git2::Repository::init(tmp.path().join("main")).unwrap();
+        make_commit(&repo, "README.md", "hello", "Initial commit");
+        let wt_path = tmp.path().join("linked");
+        let wt = repo.worktree("linked", &wt_path, None).unwrap();
+
+        let repo_id = git_ops::discover_repo_id(&wt_path).unwrap();
+        assert!(!git_ops::is_worktree_operation_in_progress(&wt_path));
+
+        let lock_path = repo_id
+            .join("worktrees")
+            .join(wt.name().unwrap())
+            .join("index.lock");
+        std::fs::write(&lock_path, "").unwrap();
+
+        assert!(git_ops::is_worktree_operation_in_progress(&wt_path));
+        // The common-dir check alone misses it — the gap this guards.
+        assert!(!git_ops::is_operation_in_progress(&repo_id));
+    }
+
+    #[test]
     fn is_worktree_dirty_clean_repo() {
         let tmp = temp_dir();
         let repo = git2::Repository::init(tmp.path()).unwrap();

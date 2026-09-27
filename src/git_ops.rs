@@ -412,8 +412,11 @@ pub fn is_valid_repo(path: &Path) -> bool {
     git2::Repository::open(path).is_ok()
 }
 
-/// Check if any git operation is in progress (rebase, merge, cherry-pick, bisect).
-pub fn is_operation_in_progress(repo_id: &Path) -> bool {
+/// Check if any git operation is in progress (rebase, merge, cherry-pick, bisect)
+/// in the given git dir. For the repo_id (common dir) this covers the main
+/// worktree only; linked worktrees keep this state in their own git dir, see
+/// `is_worktree_operation_in_progress`.
+pub fn is_operation_in_progress(git_dir: &Path) -> bool {
     let checks = [
         "index.lock",
         "rebase-merge",
@@ -423,12 +426,21 @@ pub fn is_operation_in_progress(repo_id: &Path) -> bool {
         "BISECT_LOG",
     ];
     for name in &checks {
-        let p = repo_id.join(name);
+        let p = git_dir.join(name);
         if p.exists() {
             return true;
         }
     }
     false
+}
+
+/// Check if a git operation is in progress in the worktree checked out at
+/// `worktree_path` (main or linked). Unreadable worktrees count as busy.
+pub fn is_worktree_operation_in_progress(worktree_path: &Path) -> bool {
+    match git2::Repository::open(worktree_path) {
+        Ok(repo) => is_operation_in_progress(repo.path()),
+        Err(_) => true,
+    }
 }
 
 /// Check if a worktree has any staged or unstaged changes to tracked files.
@@ -473,6 +485,9 @@ fn git_command(repo_path: &Path, git_path: Option<&str>) -> TokioCommand {
     cmd.arg("-C")
         .arg(repo_path)
         .env("GIT_TERMINAL_PROMPT", "0")
+        // Without this a git child outlives its timeout and keeps holding ref
+        // locks, overlapping with the next cycle's fetch/push.
+        .kill_on_drop(true)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
