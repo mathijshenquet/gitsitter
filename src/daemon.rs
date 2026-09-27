@@ -894,6 +894,17 @@ pub async fn sync_repo(daemon: &SharedDaemon, repo_id: &str) -> Result<Vec<SyncE
     result
 }
 
+/// Defer a repo that can't be synced right now to its next scheduled refresh.
+/// Clears `sync_reason` too: a pending reason makes the repo due on every 1s
+/// tick, which for a missing repo meant a warning per second, forever.
+async fn mark_skipped(daemon: &SharedDaemon, repo_id: &str) {
+    let mut repos = daemon.repos.write().await;
+    if let Some(tr) = repos.get_mut(repo_id) {
+        tr.last_sync = Some(Instant::now());
+        tr.sync_reason = None;
+    }
+}
+
 async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<Vec<SyncEvent>> {
     let sync_start = Instant::now();
     let repo_path = PathBuf::from(repo_id);
@@ -904,11 +915,7 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<Vec<Syn
     // 1. Check repo exists
     if !repo_path.exists() {
         repo_warn!(repo_label, "repo path missing");
-        // Update last_sync so we don't hammer every second
-        let mut repos = daemon.repos.write().await;
-        if let Some(tr) = repos.get_mut(repo_id) {
-            tr.last_sync = Some(Instant::now());
-        }
+        mark_skipped(daemon, repo_id).await;
         return Ok(events);
     }
 
@@ -927,10 +934,8 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<Vec<Syn
 
     // Skip disabled repos
     if config.is_repo_disabled(repo_id) {
-        let mut repos = daemon.repos.write().await;
-        if let Some(tr) = repos.get_mut(repo_id) {
-            tr.last_sync = Some(Instant::now());
-        }
+        drop(config);
+        mark_skipped(daemon, repo_id).await;
         return Ok(events);
     }
 
@@ -1126,8 +1131,11 @@ async fn sync_repo_inner(daemon: &SharedDaemon, repo_id: &str) -> Result<Vec<Syn
         // Gather inputs for the pure decision function.
         let is_checked_out = occupancy.contains_key(&branch.name);
         let is_worktree_dirty = if is_checked_out {
-            let wt_path = occupancy.get(&branch.name).unwrap();
-            git_ops::is_worktree_dirty(&PathBuf::from(wt_path)).unwrap_or(true)
+            let wt_path = PathBuf::from(occupancy.get(&branch.name).unwrap());
+            // A commit/rebase/merge in progress in that worktree must block the
+            // ff-merge just like uncommitted changes do.
+            git_ops::is_worktree_operation_in_progress(&wt_path)
+                || git_ops::is_worktree_dirty(&wt_path).unwrap_or(true)
         } else {
             false
         };
