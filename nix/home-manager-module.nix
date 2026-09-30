@@ -53,13 +53,13 @@ in
 
     systemd.enable = lib.mkOption {
       type = lib.types.bool;
-      default = pkgs.stdenv.isLinux;
+      default = pkgs.stdenv.hostPlatform.isLinux;
       description = "Whether to run gitsitter as a user systemd service.";
     };
 
     launchd.enable = lib.mkOption {
       type = lib.types.bool;
-      default = pkgs.stdenv.isDarwin;
+      default = pkgs.stdenv.hostPlatform.isDarwin;
       description = "Whether to run gitsitter as a launchd user agent.";
     };
 
